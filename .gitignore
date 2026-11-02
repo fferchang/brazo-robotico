@@ -1,1 +1,3 @@
 node_modules/
+# Copias locales comprimidas del proyecto (no van al repositorio).
+*.zip

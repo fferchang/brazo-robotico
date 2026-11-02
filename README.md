@@ -11,14 +11,19 @@ Built at Instituto Industrial Luis A. Huergo, Buenos Aires · 2026
 
 ## 📌 Overview
 
-This project implements a low-cost 6 degree-of-freedom robotic arm capable of:
+This project implements a low-cost 6 degree-of-freedom robotic arm that picks a
+red cube and drops it into a lime-green container:
 
-- **Autonomous object detection** using a fine-tuned YOLO model
-- **Direct kinematics** for precise PC-to-arm coordinate translation
-- **Autonomous sorting** based on object classification
-- **2D/3D simulation** with software-enforced joint angle limits and dynamic geometric rules
+- **Object detection** with two fixed USB cameras (front + side) and OpenCV color segmentation
+- **Learning from demonstration**: 12 key poses per demonstration, recorded with photos and joint angles
+- **Supervised execution**: every move is proposed first and needs operator confirmation
+- **Physics simulation** in MuJoCo with an inverse-kinematics expert that performs the full task virtually
+- **Calibrated 3D model** and geometric safety rules shared by the PC planner and the ESP32 firmware
 
 Total hardware cost: ~USD 350 vs USD 30,000–150,000 for equivalent industrial arms.
+
+The current version lives in [`brazorobtoIA/`](brazorobtoIA/) (documentation in Spanish).
+The other folders hold earlier prototypes.
 
 ---
 
@@ -40,10 +45,10 @@ This project builds upon the open-source [SO-ARM101](https://github.com/TheRobot
 > 📦 **Bill of Materials, CAD files, and hardware assembly instructions** are available in the original [SO-ARM101 repository](https://github.com/TheRobotStudio/SO-ARM101). Our technical report (linked above) includes the specific components and pricing used in this build.
 
 Key differences from the original:
-- Custom direct kinematics in JavaScript (`kinematics.js`) inside an Electron desktop app
-- 2D/3D simulation with dynamic geometric safety rules per joint
-- Stereo vision pipeline planned (USB webcams / smartphones)
-- Fine-tuned YOLO model for object classification (upcoming)
+- Python desktop app for teaching, training and supervised execution (`brazorobtoIA/`)
+- MuJoCo simulation of the whole task, with an inverse-kinematics expert
+- 3D model calibrated against the real arm (table touches, gripper closing)
+- Geometric safety rules enforced twice: PC planner and ESP32 firmware
 
 ---
 
@@ -54,8 +59,7 @@ Key differences from the original:
 | Servomotors | 6× Feetech STS3215 (12V, 30kg·cm) |
 | Driver | Waveshare Bus Servo Adapter (A) V1.1 |
 | Microcontroller | ESP32 |
-| Vision (prototype) | 2× smartphones via USB (stereo) |
-| Vision (production) | 2× USB webcams (fixed, stereo) |
+| Vision | 2× fixed USB webcams (front + side view) |
 | Frame | 3D printed (PLA MAX, Creality Ender 3 V3 SE) |
 | Base | Recycled 40×40cm pressed wood board |
 | Power | External 12V supply |
@@ -66,15 +70,14 @@ Key differences from the original:
 
 | Layer | Technology |
 |-------|-----------|
-| Desktop app | Electron (Node.js) |
-| Direct kinematics | JavaScript (`kinematics.js`) |
-| 3D render | Canvas / Three.js |
-| Simulation (Python) | Python — geometric validation scripts |
-| Simulation (web) | HTML + JavaScript prototypes |
-| Object detection | YOLO (Ultralytics) with fine-tuning — upcoming |
-| Vision pipeline | Python + OpenCV (stereo, upcoming) |
-| Firmware | Arduino IDE (ESP32) |
-| Dev tools | VS Code, OpenAI Codex, GitHub |
+| Main app | Python 3 + Tkinter (`brazorobtoIA/app.py`) |
+| Vision | OpenCV (HSV color segmentation, two cameras) |
+| Learned policy | NumPy (per-stage regression from demonstrations) |
+| Physics simulation | MuJoCo 3.17 + inverse-kinematics expert |
+| 3D view / digital twin | Rerun 0.35 (live telemetry on the URDF model) |
+| Firmware | Arduino IDE (ESP32): `brazorobtoIA/firmware/firmware_secuencias.ino` |
+| Earlier prototypes | Electron app, web simulators, Python kinematics scripts |
+| Dev tools | VS Code, OpenAI Codex, Claude Code, GitHub |
 
 ---
 
@@ -82,26 +85,25 @@ Key differences from the original:
 
 ```
 brazo-robotico/
-├── app/                             # Desktop app (Electron) + WebSerial UI
-│   ├── brazo_desktop_app/           # Main Electron app: 3D render, kinematics, serial control
-│   └── ui_servos_webserial/         # Browser-based WebSerial interface
-├── firmware/                        # Arduino/ESP32 sketches
-│   ├── diagnostico_ping_sts3215_esp32/
-│   ├── setear_ids_sts3215_arduino/
-│   ├── leer_6_sts3215_bus_esp32/
-│   ├── mover_un_motor_por_angulo_esp32/
-│   └── mover_un_motor_por_angulo_esp32_test_reglas/  # ← main active sketch
-├── kinematics/                      # Python geometric simulation and kinematics
-│   └── simulacion_3d_simplificada/
-├── simulation/                      # Web-based 3D simulator prototypes (HTML + JS)
-├── vision/                          # Object detection pipeline (upcoming)
+├── brazorobtoIA/                    # ← Current version: Python app, firmware, simulation
+│   ├── app.py                       # Teaching, training and supervised execution
+│   ├── brazoia/                     # Vision, policy, planner, MuJoCo sim, calibration
+│   ├── firmware/                    # ESP32 sketch with geometric safety rules
+│   ├── assets/                      # URDF + meshes (SO-ARM100), calibration, references
+│   ├── tests/                       # Automated tests (no hardware needed)
+│   └── *.md                         # Guides: simulation, calibration, safety rules
+├── app/                             # Earlier prototype: Electron app + WebSerial UI
+├── firmware/                        # Earlier Arduino/ESP32 test sketches
+├── kinematics/                      # Earlier Python geometric simulation
+├── simulation/                      # Earlier web-based 3D simulator prototypes
 ├── docs/                            # Technical report
 │   └── informe_brazo_robotico.pdf
 ├── index.html                       # Landing page (GitHub Pages)
 └── README.md
 ```
 
-> ⚠️ **Pre-alpha:** code is actively being tested and debugged. `node_modules/` is excluded from the repo.
+> ⚠️ **Pre-alpha:** code is actively being tested. Demonstration photos are not
+> uploaded (they can show people); virtual environments and trained models are excluded.
 
 ---
 
@@ -111,30 +113,34 @@ brazo-robotico/
 |--------|--------|
 | Mechanical assembly | ✅ 100% complete |
 | Servo ID assignment & telemetry | ✅ Complete |
-| Fixed + dynamic joint angle limits | ✅ Complete |
-| 2D/3D geometric simulation | ✅ Functional prototype |
-| Electron desktop app | ✅ Functional (active development) |
-| Direct kinematics (PC → arm) | 🔄 ~80% — polishing XYZ coordinates |
-| Stereo vision (smartphones → PC) | ⏳ Planned (Jul–Aug 2026) |
-| YOLO fine-tuning & integration | ⏳ Planned (Jul–Aug 2026) |
+| Teaching app (12-pose demonstrations, two cameras) | ✅ Functional — 15 successful demonstrations |
+| Learned policy | 🔄 Experimental, not validated (validation error 44°; more demonstrations needed) |
+| MuJoCo simulation + inverse kinematics | ✅ 100/100 virtual pick & place episodes |
+| 3D model calibration | ✅ Table and gripper (Oct 2026); M3/M4 zeros and M1 direction pending |
+| Geometric safety rules (planner + firmware) | ✅ Retuned Nov 2026 — new firmware pending upload to the ESP32 |
+| Gripper current protection | 🔄 Fixes pending (`brazorobtoIA/DIAGNOSTICO_GARRA.md`) |
+| Camera calibration (sim ↔ real) | ⏳ Pending |
+| YOLO fine-tuning | ⏳ Pending — the current version detects by color |
 | Full sorting demo | ⏳ Target: Nov 2026 |
 
 ---
 
 ## 🔩 Joint Angle Limits
 
-Fixed limits per motor:
+Fixed limits per motor (`brazorobtoIA/config.json`):
 
 | Motor | Range |
 |-------|-------|
 | M1 | 60° – 300° |
 | M2 | 90° – 270° |
-| M3 | 90° – 270° |
-| M4 | 75° – 260° (+ dynamic rules) |
+| M3 | 90° – 276° |
+| M4 | 75° – 278° (+ dynamic rules for folded poses) |
 | M5 | 0° – 340° |
 | M6 | 0° – 140° (gripper, with offset) |
 
-M4 also has dynamic geometric rules based on M2 and M3 pose to prevent collisions.
+The floor rule keeps the gripper outline (for any wrist roll and the current
+gripper opening) more than 5 mm above the table. Details in
+[`brazorobtoIA/REGLAS_GEOMETRIA.md`](brazorobtoIA/REGLAS_GEOMETRIA.md).
 
 ---
 
@@ -144,9 +150,8 @@ M4 also has dynamic geometric rules based on M2 and M3 pose to prevent collision
 
 ### Prerequisites
 
-- Node.js + npm (for Electron app)
-- Python 3.10+ (for simulation scripts)
-- Arduino IDE 2.x (for ESP32 firmware)
+- Windows with Python 3.12 or newer (developed with 3.12, also tested with 3.14)
+- Arduino IDE 2.x with the ESP32 core and the SCServo library (firmware)
 - Feetech STS3215 servos × 6
 - Waveshare Bus Servo Adapter (A) V1.1
 - External 12V power supply
@@ -155,17 +160,15 @@ M4 also has dynamic geometric rules based on M2 and M3 pose to prevent collision
 
 ```bash
 git clone https://github.com/ferchng/brazo-robotico.git
-cd brazo-robotico
-
-# Desktop app
-cd app/brazo_desktop_app
-npm install
-npm start
-
-# Python simulation
-cd ../../kinematics/simulacion_3d_simplificada
-python visualizador_brazo_con_reglas.py
+cd brazo-robotico/brazorobtoIA
 ```
+
+Then, from the `brazorobtoIA` folder:
+
+- `INSTALAR.bat` once, to create the virtual environment and install dependencies
+- `INICIAR.bat` for the main app (cameras, ESP32, teaching and execution)
+- `SIMULACION_MUJOCO.bat` for the virtual pick & place (no hardware needed)
+- `CALIBRACION.bat` for the model-to-arm calibration
 
 ---
 
