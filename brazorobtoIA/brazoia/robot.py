@@ -6,6 +6,8 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import serial
 
@@ -16,6 +18,17 @@ COMPACT_POSITION = re.compile(
 SINGLE_POSITION = re.compile(
     r"POS ID ([1-6]):\s*(-?\d+)\s*\(~([-+]?\d+(?:\.\d+)?) deg\)"
 )
+REASON = re.compile(r"reason=(\w+)")
+GRIPPER_CURRENT = re.compile(r"^GRIPPER_I raw=(-?\d+)")
+
+# Estado de la garra según el motivo de GRIPPER_HOLD. Solo «contact» significa
+# que la garra se detuvo sobre un objeto; «closed_limit» es un cierre sin objeto.
+HOLD_STATES = {
+    "contact": "holding",
+    "closed_limit": "closed",
+    "manual": "stopped",
+    "timeout": "stopped",
+}
 
 FAULT_MARKERS = (
     "pair_rejected",
@@ -26,6 +39,7 @@ FAULT_MARKERS = (
     "no se pudo leer",
     "cooldown activo",
     "gripper_error",
+    "gripper_fault",
     "reason=communication_error",
     "reason=hard_current",
     "reason=timeout",
@@ -48,6 +62,10 @@ class RobotSnapshot:
     torque_enabled: bool | None
     gripper_state: str
     fault: str
+    # Motivo y momento (time.monotonic) del último cambio de estado de la garra.
+    gripper_reason: str = ""
+    gripper_updated_at: float = 0.0
+    gripper_current_raw: int | None = None
 
 
 def parse_positions(line: str) -> dict[int, float | None]:
@@ -88,10 +106,21 @@ def is_fault_line(line: str) -> bool:
 class RobotSerial:
     """Un solo hilo posee el puerto y publica telemetria inmutable."""
 
-    def __init__(self, port: str, baud: int, history_seconds: float = 3.0):
+    def __init__(
+        self,
+        port: str,
+        baud: int,
+        history_seconds: float = 3.0,
+        log_folder: Path | None = None,
+    ):
         self.port = port
         self.baud = baud
         self.history_seconds = history_seconds
+        # Registro persistente de todo lo enviado y recibido, un archivo por conexión.
+        self.log_folder = log_folder
+        self.log_path: Path | None = None
+        self.log_lock = threading.Lock()
+        self._log_file = None
         self.connection: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
@@ -105,6 +134,9 @@ class RobotSerial:
         }
         self.torque_enabled: bool | None = None
         self.gripper_state = "idle"
+        self.gripper_reason = ""
+        self.gripper_updated_at = 0.0
+        self.gripper_current_raw: int | None = None
         self.fault = ""
 
     @property
@@ -125,6 +157,7 @@ class RobotSerial:
             connection.close()
             raise RuntimeError("Conexión cancelada.")
         connection.reset_input_buffer()
+        self._open_log()
         self.connection = connection
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
@@ -140,6 +173,24 @@ class RobotSerial:
         if connection is not None:
             connection.close()
         self.events.put(RobotEvent(time.monotonic(), "disconnected", self.port))
+        with self.log_lock:
+            if self._log_file is not None:
+                self._log_file.close()
+                self._log_file = None
+
+    def _open_log(self) -> None:
+        if self.log_folder is None:
+            return
+        self.log_folder.mkdir(parents=True, exist_ok=True)
+        name = datetime.now().strftime("serie_%Y%m%d_%H%M%S_%f.log")
+        with self.log_lock:
+            self.log_path = self.log_folder / name
+            self._log_file = self.log_path.open("a", encoding="utf-8", buffering=1)
+
+    def _log(self, stamp: float, kind: str, payload: str) -> None:
+        with self.log_lock:
+            if self._log_file is not None:
+                self._log_file.write(f"{stamp:.3f}\t{kind}\t{payload}\n")
 
     def send(self, command: str) -> None:
         connection = self.connection
@@ -151,7 +202,9 @@ class RobotSerial:
         with self.write_lock:
             connection.write((clean + "\n").encode("ascii"))
             connection.flush()
-        self.events.put(RobotEvent(time.monotonic(), "tx", clean))
+        stamp = time.monotonic()
+        self._log(stamp, "tx", clean)
+        self.events.put(RobotEvent(stamp, "tx", clean))
 
     def clear_fault(self) -> None:
         with self.state_lock:
@@ -165,6 +218,9 @@ class RobotSerial:
                 torque_enabled=self.torque_enabled,
                 gripper_state=self.gripper_state,
                 fault=self.fault,
+                gripper_reason=self.gripper_reason,
+                gripper_updated_at=self.gripper_updated_at,
+                gripper_current_raw=self.gripper_current_raw,
             )
 
     def stable_pose(
@@ -226,20 +282,38 @@ class RobotSerial:
                 while history and stamp - history[0][0] > self.history_seconds:
                     history.popleft()
 
-            if line in ("TORQUE_ON_OK", "ARM_TORQUE_ON_OK"):
+            reason_match = REASON.search(line)
+            reason = reason_match.group(1) if reason_match else ""
+            current = GRIPPER_CURRENT.match(line)
+            gripper_state: str | None = None
+            if current:
+                self.gripper_current_raw = int(current.group(1))
+            elif line in ("TORQUE_ON_OK", "ARM_TORQUE_ON_OK"):
                 self.torque_enabled = True
-            elif line in ("TORQUE_OFF_OK", "ARM_TORQUE_OFF_OK"):
+            elif line == "TORQUE_OFF_OK":
+                self.torque_enabled = False
+                gripper_state = "released"  # El apagado global también desenergiza M6.
+            elif line == "ARM_TORQUE_OFF_OK":
                 self.torque_enabled = False
             elif line.startswith("GRIPPER_CLOSE_START"):
-                self.gripper_state = "closing"
+                gripper_state = "closing"
             elif line.startswith("GRIPPER_OPEN_OK"):
-                self.gripper_state = "opening"
+                gripper_state = "opening"
             elif line.startswith("GRIPPER_HOLD"):
-                self.gripper_state = "holding"
+                gripper_state = HOLD_STATES.get(reason, "stopped")
             elif line.startswith("GRIPPER_TORQUE_OFF"):
-                self.gripper_state = "released"
+                gripper_state = "released"
+            elif line.startswith("GRIPPER_FAULT") or (
+                line.startswith("GRIPPER_STOP ") and reason == "communication_error"
+            ):
+                gripper_state = "error"
+            if gripper_state is not None:
+                self.gripper_state = gripper_state
+                self.gripper_reason = reason
+                self.gripper_updated_at = stamp
 
             if is_fault_line(line):
                 self.fault = line
+        self._log(stamp, "rx", line)
         self.events.put(RobotEvent(stamp, "rx", line))
 

@@ -535,7 +535,10 @@ class App:
     def connect_robot(self) -> None:
         if self.robot is not None and self.robot.connected:
             return
-        robot = RobotSerial(self.port.get().strip(), self.config.baud)
+        robot = RobotSerial(
+            self.port.get().strip(), self.config.baud,
+            log_folder=self.config.root / "datos" / "serie",
+        )
         self.robot = robot
         self.connection_status.set("Conectando...")
 
@@ -1207,7 +1210,10 @@ class App:
             self.angle_vars[motor_id].set("—" if value is None or age > 0.5 else f"{value:.1f}°")
         torque = "ON" if snapshot.torque_enabled is True else "OFF" if snapshot.torque_enabled is False else "desconocido"
         self.torque_status.set(f"Torque: {torque}")
-        self.gripper_status.set(f"Garra: {snapshot.gripper_state}")
+        gripper_text = f"Garra: {snapshot.gripper_state}"
+        if snapshot.gripper_current_raw is not None:
+            gripper_text += f" · {snapshot.gripper_current_raw * 6.5:.0f} mA"
+        self.gripper_status.set(gripper_text)
         if self.rerun.available and now - self.last_rerun_update > 0.15:
             self.rerun.log_pose(snapshot.positions)
             self.last_rerun_update = now
@@ -1216,7 +1222,8 @@ class App:
                 event: RobotEvent = robot.events.get_nowait()
             except queue.Empty:
                 break
-            if event.kind != "rx" or not event.payload.startswith("POS ID"):
+            # Posiciones y corriente de la garra quedan en datos/serie/, no en la consola.
+            if event.kind != "rx" or not event.payload.startswith(("POS ID", "GRIPPER_I ")):
                 self.log(f"[{event.kind}] {event.payload}")
 
     def _drain_workers(self) -> None:

@@ -1,5 +1,54 @@
 # Revisión del agarre por corriente — 8 de octubre de 2026
 
+## Correcciones del 2 de noviembre de 2026
+
+Estado de los diez fallos descritos más abajo, en `firmware/firmware_secuencias.ino`,
+`brazoia/robot.py` y `brazoia/execution.py`:
+
+| # | Fallo | Estado |
+|---|---|---|
+| 1 | Vigilancia sólo al cerrar | Corregido: la corriente de M6 se lee cada 40 ms al cerrar y cada 100 ms al abrir o sostener, también tras `torque on` |
+| 2 | Lectura fallida deja torque y abandona la vigilancia | Corregido: una lectura fallida no avanza la consigna; tres seguidas desenergizan M6 |
+| 3 | Timeout mantiene esfuerzo sin vigilancia | Parcial: sigue sosteniendo la posición, pero vigilada; la sobrecorriente se evalúa antes que el timeout y la aplicación lo trata como fallo |
+| 4 | Parada por sobrecorriente no confirmada | Corregido: `EnableTorque(6, 0)` inmediato, sin leer ni escribir antes, hasta 3 intentos; `GRIPPER_FAULT` si el servo no confirma |
+| 5 | Demoras de comunicación | Sin cambios; no medido en hardware |
+| 6 | La consigna se adelanta al eje | Sin cambios |
+| 7 | Pulsaciones repetidas reinician el cierre | Corregido: el firmware responde `GRIPPER_CLOSE_IGNORED` |
+| 8 | Estado de interfaz ambiguo | Corregido: `holding` (contacto), `closed` (cerró sin objeto), `stopped` (manual o timeout), `error`, `released` |
+| 9 | Torque global OFF no cancela el cierre | Corregido |
+| 10 | Confirmación potencialmente antigua | Corregido: el ejecutor exige un estado posterior a su orden y se detiene si la garra cerró sin el cubo |
+
+Al cerrar basta una lectura sobre el umbral duro (200 unidades, ~1.300 mA);
+al abrir o sostener hacen falta dos seguidas, para no cortar por un pico de
+arranque. El firmware informa `GRIPPER_I raw=<unidades>` cada 200 ms con torque
+(en cada lectura al cerrar) y la interfaz muestra la corriente junto al estado de
+la garra. Todo lo enviado y recibido queda en `datos/serie/serie_<fecha>.log`,
+un archivo por conexión (no se sube al repositorio).
+
+Sin cambios: el registro interno de límite de torque y la protección interna del
+servo no se configuran ni se verifican; tampoco se midió la causa del corte de la
+fuente de 5 A.
+
+Verificación: `tests/firmware_host/` compila el firmware en el PC con sustitutos
+de Arduino y SCServo y recorre 16 casos con corrientes y fallos de bus simulados
+(`tests/test_firmware_gripper.py`; se omite sin compilador de C++). No se compiló
+para el ESP32 en esta revisión: hay que compilarlo y cargarlo desde el IDE de
+Arduino.
+
+### Prueba con el brazo después de cargar el firmware
+
+Con el monitor de la aplicación abierto y la mesa despejada:
+
+1. **Cerrar garra por presión** sin nada entre los dedos: debe terminar en
+   `GRIPPER_HOLD reason=closed_limit` y la interfaz mostrar `closed`.
+2. Abrir y cerrar sobre el cubo sostenido a mano: `reason=contact`, estado
+   `holding`. Anotar los valores de `GRIPPER_I` mientras sostiene durante 60 s.
+3. **Abrir garra** varias veces: no debe aparecer `reason=hard_current`. Si
+   aparece al abrir sin carga, avisar: el pico de arranque supera el umbral.
+4. `gripper release` en el monitor serie: debe decir `result=1`. Si la garra
+   queda floja pero dice `result=0`, la biblioteca instalada informa distinto y
+   hay que ajustar la confirmación.
+
 ## Resultado y alcance
 
 El botón está conectado correctamente: su callback envía una sola línea

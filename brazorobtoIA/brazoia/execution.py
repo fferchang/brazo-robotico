@@ -51,8 +51,9 @@ class MotionExecutor:
             self._move_group(group)
         if proposal.gripper_action == "close":
             self.status("Cerrando la garra por presión...")
+            sent_at = time.monotonic()
             self.robot.send("gripper close")
-            self._wait_gripper("holding", timeout=16.0)
+            self._wait_gripper("holding", timeout=16.0, since=sent_at)
         elif proposal.gripper_action == "open":
             self.status("Abriendo la garra...")
             self.robot.send("gripper open")
@@ -111,7 +112,12 @@ class MotionExecutor:
                 return
         raise RuntimeError(f"M{motor_id} no confirmó {target:.1f}°.")
 
-    def _wait_gripper(self, expected: str, timeout: float) -> None:
+    def _wait_gripper(self, expected: str, timeout: float, since: float) -> None:
+        """Espera un estado de la garra informado después de `since` (time.monotonic).
+
+        Un estado anterior a la orden no cuenta como confirmación. Un cierre sin
+        objeto («closed») u otro final distinto del esperado detienen la tarea.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.stop_event.wait(0.05):
@@ -119,8 +125,17 @@ class MotionExecutor:
             snapshot = self.robot.snapshot()
             if snapshot.fault:
                 raise RuntimeError(snapshot.fault)
-            if snapshot.gripper_state == expected:
+            if snapshot.gripper_updated_at < since:
+                continue
+            state = snapshot.gripper_state
+            if state == expected:
                 return
+            if state == "closing":
+                continue
+            if state == "closed":
+                raise RuntimeError("La garra cerró sin el cubo: no hubo contacto.")
+            reason = snapshot.gripper_reason or "sin motivo"
+            raise RuntimeError(f"La garra terminó en «{state}» ({reason}) en lugar de «{expected}».")
         raise RuntimeError("La garra no confirmó el contacto.")
 
 

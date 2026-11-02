@@ -9,3 +9,5 @@ datos/ejecuciones/
 datos/simulacion/
 modelos/**/*.npz
 *.log
+# Registro de la comunicación serie (uno por conexión).
+datos/serie/
