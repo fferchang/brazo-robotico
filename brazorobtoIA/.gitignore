@@ -1,0 +1,11 @@
+.venv/
+.venv_*/
+__pycache__/
+*.pyc
+# Fotos de las cámaras (pueden mostrar personas) y datos de cada prueba.
+datos/demostraciones/
+datos/muestras_eliminadas_*/
+datos/ejecuciones/
+datos/simulacion/
+modelos/**/*.npz
+*.log

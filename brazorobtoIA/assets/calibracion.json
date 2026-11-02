@@ -1,0 +1,44 @@
+{
+  "1": {
+    "joint": "1",
+    "servo_zero_degrees": 180.0,
+    "urdf_zero_radians": 0.0,
+    "direction": 1.0,
+    "visual_offset_degrees": 0.0
+  },
+  "2": {
+    "joint": "2",
+    "servo_zero_degrees": 180.0,
+    "urdf_zero_radians": 1.5707963268,
+    "direction": 1.0,
+    "visual_offset_degrees": 16.5
+  },
+  "3": {
+    "joint": "3",
+    "servo_zero_degrees": 90.0,
+    "urdf_zero_radians": -1.5707963268,
+    "direction": 1.0,
+    "visual_offset_degrees": -95.0
+  },
+  "4": {
+    "joint": "4",
+    "servo_zero_degrees": 180.0,
+    "urdf_zero_radians": 0.0,
+    "direction": 1.0,
+    "visual_offset_degrees": -30.0
+  },
+  "5": {
+    "joint": "5",
+    "servo_zero_degrees": 170.0,
+    "urdf_zero_radians": 0.0,
+    "direction": 1.0,
+    "visual_offset_degrees": 0.0
+  },
+  "6": {
+    "joint": "6",
+    "servo_zero_degrees": 0.0,
+    "urdf_zero_radians": 0.0,
+    "direction": 1.0,
+    "visual_offset_degrees": -17.5
+  }
+}

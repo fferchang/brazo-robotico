@@ -1,0 +1,7 @@
+opencv-contrib-python>=4.10,<5
+cv2-enumerate-cameras>=1.4,<2
+numpy>=1.26,<3
+Pillow>=10,<13
+pyserial>=3.5,<4
+rerun-sdk==0.35.0
+mujoco>=3.17,<4

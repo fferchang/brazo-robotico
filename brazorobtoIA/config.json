@@ -1,0 +1,76 @@
+{
+  "serial": {
+    "port": "COM4",
+    "baud": 115200
+  },
+  "cameras": {
+    "frontal": {
+      "name": "USB CAMERA",
+      "fallback_index": 2,
+      "rotation_degrees": 180,
+      "brightness_percent": -25.0,
+      "contrast_percent": 50.0,
+      "saturation_percent": 10.0,
+      "zoom_factor": 1.0
+    },
+    "lateral": {
+      "name": "GENERAL WEBCAM",
+      "fallback_index": 1,
+      "rotation_degrees": 180,
+      "brightness_percent": -25.0,
+      "contrast_percent": 50.0,
+      "saturation_percent": 0.0,
+      "zoom_factor": 1.0
+    }
+  },
+  "limits": {
+    "1": [
+      60.0,
+      300.0
+    ],
+    "2": [
+      90.0,
+      270.0
+    ],
+    "3": [
+      90.0,
+      276.0
+    ],
+    "4": [
+      75.0,
+      278.0
+    ],
+    "5": [
+      0.0,
+      340.0
+    ],
+    "6": [
+      0.0,
+      140.0
+    ]
+  },
+  "capture": {
+    "maximum_camera_age_seconds": 0.5,
+    "maximum_camera_skew_seconds": 0.1,
+    "maximum_telemetry_age_seconds": 0.5,
+    "stable_window_seconds": 0.6,
+    "stable_max_range_degrees": 0.6
+  },
+  "vision": {
+    "minimum_red_area_ratio": 0.001,
+    "minimum_lime_area_ratio": 0.004,
+    "frontal_lime_hsv_lower": [
+      28,
+      115,
+      50
+    ],
+    "frontal_lime_hsv_upper": [
+      55,
+      255,
+      220
+    ],
+    "frontal_minimum_lime_area_ratio": 0.04,
+    "frontal_minimum_lime_shape_ratio": 0.4,
+    "frontal_minimum_lime_confidence": 0.7
+  }
+}
