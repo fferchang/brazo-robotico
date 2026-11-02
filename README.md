@@ -31,8 +31,8 @@ The other folders hold earlier prototypes.
 
 | Resource | Link |
 |----------|------|
-| 🌐 Landing Page | [ferchng.github.io/brazo-robotico](https://ferchng.github.io/brazo-robotico) |
-| 📄 Technical Report | [View PDF](https://github.com/ferchng/brazo-robotico/blob/main/docs/informe_brazo_robotico.pdf) |
+| 🌐 Landing Page | [fferchang.github.io/brazo-robotico](https://fferchang.github.io/brazo-robotico) |
+| 📄 Technical Report | [View PDF](https://github.com/fferchang/brazo-robotico/blob/main/docs/informe_brazo_robotico.pdf) |
 | 📸 Photo Gallery | [Google Photos](https://photos.app.goo.gl/9NATdUXzkGk8ssc47) |
 | 🎥 Demo Videos | *(coming soon)* |
 
@@ -159,7 +159,7 @@ gripper opening) more than 5 mm above the table. Details in
 ### Quick Start *(pre-alpha)*
 
 ```bash
-git clone https://github.com/ferchng/brazo-robotico.git
+git clone https://github.com/fferchang/brazo-robotico.git
 cd brazo-robotico/brazorobtoIA
 ```
 
