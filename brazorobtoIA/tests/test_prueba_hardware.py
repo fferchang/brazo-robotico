@@ -5,6 +5,7 @@ help, posall y scan. Que estas pruebas pasen no certifica el hardware real.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import tempfile
 import threading
@@ -41,7 +42,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FIRMWARE = (ROOT / "firmware" / "firmware_secuencias.ino").read_text(encoding="utf-8")
 FIRMWARE_HELP = [render_template(template, "50") for template in help_templates(FIRMWARE)]
 DIVIDER = FIRMWARE_HELP[0]
-CONFIG = load_config()
+# El puerto de config.json depende de cada PC (COM4, COM11...); las pruebas usan uno fijo.
+CONFIG = dataclasses.replace(load_config(), port="COM4")
 POSE = {1: 180.0, 2: 180.0, 3: 120.0, 4: 180.0, 5: 263.0, 6: 2.0}
 CAMERAS = [
     {"indice": 1, "nombre": "GENERAL WEBCAM", "vid": 0x1908, "pid": 0x2311},
