@@ -60,7 +60,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(configuration.cameras["lateral"].contrast_percent, 50.0)
         self.assertEqual(configuration.cameras["frontal"].brightness_percent, -25.0)
         self.assertEqual(configuration.cameras["frontal"].saturation_percent, 10.0)
-        self.assertEqual(configuration.cameras["lateral"].brightness_percent, -15.0)
+        self.assertEqual(configuration.cameras["lateral"].brightness_percent, -25.0)
         self.assertEqual(configuration.cameras["lateral"].saturation_percent, 0.0)
         self.assertEqual(configuration.cameras["frontal"].zoom_factor, 1.0)
 

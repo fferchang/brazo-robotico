@@ -27,7 +27,7 @@ No modifica demostraciones ya finalizadas ni modelos ya entrenados.
 - Panel independiente por cámara para ajustar en vivo brillo, contraste,
   saturación y zoom digital, con guardado persistente y restauración a valores
   neutros. La configuración guardada es frontal `brillo −25%`, `contraste +50%`,
-  `saturación +10%`, `zoom 1×`; lateral `brillo −15%`, `contraste +50%`,
+  `saturación +10%`, `zoom 1×`; lateral `brillo −25%`, `contraste +50%`,
   `saturación 0%`, `zoom 1×`. El panel inicia bloqueado y atenuado; **Editar
   ajustes** lo habilita temporalmente. Se aplican por igual a la vista previa,
   las imágenes guardadas y la detección.
