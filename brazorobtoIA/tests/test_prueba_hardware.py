@@ -67,7 +67,7 @@ class FakeESP32Serial:
 
     def __init__(self, port, baud, timeout=0.1, write_timeout=0.5, *, missing=(),
                  help_lines=None, reset_on_open=True, voltage=74, temperature=31,
-                 fail_writes=False):
+                 fail_writes=False, partial_after_reset=b""):
         self.port, self.baudrate, self.timeout = port, baud, timeout
         self.is_open = True
         self.missing = set(missing)
@@ -75,6 +75,7 @@ class FakeESP32Serial:
         self.reset_on_open = reset_on_open
         self.voltage, self.temperature = voltage, temperature
         self.fail_writes = fail_writes
+        self.partial_after_reset = partial_after_reset
         self.written: list[str] = []
         self._buffer = bytearray()
         self._lock = threading.RLock()
@@ -152,7 +153,8 @@ class FakeESP32Serial:
 
     def reset_input_buffer(self):
         with self._lock:
-            self._buffer.clear()
+            # Lo que sigue llegando de una línea que se estaba transmitiendo.
+            self._buffer[:] = self.partial_after_reset
 
     def close(self):
         self.is_open = False
@@ -383,6 +385,16 @@ class FaultyHardwareTests(unittest.TestCase):
         check = report.find("esp32", "conexión")
         self.assertEqual(check.status, OK)
         self.assertIn("no lo reinició", check.detail)
+
+    def test_line_cut_by_reset_input_buffer_is_discarded(self) -> None:
+        # Informes reales: el final de 'POS ID 1: ...' aparecía como línea con
+        # bytes inválidos o como línea de más en la respuesta a help.
+        report, *_ = run_fake(serial_options={"partial_after_reset": b"\xff\xfe1: 1905 (~167.5 deg)\r\n"},
+                              cameras=False)
+        for group, name in (("esp32", "línea serie"), ("firmware", "versión cargada (help)")):
+            with self.subTest(prueba=name):
+                check = report.find(group, name)
+                self.assertEqual(check.status, OK, check.detail)
 
     def test_black_camera_fails(self) -> None:
         report, *_ = run_fake(frames={"frontal": black}, esp32=False)

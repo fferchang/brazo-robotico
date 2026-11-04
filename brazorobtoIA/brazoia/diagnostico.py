@@ -27,7 +27,7 @@ from serial.tools import list_ports
 
 from .capture import CameraStream, FrameSnapshot, discover_camera_index, validate_frame_pair
 from .config import AppConfig
-from .robot import RobotEvent, RobotSerial, is_fault_line, parse_positions
+from .robot import RobotEvent, RobotSerial, discard_partial_line, is_fault_line, parse_positions
 from .vision import detect_scene, draw_observation
 
 
@@ -406,6 +406,7 @@ class DiagnosticRobotSerial(RobotSerial):
             while time.monotonic() < deadline:
                 raw += connection.read(max(1, min(connection.in_waiting, 4096)))
             connection.reset_input_buffer()
+            discard_partial_line(connection)
         except BaseException:
             connection.close()
             raise

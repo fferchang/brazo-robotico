@@ -85,6 +85,19 @@ def is_fault_line(line: str) -> bool:
     return any(marker in lowered for marker in FAULT_MARKERS)
 
 
+def discard_partial_line(connection: serial.Serial) -> None:
+    """Descarta el resto de la linea que reset_input_buffer() dejo cortada.
+
+    Con la telemetria a 20 Hz casi siempre hay una linea en camino; sin esto
+    su final llega como una linea invalida. Si no habia ninguna cortada se
+    pierde una de telemetria.
+    """
+    for _ in range(4096):
+        byte = connection.read(1)
+        if not byte or byte == b"\n":
+            return
+
+
 class RobotSerial:
     """Un solo hilo posee el puerto y publica telemetria inmutable."""
 
@@ -125,6 +138,7 @@ class RobotSerial:
             connection.close()
             raise RuntimeError("Conexión cancelada.")
         connection.reset_input_buffer()
+        discard_partial_line(connection)
         self.connection = connection
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
