@@ -324,6 +324,19 @@ def list_serial_ports() -> list[dict[str, Any]]:
     ]
 
 
+def _port_text(port: dict[str, Any]) -> str:
+    return f"{port.get('descripcion', '')} {port.get('fabricante', '')}".lower()
+
+
+def usb_ports(ports: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Adaptadores USB serie, con los marcadores de App.refresh_ports."""
+    return [port for port in ports if any(marker in _port_text(port) for marker in USB_MARKERS)]
+
+
+def is_bluetooth_port(port: dict[str, Any]) -> bool:
+    return "bluetooth" in _port_text(port)
+
+
 def resolve_port(
     preferred: str, ports: Sequence[dict[str, Any]], override: str | None = None
 ) -> tuple[str | None, str]:
@@ -332,16 +345,9 @@ def resolve_port(
         return override, "indicado con --puerto"
     if preferred in [port["puerto"] for port in ports]:
         return preferred, "config.json"
-    usb = [
-        port["puerto"]
-        for port in ports
-        if any(
-            marker in f"{port.get('descripcion', '')} {port.get('fabricante', '')}".lower()
-            for marker in USB_MARKERS
-        )
-    ]
+    usb = usb_ports(ports)
     if len(usb) == 1:
-        return usb[0], "autodetectado"
+        return usb[0]["puerto"], "autodetectado"
     return None, "no encontrado"
 
 
@@ -914,6 +920,29 @@ def _connect_esp32(
             "Revisá el cable USB y el driver (CH340/CP210x) o indicá --puerto.",
         )
         return None
+    selected = next((item for item in ports if item["puerto"] == port), None)
+    if selected is not None and is_bluetooth_port(selected):
+        # firmware_secuencias.ino usa Serial (USB); un COM Bluetooth no es el ESP32.
+        usb = usb_ports(ports)
+        if len(usb) == 1:
+            advice = (
+                f"El adaptador USB serie es {usb[0]['puerto']} ({usb[0]['descripcion']}): cambiá "
+                f"\"port\" en config.json a {usb[0]['puerto']} o ejecutá con --puerto {usb[0]['puerto']}."
+            )
+        elif usb:
+            advice = (
+                "Adaptadores USB serie: "
+                + ", ".join(f"{item['puerto']} ({item['descripcion']})" for item in usb)
+                + ". Indicá el del ESP32 con --puerto."
+            )
+        else:
+            advice = "No hay ningún adaptador USB serie: revisá el cable USB del ESP32."
+        report.add(
+            group, "puerto", FALLA,
+            f"{port} es un puerto Bluetooth ('{selected['descripcion']}'); el firmware se comunica "
+            f"por el USB del ESP32. {advice} Puertos: {listed}.",
+        )
+        return None
     if origin == "autodetectado":
         report.add(
             group, "puerto", AVISO,
@@ -932,12 +961,16 @@ def _connect_esp32(
         robot.connect()
     except (serial.SerialException, OSError) as exc:
         text = str(exc)
-        busy = any(marker in text.lower() for marker in ("denied", "denegado", "permission", "busy", "ocupado"))
-        hint = (
-            "El puerto está en uso: cerrá la app principal, el monitor serie de Arduino u otro programa."
-            if busy
-            else "Revisá el cable USB y que el ESP32 esté encendido."
-        )
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("denied", "denegado", "permission", "busy", "ocupado")):
+            hint = "El puerto está en uso: cerrá la app principal, el monitor serie de Arduino u otro programa."
+        elif "timeout" in lowered:
+            hint = (
+                "El puerto abrió pero no acepta datos: probablemente no es el ESP32. Revisá en el "
+                "Administrador de dispositivos, en Puertos (COM y LPT), qué COM es el adaptador USB."
+            )
+        else:
+            hint = "Revisá el cable USB y que el ESP32 esté encendido."
         report.add(group, "conexión", FALLA, f"No se pudo abrir {port}: {text}. {hint}")
         return None
 

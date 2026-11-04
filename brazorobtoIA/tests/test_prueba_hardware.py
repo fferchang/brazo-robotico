@@ -15,6 +15,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import serial
 
 from brazoia.capture import FrameSnapshot
 from brazoia.config import load_config
@@ -65,13 +66,15 @@ class FakeESP32Serial:
     """Puerto serie con el comportamiento de firmware_secuencias.ino."""
 
     def __init__(self, port, baud, timeout=0.1, write_timeout=0.5, *, missing=(),
-                 help_lines=None, reset_on_open=True, voltage=74, temperature=31):
+                 help_lines=None, reset_on_open=True, voltage=74, temperature=31,
+                 fail_writes=False):
         self.port, self.baudrate, self.timeout = port, baud, timeout
         self.is_open = True
         self.missing = set(missing)
         self.help_lines = FIRMWARE_HELP if help_lines is None else help_lines
         self.reset_on_open = reset_on_open
         self.voltage, self.temperature = voltage, temperature
+        self.fail_writes = fail_writes
         self.written: list[str] = []
         self._buffer = bytearray()
         self._lock = threading.RLock()
@@ -123,6 +126,8 @@ class FakeESP32Serial:
             time.sleep(0.005)
 
     def write(self, data):
+        if self.fail_writes:  # p. ej. un COM Bluetooth sin dispositivo enlazado
+            raise serial.SerialTimeoutException("Write timeout")
         for command in data.decode("ascii").splitlines():
             self.written.append(command)
             if command == "help":
@@ -216,7 +221,8 @@ class FakeStream:
         self.closed = True
 
 
-def run_fake(*, serial_options=None, frames=None, same_index=False, cameras=True, esp32=True):
+def run_fake(*, serial_options=None, frames=None, same_index=False, cameras=True, esp32=True,
+             ports=PORTS):
     factories = {"frontal": scene, "lateral": scene, **(frames or {})}
     by_index = {CONFIG.cameras[key].fallback_index: factory for key, factory in factories.items()}
     devices: list[FakeESP32Serial] = []
@@ -235,7 +241,7 @@ def run_fake(*, serial_options=None, frames=None, same_index=False, cameras=True
             stream_factory=lambda index, **params: FakeStream(index, by_index[index], **params),
             index_resolver=lambda _name, fallback: 2 if same_index else fallback,
             camera_enumerator=lambda: CAMERAS,
-            port_lister=lambda: PORTS,
+            port_lister=lambda: ports,
             serial_factory=serial_factory,
             progress=lambda _message: None,
         )
@@ -387,6 +393,29 @@ class FaultyHardwareTests(unittest.TestCase):
         self.assertEqual(report.find("cámaras", "lateral · apertura").status, FALLA)
         self.assertEqual(report.find("cámaras", "par de imágenes").status, FALLA)
         self.assertEqual(report.find("integración", "condiciones de Tomar foto").status, FALLA)
+
+    def test_bluetooth_port_is_not_taken_for_the_esp32(self) -> None:
+        # Puertos del primer informe real: COM4 de config.json era Bluetooth.
+        ports = [
+            {"puerto": "COM11", "descripcion": "Silicon Labs CP210x USB to UART Bridge (COM11)",
+             "fabricante": "Silicon Labs"},
+            {"puerto": "COM4", "descripcion": "Serie estándar sobre el vínculo Bluetooth (COM4)",
+             "fabricante": "Microsoft"},
+            {"puerto": "COM5", "descripcion": "Serie estándar sobre el vínculo Bluetooth (COM5)",
+             "fabricante": "Microsoft"},
+        ]
+        report, devices, *_ = run_fake(ports=ports, cameras=False)
+        check = report.find("esp32", "puerto")
+        self.assertEqual(check.status, FALLA)
+        self.assertIn("--puerto COM11", check.detail)
+        self.assertEqual(devices, [])
+        self.assertIsNone(report.find("esp32", "conexión"))
+
+    def test_port_that_rejects_writes_explains_the_cause(self) -> None:
+        report, *_ = run_fake(serial_options={"fail_writes": True}, cameras=False)
+        check = report.find("esp32", "conexión")
+        self.assertEqual(check.status, FALLA)
+        self.assertIn("no acepta datos", check.detail)
 
     def test_both_cameras_on_same_index_fail_before_opening(self) -> None:
         report, *_ = run_fake(same_index=True, esp32=False)
