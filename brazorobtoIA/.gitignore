@@ -7,5 +7,6 @@ datos/demostraciones/
 datos/muestras_eliminadas_*/
 datos/ejecuciones/
 datos/simulacion/
+datos/prueba_hardware/
 modelos/**/*.npz
 *.log

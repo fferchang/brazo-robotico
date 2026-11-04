@@ -168,6 +168,26 @@ de M2–M4 y M6. No modifica `calibracion.json`. Ver `CALIBRACION.md`.
 - Dos cámaras DirectShow.
 - Seis servos STS3215.
 
+## Prueba de hardware
+
+`PRUEBA_HARDWARE.bat` revisa las cámaras y el ESP32 en modo solo lectura: no
+mueve el brazo ni cambia el torque, y al ESP32 solo le envía `help`, `posall` y
+`scan`. Antes de ejecutarla, cerrá la aplicación principal, dejá el brazo quieto
+y poné el cubo y el recipiente a la vista de las dos cámaras.
+
+- Cámaras: identificación por nombre, apertura, resolución, cuadros por segundo,
+  imagen negra o congelada, desfase entre cámaras y detección del cubo y del
+  recipiente con los mismos parámetros que la aplicación.
+- ESP32: puerto, reinicio al conectar, versión del firmware (texto de `help`
+  comparado con `firmware/firmware_secuencias.ino`), lectura de M1–M6, voltaje,
+  temperatura, telemetría, límites y estabilidad en reposo.
+- Integración: las condiciones que comprueba **Tomar foto**, salvo el torque.
+
+Los resultados quedan en `datos/prueba_hardware/prueba_AAAAMMDD_HHMMSS/`:
+`reporte.txt`, `reporte.json`, `serial.log` y las fotos de cada cámara, con y sin
+la detección dibujada. Opciones: `--puerto COM5`, `--segundos 10`,
+`--solo-camaras`, `--solo-esp32`. No prueba movimiento, torque ni garra.
+
 ## Seguridad
 
 Los límites configurados son M1 `60..300`, M2 `90..270`, M3 `90..276`,
