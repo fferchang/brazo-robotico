@@ -133,11 +133,14 @@ class SupervisedExecution:
         self.next_stage_index = 1
         self.finished = False
         self.proposal: MotionProposal | None = None
+        # Escena vista desde la pose de Inicio; el modelo predice todas las etapas con ella.
+        self.scene_features: np.ndarray | None = None
 
     def reset(self) -> None:
         self.next_stage_index = 1
         self.finished = False
         self.proposal = None
+        self.scene_features = None
 
     def prepare(
         self,
@@ -174,14 +177,19 @@ class SupervisedExecution:
 
         stage_index = self.next_stage_index
         stage = KEYFRAME_STAGES[stage_index]
+        if stage_index == 1:
+            # El brazo sigue en Inicio: es la misma escena con la que se entrenó.
+            # Después el brazo tapa o lleva el cubo y la vista ya no sirve.
+            self.scene_features = observation_features(observations)
+        if self.scene_features is None:
+            raise RuntimeError("Falta la escena de Inicio; reiniciá la tarea automática.")
         if stage == "guardado":
             target = {
                 motor_id: float(self.policy.canonical_guard[motor_id - 1])
                 for motor_id in range(1, 6)
             }
         else:
-            features = observation_features(observations)
-            target = self.policy.predict(stage_index, features)
+            target = self.policy.predict(stage_index, self.scene_features)
         groups = build_motion_plan(current, target, self.limits)
         gripper_action = {
             "aproximacion_2": "open",

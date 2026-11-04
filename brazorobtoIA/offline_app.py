@@ -156,7 +156,9 @@ class OfflineApp:
             except Exception as exc:
                 label.configure(image="", text=f"No se pudo abrir la foto: {exc}")
         try:
-            self.result = self.model.evaluate(index, stage)
+            self.result = self.model.evaluate(
+                index, stage, scene_stage=self.demo["stages"][0], demo_name=name
+            )
         except Exception as exc:
             self.pause()
             self.status.set(f"No se puede evaluar: {exc}")

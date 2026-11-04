@@ -100,12 +100,22 @@ Desde 5 demostraciones exitosas se permite entrenar un **modelo piloto** para
 comprobar el circuito completo bajo supervisión. Con menos de 20 muestras no se
 debe considerar confiable ni generalizar fuera de posiciones muy parecidas a las
 enseñadas. Para la versión final se recomiendan aproximadamente 300, variando las
-posiciones del cubo y del recipiente sobre la misma mesa; el 20% se reserva
-automáticamente para validación.
+posiciones del cubo y del recipiente sobre la misma mesa.
 
-Aunque haya cinco muestras, el modelo no se guarda si la validación supera
-`20°` de error medio o `45°` en alguna etapa. Esto evita cargar automáticamente
-una política incoherente en un brazo físico.
+El modelo predice las doce poses a partir de la escena de **Inicio**: la posición
+del cubo y del recipiente en las dos cámaras, antes de mover el brazo. Es lo mismo
+que ve la ejecución automática; las fotos posteriores muestran el brazo tapando o
+llevando el cubo. Por eso, en la foto de Inicio el cubo y el recipiente tienen que
+detectarse en ambas cámaras; las demostraciones que no lo cumplen se excluyen y
+quedan listadas en el modelo. Por etapa usa una regresión lineal con
+regularización elegida automáticamente: con pocas demostraciones tiende a la pose
+media en vez de extrapolar. Inicio y Guardado usan una pose canónica.
+
+La validación es cruzada: cada demostración se predice con un modelo entrenado
+sin ella. Aunque haya cinco muestras, el modelo no se guarda si ese error supera
+`20°` de media o `45°` en alguna etapa. Esto evita cargar automáticamente una
+política incoherente en un brazo físico. Los modelos entrenados con la versión
+anterior se rechazan: hay que volver a entrenar con las demostraciones guardadas.
 
 Los avisos de captura no excluyen muestras completas marcadas como exitosas del
 entrenamiento. Para análisis offline, `train_policy(..., export_unvalidated=True)`
@@ -124,8 +134,9 @@ la aplicación de control físico.
 
 1. Carga automáticamente el modelo más reciente de `modelos/no_validados` o el
    modelo activo; también permite elegir otro `.npz`.
-2. Elegí una demostración guardada. Si el modelo registra la partición, se
-   selecciona inicialmente una de validación y se identifica como tal.
+2. Elegí una demostración guardada. En los modelos nuevos, cada demostración
+   muestra la predicción de validación cruzada: la de un modelo entrenado sin
+   ella. En los anteriores se selecciona una de validación, si está registrada.
 3. Recorré las etapas con Anterior/Siguiente, el selector o Reproducir 12 etapas.
 4. Compará las fotos, los ángulos enseñados, la predicción cruda y el error M1–M5.
 5. Pulsá **Ver predicción en Rerun** para visualizar las poses en una grabación

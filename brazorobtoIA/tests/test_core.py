@@ -27,10 +27,15 @@ from brazoia.config import (
 from brazoia.dataset import DemonstrationSession, load_successful_demonstrations
 from brazoia.execution import SupervisedExecution
 from brazoia.planner import build_motion_plan
-from brazoia.policy import MINIMUM_DEMONSTRATIONS, StagePolicy, train_policy
+from brazoia.policy import (
+    MINIMUM_DEMONSTRATIONS,
+    SCENE_FEATURE_INDICES,
+    StagePolicy,
+    train_policy,
+)
 from brazoia.robot import RobotSerial, parse_positions
 from brazoia.runlog import ExecutionLog
-from brazoia.vision import SceneObservation, detect_scene, observation_features
+from brazoia.vision import Detection, SceneObservation, detect_scene, observation_features
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -329,6 +334,7 @@ class PolicyTests(unittest.TestCase):
             features = np.linspace(0.1, 0.9, 32) + base * 0.01
             features[1] = 0.45 + base * 0.10
             features[17] = 0.55 - base * 0.08
+            features[[0, 8, 16, 24]] = 1.0  # cubo y recipiente detectados
             joints = {
                 str(motor_id): 120.0
                 + 7.0 * motor_id
@@ -367,8 +373,17 @@ class PolicyTests(unittest.TestCase):
             features = np.linspace(0.1, 0.9, 32)
             features[1] = 0.45
             features[17] = 0.55
+            features[[0, 8, 16, 24]] = 1.0
             prediction = model.predict(4, features)
             self.assertEqual(set(prediction), set(range(1, 6)))
+            self.assertEqual(model.metadata["validation"], "leave_one_demonstration_out")
+            held_out = model.metadata["held_out_predictions"]
+            self.assertEqual(set(held_out), set(model.metadata["source_demonstrations"]))
+            self.assertTrue(all(np.shape(values) == (12, 5) for values in held_out.values()))
+            outside = features.copy()
+            outside[1] = 0.95
+            with self.assertRaisesRegex(ValueError, "fuera de lo enseñado"):
+                model.predict(4, outside)
 
     def test_five_demonstrations_enable_pilot_training(self) -> None:
         self.assertEqual(MINIMUM_DEMONSTRATIONS, 5)
@@ -427,6 +442,88 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(model.metadata["captures_with_warnings"], 60)
 
 
+    def test_model_from_previous_training_version_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "v1.npz"
+            metadata = {"stages": list(KEYFRAME_STAGES), "schema": 1, "validation_passed": True}
+            np.savez(path, metadata_json=np.asarray(json.dumps(metadata)))
+            with self.assertRaisesRegex(ValueError, "versión anterior"):
+                StagePolicy.load(path)
+
+    def test_nearly_constant_pose_is_learned_from_few_demonstrations(self) -> None:
+        # Caso en que fallaba el modelo anterior: pose casi fija y escena con ruido.
+        rng = np.random.default_rng(3)
+        pose = np.array([180.0, 180.0, 120.0, 180.0, 263.0])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "demos"
+            root.mkdir()
+            center = rng.uniform(0.3, 0.7, 8)
+            for index in range(12):
+                scene = _scene_features(center + rng.normal(0, 0.03, 8))
+                joints = pose + rng.normal(0, 1.0, (12, 5))
+                _write_scene_demo(root, f"demo_{index:02d}", scene, joints)
+            report = train_policy(root, Path(temporary) / "model.npz", load_config().limits)
+            self.assertTrue(report.validation_passed)
+            self.assertLess(report.mean_absolute_error_degrees, 3.0)
+
+    def test_every_stage_is_predicted_from_the_inicio_scene(self) -> None:
+        rng = np.random.default_rng(7)
+        home = np.array([180.0, 180.0, 90.0, 180.0, 263.0])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "demos"
+            root.mkdir()
+            for index in range(12):
+                cube = rng.uniform(0.3, 0.7, 2)
+                scene = _scene_features(np.array([*cube, 0.6, 0.6, cube[0] + 0.05, cube[1] - 0.05, 0.4, 0.6]))
+                joints = 150.0 + 3.0 * np.arange(12)[:, None] + 60.0 * cube[0] - 40.0 * cube[1] + np.zeros((12, 5))
+                joints[0] = joints[-1] = home
+                # Después de Inicio el brazo tapa o lleva el cubo: esas fotos no sirven.
+                later = [_scene_features(rng.uniform(0.2, 0.8, 8)) for _ in KEYFRAME_STAGES]
+                _write_scene_demo(root, f"demo_{index:02d}", scene, joints, later)
+            report = train_policy(root, Path(temporary) / "model.npz", load_config().limits)
+            self.assertLess(report.mean_absolute_error_degrees, 1.0)
+
+    def test_scene_without_both_objects_is_excluded_and_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "demos"
+            root.mkdir()
+            for index in range(6):
+                self._write_demo(root, index)
+            metadata_path = root / "demo_005" / "metadata.json"
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+            data["stages"][0]["features"][0] = 0.0  # sin cubo en la cámara frontal
+            metadata_path.write_text(json.dumps(data), encoding="utf-8")
+            model_path = Path(temporary) / "model.npz"
+            report = train_policy(root, model_path, load_config().limits)
+            self.assertEqual((report.demonstrations, report.excluded_demonstrations), (5, 1))
+            model = StagePolicy.load(model_path)
+            self.assertEqual(model.metadata["excluded_demonstrations"][0]["demostracion"], "demo_005")
+            with self.assertRaisesRegex(ValueError, "no se detecta el cubo rojo en la cámara frontal"):
+                model.predict(3, data["stages"][0]["features"])
+
+
+def _scene_features(values: np.ndarray) -> np.ndarray:
+    """32 características con el cubo y el recipiente detectados y estas 8 coordenadas."""
+    features = np.full(32, 0.5)
+    features[[0, 8, 16, 24]] = 1.0
+    features[SCENE_FEATURE_INDICES] = values
+    return features
+
+
+def _write_scene_demo(root: Path, name: str, scene, joints, later_features=None) -> None:
+    path = root / name
+    path.mkdir()
+    stages = []
+    for stage_index, stage_name in enumerate(KEYFRAME_STAGES):
+        features = scene if stage_index == 0 or later_features is None else later_features[stage_index]
+        angles = {str(motor): float(joints[stage_index][motor - 1]) for motor in range(1, 6)}
+        angles["6"] = 0.0
+        stages.append({"stage": stage_name, "features": list(map(float, features)),
+                       "joint_degrees_logical": angles})
+    metadata = {"schema": 4, "status": "finished", "result": "success", "stages": stages}
+    (path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+
 class PlannerTests(unittest.TestCase):
     def test_motion_groups_never_command_more_than_two_motors(self) -> None:
         limits = load_config().limits
@@ -468,6 +565,37 @@ class ExecutionSequenceTests(unittest.TestCase):
             self.assertEqual(proposal.gripper_action, action)
             execution.mark_completed()
             self.assertEqual(execution.finished, stage_index == 11)
+
+
+    def test_every_stage_uses_the_scene_seen_from_inicio(self) -> None:
+        class RecordingPolicy:
+            canonical_start = np.asarray([180.0, 180.0, 160.0, 180.0, 170.0])
+            canonical_guard = canonical_start.copy()
+
+            def __init__(self):
+                self.scenes = []
+
+            def predict(self, _stage_index, features):
+                self.scenes.append(np.asarray(features).copy())
+                return {1: 180.0, 2: 180.0, 3: 160.0, 4: 180.0, 5: 170.0}
+
+        def scene(cube_x):
+            cube = Detection("red_cube", cube_x, 0.5, 0.1, 0.1, 0.01, 0.9, 1.0, 0.9, (0, 0, 1, 1))
+            container = Detection("lime_container", 0.5, 0.7, 0.3, 0.2, 0.06, 0.9, 0.6, 0.9, (0, 0, 1, 1))
+            return [SceneObservation(cube, container), SceneObservation(cube, container)]
+
+        policy = RecordingPolicy()
+        execution = SupervisedExecution(policy, load_config().limits)
+        current = {1: 180.0, 2: 180.0, 3: 160.0, 4: 180.0, 5: 170.0, 6: 0.0}
+        execution.prepare(current, scene(0.3))  # todavía en Inicio
+        execution.mark_completed()
+        while not execution.finished:
+            execution.prepare(current, scene(0.7))  # el brazo ya movió el cubo
+            execution.mark_completed()
+        self.assertEqual(len(policy.scenes), 10)  # Guardado usa la pose canónica
+        expected = observation_features(scene(0.3))
+        for features in policy.scenes:
+            np.testing.assert_array_equal(features, expected)
 
 
 if __name__ == "__main__":

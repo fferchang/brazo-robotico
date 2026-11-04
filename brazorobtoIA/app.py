@@ -951,7 +951,7 @@ class App:
             )
             self.training_status.set(
                 f"{model_kind} · {report.demonstrations} pruebas · "
-                f"MAE validación {report.mean_absolute_error_degrees:.2f}° "
+                f"MAE validación cruzada {report.mean_absolute_error_degrees:.2f}° "
                 f"· peor etapa {report.maximum_stage_mae_degrees:.2f}°"
             )
             self.log(str(report))

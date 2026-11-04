@@ -10,7 +10,8 @@ import numpy as np
 
 from brazoia.config import INITIAL_POSE, KEYFRAME_STAGES, load_config
 from brazoia.offline import OfflineModel
-from brazoia.policy import StagePolicy
+from brazoia.dataset import load_successful_demonstrations
+from brazoia.policy import StagePolicy, train_policy
 from offline_app import OfflineApp
 
 
@@ -110,6 +111,38 @@ class OfflineTests(unittest.TestCase):
                     ui.close()
                 else:
                     root.destroy()
+
+
+
+class SceneModelOfflineTests(unittest.TestCase):
+    def test_each_demonstration_shows_its_cross_validation_prediction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "demos"
+            for index in range(6):
+                features = np.full(32, 0.5)
+                features[[0, 8, 16, 24]] = 1.0
+                features[1] = 0.4 + 0.02 * index
+                joints = {str(m): 150.0 + 10.0 * m + 100.0 * (features[1] - 0.4) for m in range(1, 6)}
+                joints["6"] = 0.0
+                stages = [{"stage": name, "features": features.tolist(), "joint_degrees_logical": joints}
+                          for name in KEYFRAME_STAGES]
+                folder = root / f"demo_{index}"
+                folder.mkdir(parents=True)
+                (folder / "metadata.json").write_text(json.dumps(
+                    {"schema": 4, "status": "finished", "result": "success", "stages": stages}), encoding="utf-8")
+            model_path = Path(temporary) / "model.npz"
+            train_policy(root, model_path, load_config().limits, export_unvalidated=True)
+            model = OfflineModel(model_path)
+            self.assertFalse(hasattr(model, "predict"))
+            demo = load_successful_demonstrations(root)[0]
+            name = Path(demo["_path"]).name
+            held = model.evaluate(4, demo["stages"][4], scene_stage=demo["stages"][0], demo_name=name)
+            self.assertIn("Validación cruzada", " ".join(held["notes"]))
+            np.testing.assert_allclose(held["raw"], model.metadata["held_out_predictions"][name][4])
+            final = model.evaluate(4, demo["stages"][4], scene_stage=demo["stages"][0])
+            self.assertIn("no usada", " ".join(final["notes"]))
+            with self.assertRaises(ValueError):
+                model.evaluate(4, demo["stages"][4])
 
 
 if __name__ == "__main__":
