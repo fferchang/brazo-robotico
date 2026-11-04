@@ -190,7 +190,14 @@ class SupervisedExecution:
             }
         else:
             target = self.policy.predict(stage_index, self.scene_features)
-        groups = build_motion_plan(current, target, self.limits)
+        # La política geométrica agrega puntos previos (descenso y retiro verticales);
+        # el modelo aprendido no tiene.
+        via_points = self.policy.via(stage_index, self.scene_features) if hasattr(self.policy, "via") else []
+        groups = []
+        start = dict(current)
+        for waypoint in (*via_points, target):
+            groups.extend(build_motion_plan(start, waypoint, self.limits))
+            start = {**start, **waypoint}
         gripper_action = {
             "aproximacion_2": "open",
             "aproximacion_3": "close",

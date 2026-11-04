@@ -170,6 +170,7 @@ Then, from the `brazorobtoIA` folder:
 - `SIMULACION_MUJOCO.bat` for the virtual pick & place (no hardware needed)
 - `CALIBRACION.bat` for the model-to-arm calibration
 - `PRUEBA_HARDWARE.bat` for a read-only check of the cameras and the ESP32 (no movement, no torque changes)
+- `SIMULACION_GEOMETRICA.bat` for the geometric mode (calibrated cameras + inverse kinematics) with virtual cameras
 
 ---
 

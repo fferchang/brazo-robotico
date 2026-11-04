@@ -33,7 +33,7 @@ from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
 from brazoia.rerun_view import RerunArmView
 from brazoia.robot import RobotEvent, RobotSerial
 from brazoia.runlog import ExecutionLog
-from brazoia.vision import cube_inside_container, detect_scene, draw_observation
+from brazoia.vision import cube_inside_container, detect_scene, draw_observation, observation_features
 
 
 def build_reference_pose_plan(
@@ -126,6 +126,10 @@ class App:
         self.demo_status = tk.StringVar(value="Sin demostración activa")
         self.training_status = tk.StringVar(value="Modelo no cargado")
         self.auto_status = tk.StringVar(value="Modo automático detenido")
+        # "aprendido": modelo entrenado con demostraciones; "geometrico": cámaras calibradas
+        # y cinemática inversa del modelo 3D (brazoia/politica_geometrica.py).
+        self.automatic_mode = tk.StringVar(value="aprendido")
+        self.geometric_model = None  # (VirtualArm, PickPlaceExpert): armarlo tarda ~1 s
         self.notes = tk.StringVar()
         self.port = tk.StringVar(value=self.config.port)
         self.rotation_vars = [
@@ -347,6 +351,7 @@ class App:
         training.pack(fill="x", padx=8, pady=5)
         ttk.Button(training, text="Trayecto desde brazo · simulación", command=self.open_trajectory_simulator).pack(side="bottom", anchor="w", pady=4)
         ttk.Button(training, text="Calibración · toques de mesa", command=self.open_calibration).pack(side="bottom", anchor="w", pady=4)
+        ttk.Button(training, text="Calibración · cámaras", command=self.open_camera_calibration).pack(side="bottom", anchor="w", pady=4)
         self.demo_count = tk.StringVar(value="0 demostraciones exitosas")
         ttk.Label(training, textvariable=self.demo_count).pack(side="left")
         ttk.Button(training, text="Entrenar / actualizar modelo", command=self.train_model).pack(side="left", padx=12)
@@ -356,6 +361,12 @@ class App:
 
         automatic = ttk.LabelFrame(self.content, text="Ejecución automática supervisada", padding=8)
         automatic.pack(fill="x", padx=8, pady=5)
+        modes = ttk.Frame(automatic)
+        modes.pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(modes, text="Modelo aprendido", value="aprendido",
+                        variable=self.automatic_mode).pack(anchor="w")
+        ttk.Radiobutton(modes, text="Geométrico (cámaras calibradas)", value="geometrico",
+                        variable=self.automatic_mode).pack(anchor="w")
         ttk.Button(automatic, text="Iniciar tarea", command=self.start_automatic).pack(side="left", padx=3)
         ttk.Button(automatic, text="Preparar siguiente etapa", command=self.prepare_next_stage).pack(side="left", padx=3)
         ttk.Button(automatic, text="CONFIRMAR Y MOVER", command=self.confirm_stage).pack(side="left", padx=10)
@@ -932,6 +943,35 @@ class App:
         window.trajectory = TrajectoryApp(window, project_root=self.config.root,
                                          real_pose_provider=self.simulation_snapshot_pose)
 
+    def calibration_scene(self):
+        """Escena actual para la calibración de cámaras; solo lee, no ordena nada."""
+        if len(self.cameras) != 2:
+            raise ValueError("Abrí primero las dos cámaras en la aplicación principal.")
+        problem = validate_frame_pair(
+            self.snapshots,
+            time.monotonic(),
+            maximum_age=self.config.capture.maximum_camera_age_seconds,
+            maximum_skew=self.config.capture.maximum_camera_skew_seconds,
+        )
+        if problem:
+            raise ValueError(problem)
+        if len(self.observations) != 2:
+            raise ValueError("Todavía no hay detección de las dos cámaras.")
+        return observation_features(self.observations)
+
+    def open_camera_calibration(self):
+        from brazoia.calibracion_camaras import settings_from_config
+        from calibracion_camaras_app import CameraCalibrationApp
+
+        window = tk.Toplevel(self.root)
+        window.camera_calibration = CameraCalibrationApp(
+            window,
+            project_root=self.config.root,
+            scene_provider=self.calibration_scene,
+            pose_provider=self.simulation_snapshot_pose,
+            camera_settings=settings_from_config(self.config.cameras),
+        )
+
     def open_calibration(self):
         from calibracion_app import CalibrationApp
         window = tk.Toplevel(self.root)
@@ -988,11 +1028,11 @@ class App:
         if self.execution is not None:
             self.status.set("Ya hay una tarea automática activa; terminala o marcala como detenida.")
             return
-        if self.policy is None:
-            self.status.set("Entrená o cargá primero un modelo.")
-            return
         if self.robot is None or not self.robot.connected or len(self.cameras) != 2:
             self.status.set("Abrí cámaras y conectá el robot.")
+            return
+        policy = self.automatic_policy()
+        if policy is None:
             return
         snapshot = self.robot.snapshot()
         if 6 not in snapshot.positions:
@@ -1004,7 +1044,7 @@ class App:
         if gripper_problem:
             self.status.set("Para iniciar la tarea automática: " + gripper_problem)
             return
-        self.execution = SupervisedExecution(self.policy, self.config.limits)
+        self.execution = SupervisedExecution(policy, self.config.limits)
         self.executor = MotionExecutor(
             self.robot, status=lambda text: self.worker_messages.put(("log", text))
         )
@@ -1013,6 +1053,30 @@ class App:
         self.execution_busy = False
         self.set_camera_controls_enabled(False)
         self.auto_status.set("Tarea iniciada. Prepará la recuperación/inicio.")
+
+    def automatic_policy(self):
+        """Modelo aprendido o política geométrica, según el modo elegido."""
+        if self.automatic_mode.get() == "geometrico":
+            from brazoia.politica_geometrica import load_geometric_policy
+
+            try:
+                if self.geometric_model is None:
+                    from brazoia.mujoco_sim import PickPlaceExpert, VirtualArm
+
+                    arm = VirtualArm(limits=self.config.limits)
+                    self.geometric_model = (arm, PickPlaceExpert(arm))
+                arm, expert = self.geometric_model
+                # Se relee en cada tarea: toma una calibración recién guardada.
+                policy = load_geometric_policy(self.config, arm=arm, expert=expert)
+            except (OSError, ValueError) as exc:
+                self.status.set(f"Modo geométrico: {exc}")
+                return None
+            self.log(f"Modo geométrico con la calibración de cámaras del {policy.metadata['calibracion']}.")
+            return policy
+        if self.policy is None:
+            self.status.set("Entrená o cargá primero un modelo.")
+            return None
+        return self.policy
 
     def prepare_next_stage(self) -> None:
         if self.execution_busy:
@@ -1030,6 +1094,8 @@ class App:
         except Exception as exc:
             self.status.set(str(exc))
             return
+        if proposal.stage_index == 1 and hasattr(self.execution.policy, "describe"):
+            self.log(self.execution.policy.describe(self.execution.scene_features))
         target_text = " | ".join(f"M{i}={v:.1f}°" for i, v in proposal.target.items())
         self.auto_status.set(f"PROPUESTA: {proposal.label} · {target_text}")
         self.status.set("Revisá la propuesta y Rerun. Nada se moverá hasta confirmar.")
