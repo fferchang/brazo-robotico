@@ -1,9 +1,29 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import sys
 from pathlib import Path
 
 from .gripper_geometry import GripperGeometry, joint_angle
+
+
+def ensure_viewer_on_path() -> None:
+    """El SDK busca el visor `rerun` solo en el PATH.
+
+    Los lanzadores corren `.venv\\Scripts\\python.exe` sin activar el entorno, así
+    que el `rerun.exe` que instala `rerun-sdk` junto a ese Python no está en el
+    PATH. Se suma su carpeta al PATH de este proceso.
+    """
+    if shutil.which("rerun"):
+        return
+    folder = Path(sys.executable).resolve().parent
+    candidates = [folder, folder / "Scripts", folder.parent / "Scripts", folder.parent / "bin"]
+    for candidate in candidates:
+        if shutil.which("rerun", path=str(candidate)):
+            os.environ["PATH"] = str(candidate) + os.pathsep + os.environ.get("PATH", "")
+            return
 
 
 class RerunArmView:
@@ -42,6 +62,7 @@ class RerunArmView:
                     "so_arm100/collision_geometries": rrb.EntityBehavior(visible=False)
                 },
             )
+            ensure_viewer_on_path()
             recording.spawn(default_blueprint=blueprint, hide_welcome_screen=True)
             recording.log_file_from_path(urdf_path, static=True)
             tree = rr.urdf.UrdfTree.from_file_path(urdf_path)
