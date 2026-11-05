@@ -55,7 +55,7 @@ FLOOR_MARGIN_MM = 5.0
 # ~6° menos), así que la física usa el modelo sin margen.
 PART_CLEARANCE = 0.003
 # Separación mínima entre el brazo y el recipiente al planificar. La ubicación del
-# recipiente sale de las cámaras, con ~8 mm de error típico (CALIBRACION_CAMARAS.md).
+# recipiente sale de las cámaras, con ~8 mm de error típico (docs/CALIBRACION_CAMARAS.md).
 CONTAINER_CLEARANCE = 0.012
 
 # Inclinaciones de la garra hacia afuera que prueba la IK, en orden de preferencia.

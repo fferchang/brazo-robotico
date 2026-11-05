@@ -1,6 +1,6 @@
 # Simulación física en MuJoCo
 
-Abrir `SIMULACION_MUJOCO.bat`. Se abre el visor de MuJoCo con el brazo, la
+Abrir `lanzadores/SIMULACION_MUJOCO.bat`. Se abre el visor de MuJoCo con el brazo, la
 mesa, un cubo rojo y el recipiente verde lima, y se ejecutan tres episodios de
 la tarea completa con posiciones al azar del cubo y del recipiente. La consola
 informa el resultado de cada episodio. Al terminar, la ventana queda abierta
@@ -23,7 +23,7 @@ Se agregan al `.bat` o a `simulacion_mujoco.py`:
   etapa, con los mismos nombres que las demostraciones reales, y un `metadata.json`.
 - `--cerrar-al-terminar`: cierra el visor al final en lugar de esperar.
 
-Ejemplo: `SIMULACION_MUJOCO.bat --sin-visor --episodios 100`.
+Ejemplo: `lanzadores/SIMULACION_MUJOCO.bat --sin-visor --episodios 100`.
 
 ## Qué hace
 

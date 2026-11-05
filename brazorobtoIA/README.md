@@ -74,7 +74,7 @@ Así, los archivos de dos pruebas distintas nunca se mezclan.
 
 ## Instalación
 
-Ejecutar `INSTALAR.bat` una sola vez. Después, `INICIAR.bat` abre la aplicación.
+Ejecutar `lanzadores/INSTALAR.bat` una sola vez. Después, `lanzadores/INICIAR.bat` abre la aplicación.
 La instalación puede necesitar Internet para descargar dependencias; la ejecución
 posterior es completamente local.
 
@@ -127,7 +127,7 @@ desactiva reglas geométricas, límites de motores ni protecciones del firmware.
 
 ### Probar un modelo sin hardware
 
-Abrí `PRUEBA_OFFLINE.bat`, o **Probar modelo OFFLINE** junto al botón de entrenar.
+Abrí `lanzadores/PRUEBA_OFFLINE.bat`, o **Probar modelo OFFLINE** junto al botón de entrenar.
 Es una ventana/proceso separado: no abre COM, no captura cámaras en vivo y no
 envía órdenes al brazo. Puede abrir modelos experimentales sin habilitarlos en
 la aplicación de control físico.
@@ -157,18 +157,18 @@ el operador registra el resultado real.
 
 ## Simulación física en MuJoCo
 
-`SIMULACION_MUJOCO.bat` ejecuta la tarea completa en un entorno virtual con
+`lanzadores/SIMULACION_MUJOCO.bat` ejecuta la tarea completa en un entorno virtual con
 física: el brazo, la mesa, el cubo y el recipiente. Un experto por cinemática
 inversa calcula las doce poses a partir de la posición del cubo y del recipiente,
 sin demostraciones. No abre puertos serie ni usa las cámaras reales. Ver
-`SIMULACION_MUJOCO.md`.
+`docs/SIMULACION_MUJOCO.md`.
 
 ## Calibración modelo-brazo
 
-`CALIBRACION.bat`, o **Calibración · toques de mesa** en la sección de
+`lanzadores/CALIBRACION.bat`, o **Calibración · toques de mesa** en la sección de
 entrenamiento, abre una ventana de solo lectura. Captura toques de la garra
 sobre la mesa y la garra cerrada, y estima la altura real de la mesa y los ceros
-de M2–M4 y M6. No modifica `calibracion.json`. Ver `CALIBRACION.md`.
+de M2–M4 y M6. No modifica `calibracion.json`. Ver `docs/CALIBRACION.md`.
 
 ## Modo geométrico: cámaras calibradas
 
@@ -178,8 +178,8 @@ recipiente, y la cinemática inversa del modelo 3D calcula las doce poses, con
 descenso y retiro verticales y un empuje que deja el cubo apoyado contra el dedo
 fijo antes de cerrar. Se elige en **Ejecución automática supervisada**
 y sigue pidiendo confirmación en cada etapa. Necesita una calibración hecha con
-**Calibración · cámaras**; `SIMULACION_GEOMETRICA.bat` lo prueba con cámaras
-virtuales. Ver `CALIBRACION_CAMARAS.md`.
+**Calibración · cámaras**; `lanzadores/SIMULACION_GEOMETRICA.bat` lo prueba con cámaras
+virtuales. Ver `docs/CALIBRACION_CAMARAS.md`.
 
 ## Hardware esperado
 
@@ -192,7 +192,7 @@ virtuales. Ver `CALIBRACION_CAMARAS.md`.
 
 ## Prueba de hardware
 
-`PRUEBA_HARDWARE.bat` revisa las cámaras y el ESP32 en modo solo lectura: no
+`lanzadores/PRUEBA_HARDWARE.bat` revisa las cámaras y el ESP32 en modo solo lectura: no
 mueve el brazo ni cambia el torque, y al ESP32 solo le envía `help`, `posall` y
 `scan`. Antes de ejecutarla, cerrá la aplicación principal, dejá el brazo quieto
 y poné el cubo y el recipiente a la vista de las dos cámaras.
@@ -221,7 +221,7 @@ el contorno de la garra, según la apertura de M6 y para cualquier giro de M5,
 tiene que quedar a más de 5 mm de la mesa. Su modelo plano sale del modelo 3D
 calibrado (eje M2 a 121,9 mm de la mesa). Si la pose actual ya está bajo ese
 margen, se permite salir sin acercarse más a la mesa. Detalle en
-`REGLAS_GEOMETRIA.md`. Tras cambiar el firmware hay que volver a cargarlo en
+`docs/REGLAS_GEOMETRIA.md`. Tras cambiar el firmware hay que volver a cargarlo en
 el ESP32.
 
 El botón **Torque ON** usa la orden global compatible con ambas versiones del

@@ -109,7 +109,7 @@ y el recipiente. Tener la mano cerca de **EMERGENCIA · TORQUE OFF**.
 
 ## Simulación con cámaras virtuales
 
-`SIMULACION_GEOMETRICA.bat` (`simulacion_geometrica.py`) corre el circuito
+`lanzadores/SIMULACION_GEOMETRICA.bat` (`simulacion_geometrica.py`) corre el circuito
 completo en MuJoCo: calibra las cámaras virtuales con escenas al azar y prueba
 escenas nuevas con física. Opciones: `--muestras`, `--episodios`, `--semilla`,
 `--con-recipiente`, `--giro-max`, `--comparar-ideal` y `--tolerancia`.

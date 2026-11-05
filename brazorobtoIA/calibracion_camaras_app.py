@@ -3,7 +3,7 @@
 Se abre desde la aplicación principal («Calibración · cámaras»), que le pasa la
 escena detectada y la telemetría que ya recibe. No abre puertos, no cambia
 torque ni envía movimientos: la garra se abre y se cierra desde la aplicación
-principal. Ver CALIBRACION_CAMARAS.md.
+principal. Ver docs/CALIBRACION_CAMARAS.md.
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ class CameraCalibrationApp:
         ttk.Label(content, wraplength=950, text=(
             "Esta ventana solo lee la escena detectada y la telemetría que ya recibe la aplicación "
             "principal: nunca mueve el brazo ni cambia el torque. Las capturas se guardan solas en "
-            "datos/calibracion/. Guía completa: CALIBRACION_CAMARAS.md.")).pack(anchor="w", pady=(4, 8))
+            "datos/calibracion/. Guía completa: docs/CALIBRACION_CAMARAS.md.")).pack(anchor="w", pady=(4, 8))
         capture = ttk.LabelFrame(content, text="Captura", padding=10)
         capture.pack(fill="both", expand=True)
         ttk.Label(capture, wraplength=930, justify="left", text=INSTRUCTIONS).pack(anchor="w")

@@ -1,7 +1,7 @@
 """Pick & place del SO-100 en MuJoCo, solo virtual.
 
 No importa el controlador serie, no abre puertos, no usa cámaras reales y no
-modifica demostraciones ni modelos. Ver SIMULACION_MUJOCO.md.
+modifica demostraciones ni modelos. Ver docs/SIMULACION_MUJOCO.md.
 """
 from __future__ import annotations
 
