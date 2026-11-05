@@ -55,6 +55,8 @@ class CameraCalibrationWindowTests(unittest.TestCase):
                 self.assertEqual(len(app.samples), 20)
                 saved = json.loads(app.captures_path.read_text(encoding="utf-8"))
                 self.assertEqual(len(saved["muestras"]), 20)
+                # Los ángulos del agarre quedan guardados para recalcular la mesa si cambia el modelo 3D.
+                self.assertEqual(saved["muestras"][0]["angulos"], {str(motor): 180.0 for motor in range(1, 7)})
                 app.save_active()
                 self.assertIn("Primero calculá", app.status.get())
                 app.calculate()
@@ -67,6 +69,7 @@ class CameraCalibrationWindowTests(unittest.TestCase):
                 reloaded = CameraCalibrationApp(root, project_root=Path(temporary), locator=locator)
                 reloaded.load_captures(app.captures_path)
                 self.assertEqual(len(reloaded.samples), 19)
+                self.assertEqual(reloaded.samples[0].pose, {motor: 180.0 for motor in range(1, 7)})
             finally:
                 root.destroy()
 

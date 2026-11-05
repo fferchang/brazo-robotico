@@ -40,10 +40,15 @@ En la aplicación principal: abrir las cámaras, conectar el ESP32 y pulsar
 
 Hacen falta al menos 8 lugares de cada uno, y conviene 15 o más, repartidos
 por toda la zona donde van a ir el cubo y el recipiente: cerca y lejos de la
-base, a izquierda y derecha. La aplicación no ubica objetos a más de 3 cm de
-la zona calibrada. Cada muestra se guarda sola en
-`datos/calibracion/camaras_capturas_<fecha>.json`; **Cargar capturas…** permite
-retomar una sesión.
+base, a izquierda y derecha, y también a media distancia. Las 17 muestras del
+4/11 quedaron en dos filas, a unos 16–20 cm y 27–30 cm hacia adelante de la
+base: entre 21 y 26 cm no hay ninguna, y el error ahí no está medido. La
+aplicación no ubica objetos a más de 3 cm de la zona
+calibrada. Cada muestra se guarda sola en
+`datos/calibracion/camaras_capturas_<fecha>.json`, con los ángulos del agarre:
+si después cambia la calibración del modelo 3D (ceros de M3/M4, sentido de M1),
+la posición en la mesa se puede recalcular sin repetir la captura. **Cargar
+capturas…** permite retomar una sesión.
 
 Sin muestras propias, el recipiente usa el mapeo del cubo. En la simulación eso
 agrega 10–13 mm de error, frente a 1–5 mm con muestras propias.
@@ -52,7 +57,20 @@ agrega 10–13 mm de error, frente a 1–5 mm con muestras propias.
 
 **Calcular calibración** prueba varios mapeos (homografía de cada cámara,
 polinomios, combinación de ambas) y elige el de menor error al dejar cada
-muestra afuera. Informa la mediana, el 90 % y el máximo en milímetros. Como
+muestra afuera. Informa la mediana, el 90 % y el máximo en milímetros.
+
+Los mapeos de reproyección ajustan, para cada cámara, dónde se ve cada punto de
+la mesa, y ubican el objeto donde las dos imágenes coinciden mejor. Así cada
+cámara pesa en la dirección que resuelve bien: con las cámaras reales, la
+frontal mueve 1,6 píxeles por milímetro de izquierda a derecha pero solo 0,26
+de cerca a lejos (unos 4 mm por píxel), y la lateral, 0,8 píxeles por
+milímetro de cerca a lejos. El mapeo compartido suma las muestras del otro
+objeto, corridas en la mesa por la diferencia media entre los dos (unos 7 mm
+el 4/11). Con las capturas del 4/11, la homografía frontal daba una mediana de
+18 mm (90 % ≤ 35 mm); el mapeo compartido da 8 mm (90 % ≤ 16 mm) para el cubo y
+8 mm (90 % ≤ 15 mm) para el recipiente.
+
+Como
 estimación, con un cubo de 5 cm conviene una mediana de 1 cm o menos: con
 errores mayores un dedo puede caer sobre el cubo al bajar.
 **Guardar como calibración activa** escribe `datos/calibracion/camaras.json`.

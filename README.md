@@ -117,9 +117,9 @@ brazo-robotico/
 | Learned policy | 🔄 Experimental, not validated (validation error 44°; more demonstrations needed) |
 | MuJoCo simulation + inverse kinematics | ✅ 100/100 virtual pick & place episodes |
 | 3D model calibration | ✅ Table and gripper (Oct 2026); M3/M4 zeros and M1 direction pending |
-| Geometric safety rules (planner + firmware) | ✅ Retuned Nov 2026 — new firmware pending upload to the ESP32 |
+| Geometric safety rules (planner + firmware) | ✅ Retuned Nov 2026 — firmware uploaded to the ESP32 on Nov 4 |
 | Gripper current protection | 🔄 Fixes pending (`brazorobtoIA/DIAGNOSTICO_GARRA.md`) |
-| Camera calibration (sim ↔ real) | ⏳ Pending |
+| Camera calibration (sim ↔ real) | 🔄 First real calibration (Nov 4, 17 samples): ~8 mm median error; geometric mode not yet run on the real arm |
 | YOLO fine-tuning | ⏳ Pending — the current version detects by color |
 | Full sorting demo | ⏳ Target: Nov 2026 |
 

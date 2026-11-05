@@ -160,11 +160,13 @@ class CameraCalibrationApp:
                             "acomodá la escena y tomá otra foto.")
             return
         try:
-            x, y = self.locate(self.read_pose())
+            pose = self.read_pose()
+            x, y = self.locate(pose)
         except Exception as exc:
             self.status.set(f"No se pudo registrar: {exc}")
             return
-        sample = Sample(kind, dict(self.pending[kind]), (float(x), float(y)), f"captura {len(self.samples) + 1}")
+        sample = Sample(kind, dict(self.pending[kind]), (float(x), float(y)), f"captura {len(self.samples) + 1}",
+                        pose=pose)
         self.samples.append(sample)
         self.used.add(kind)
         self._insert_row(sample)

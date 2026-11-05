@@ -35,6 +35,11 @@ TABLE_MARGIN_M = 0.03
 PIXEL_MARGIN = 0.05
 
 # Mapeos candidatos: cámaras que usan y muestras mínimas para ajustarlos.
+# Los de reproyección ajustan mesa → imagen en cada cámara y ubican el objeto
+# donde las dos imágenes coinciden mejor: cada cámara pesa en la dirección que
+# resuelve bien (la frontal, izquierda-derecha; la lateral, cerca-lejos de la
+# base). El compartido suma las muestras del otro objeto, corridas en la mesa
+# por la diferencia media entre los dos.
 CANDIDATES = {
     "homografia_frontal": (("frontal",), 4),
     "homografia_lateral": (("lateral",), 4),
@@ -44,31 +49,45 @@ CANDIDATES = {
     "cuadraticas_promedio": (CAMERAS, 7),
     "conjunta_lineal": (CAMERAS, 6),
     "conjunta_cuadratica": (CAMERAS, 19),
+    "reproyeccion": (CAMERAS, 4),
+    "reproyeccion_compartida": (CAMERAS, 4),
 }
+SHARED_MODEL = "reproyeccion_compartida"
+# Muestras del otro objeto para que el corrimiento entre los dos sea confiable.
+MINIMUM_SHARED_SAMPLES = 4
 
 
 @dataclass(frozen=True)
 class Sample:
+    """Una muestra. `pose` son los ángulos del agarre: con ellos se puede recalcular
+    `table_xy` si después cambia la calibración del modelo 3D (ceros de M3/M4, M1)."""
+
     kind: str
     pixels: dict[str, tuple[float, float]]
     table_xy: tuple[float, float]
     source: str = ""
+    pose: dict[int, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "tipo": self.kind,
             "pixeles": {camera: list(value) for camera, value in self.pixels.items()},
             "mesa_m": list(self.table_xy),
             "origen": self.source,
         }
+        if self.pose is not None:
+            result["angulos"] = {str(motor): float(value) for motor, value in sorted(self.pose.items())}
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Sample":
+        angles = data.get("angulos")
         return cls(
             kind=str(data["tipo"]),
             pixels={camera: (float(v[0]), float(v[1])) for camera, v in data["pixeles"].items()},
             table_xy=(float(data["mesa_m"][0]), float(data["mesa_m"][1])),
             source=str(data.get("origen", "")),
+            pose=None if angles is None else {int(motor): float(value) for motor, value in angles.items()},
         )
 
 
@@ -143,12 +162,77 @@ def _apply_homography(matrix: np.ndarray, point: Sequence[float]) -> np.ndarray:
     return result[:2] / result[2]
 
 
-def _fit(name: str, samples: Sequence[Sample]) -> dict[str, Any]:
+def _project_with_jacobian(matrix: np.ndarray, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Punto de la imagen para `xy` en la mesa y su derivada respecto de `xy`."""
+    numerator = matrix[:2, :2] @ xy + matrix[:2, 2]
+    denominator = float(matrix[2, :2] @ xy + matrix[2, 2])
+    if abs(denominator) < 1e-9:
+        raise ValueError("El punto queda en el horizonte de la cámara.")
+    pixel = numerator / denominator
+    return pixel, (matrix[:2, :2] - np.outer(pixel, matrix[2, :2])) / denominator
+
+
+def _reprojection_locate(forward: dict[str, np.ndarray], pixels: dict[str, tuple[float, float]]) -> np.ndarray:
+    """Punto de la mesa que mejor explica lo que ve cada cámara (Gauss-Newton)."""
+    position = np.mean(
+        [_apply_homography(np.linalg.inv(matrix), pixels[camera]) for camera, matrix in forward.items()], axis=0
+    )
+    for _ in range(20):
+        residuals, jacobians = [], []
+        for camera, matrix in forward.items():
+            pixel, jacobian = _project_with_jacobian(matrix, position)
+            residuals.append(pixel - np.asarray(pixels[camera]))
+            jacobians.append(jacobian)
+        step = np.linalg.lstsq(np.vstack(jacobians), -np.concatenate(residuals), rcond=None)[0]
+        position = position + step
+        if not np.isfinite(position).all():
+            raise ValueError("No converge la ubicación por reproyección.")
+        if np.linalg.norm(step) < 1e-7:
+            break
+    return position
+
+
+def _fit_forward(samples: Sequence[Sample], targets: np.ndarray) -> dict[str, np.ndarray]:
+    return {
+        camera: _fit_homography(targets, np.array([sample.pixels[camera] for sample in samples]))
+        for camera in CAMERAS
+    }
+
+
+def _fit_shared(samples: Sequence[Sample], shared: Sequence[Sample]) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Mesa → imagen con las muestras propias y las del otro objeto, corridas en la mesa.
+
+    El corrimiento junta lo que separa a los dos objetos aunque estén en el mismo
+    lugar: el centro detectado de un objeto más grande, o dónde se sostuvo el cubo
+    sobre el recipiente. Se estima alternando con el ajuste: cada vuelta el ajuste
+    absorbe parte del corrimiento, así que converge en unas 20 vueltas.
+    """
+    group = [*samples, *shared]
+    own = np.array([sample.table_xy for sample in samples])
+    other = np.array([sample.table_xy for sample in shared])
+    offset = np.zeros(2)
+    for _ in range(60):
+        forward = _fit_forward(group, np.vstack([own, other + offset]))
+        located = np.array([_reprojection_locate(forward, sample.pixels) for sample in shared])
+        correction = np.mean(located - (other + offset), axis=0)
+        offset = offset + correction
+        if np.linalg.norm(correction) < 1e-7:
+            break
+    return _fit_forward(group, np.vstack([own, other + offset])), offset
+
+
+def _fit(name: str, samples: Sequence[Sample], shared: Sequence[Sample] = ()) -> dict[str, Any]:
     targets = np.array([sample.table_xy for sample in samples])
 
     def points(camera):
         return np.array([sample.pixels[camera] for sample in samples])
 
+    if name == "reproyeccion":
+        return {camera: matrix.tolist() for camera, matrix in _fit_forward(samples, targets).items()}
+    if name == SHARED_MODEL:
+        forward, offset = _fit_shared(samples, shared)
+        return {**{camera: matrix.tolist() for camera, matrix in forward.items()},
+                "corrimiento_compartidas_m": offset.tolist()}
     if name.startswith("homografia_"):
         return {"H": _fit_homography(points(name.split("_")[1]), targets).tolist()}
     if name.startswith("cuadratica_"):
@@ -163,6 +247,8 @@ def _fit(name: str, samples: Sequence[Sample]) -> dict[str, Any]:
 
 
 def _predict(name: str, params: dict[str, Any], pixels: dict[str, tuple[float, float]]) -> np.ndarray:
+    if name in ("reproyeccion", SHARED_MODEL):
+        return _reprojection_locate({camera: np.asarray(params[camera]) for camera in CAMERAS}, pixels)
     if name.startswith("homografia_"):
         return _apply_homography(params["H"], pixels[name.split("_")[1]])
     if name.startswith("cuadratica_"):
@@ -179,12 +265,13 @@ def _predict(name: str, params: dict[str, Any], pixels: dict[str, tuple[float, f
     return (_monomials(joint, int(params["grado"])) @ np.asarray(params["coef"]))[0]
 
 
-def _loo_errors(name: str, samples: Sequence[Sample]) -> np.ndarray:
+def _loo_errors(name: str, samples: Sequence[Sample], shared: Sequence[Sample] = ()) -> np.ndarray:
+    """Error de cada muestra propia ajustando sin ella; las compartidas quedan siempre."""
     errors = np.full(len(samples), math.inf)
     for index, sample in enumerate(samples):
         others = [item for position, item in enumerate(samples) if position != index]
         try:
-            prediction = _predict(name, _fit(name, others), sample.pixels)
+            prediction = _predict(name, _fit(name, others, shared), sample.pixels)
         except (np.linalg.LinAlgError, ValueError):
             continue
         if np.isfinite(prediction).all():
@@ -215,6 +302,7 @@ class Mapping:
     validation: dict[str, float]
     candidates: dict[str, dict[str, float]]
     samples: int
+    shared_samples: int = 0
 
     @property
     def cameras(self) -> tuple[str, ...]:
@@ -231,6 +319,7 @@ class Mapping:
             "validacion_cruzada": self.validation,
             "candidatos": self.candidates,
             "muestras": self.samples,
+            "muestras_compartidas": self.shared_samples,
         }
 
     @classmethod
@@ -247,6 +336,7 @@ class Mapping:
             validation=dict(data["validacion_cruzada"]),
             candidates=dict(data["candidatos"]),
             samples=int(data["muestras"]),
+            shared_samples=int(data.get("muestras_compartidas", 0)),
         )
 
     def locate(self, pixels: dict[str, tuple[float, float]], label: str) -> tuple[float, float]:
@@ -274,19 +364,30 @@ class Mapping:
         return float(position[0]), float(position[1])
 
 
-def fit_mapping(samples: Sequence[Sample]) -> Mapping:
-    """Elige el mapeo con menor error medio al dejar cada muestra afuera."""
-    usable = [sample for sample in samples if all(camera in sample.pixels for camera in CAMERAS)]
+def _complete(samples: Sequence[Sample]) -> list[Sample]:
+    return [sample for sample in samples if all(camera in sample.pixels for camera in CAMERAS)]
+
+
+def fit_mapping(samples: Sequence[Sample], shared: Sequence[Sample] = ()) -> Mapping:
+    """Elige el mapeo con menor error medio al dejar cada muestra afuera.
+
+    `shared` son muestras del otro objeto: solo las usa el mapeo compartido, y el
+    error se sigue midiendo con las muestras propias.
+    """
+    usable = _complete(samples)
     if len(usable) < MINIMUM_SAMPLES:
         raise ValueError(
             f"Se necesitan al menos {MINIMUM_SAMPLES} muestras con detección en las dos cámaras; "
             f"hay {len(usable)}."
         )
+    shared_usable = _complete(shared)
     candidates: dict[str, dict[str, float]] = {}
     for name, (_cameras, minimum) in CANDIDATES.items():
         if len(usable) - 1 < minimum:
             continue
-        errors = _loo_errors(name, usable)
+        if name == SHARED_MODEL and len(shared_usable) < MINIMUM_SHARED_SAMPLES:
+            continue
+        errors = _loo_errors(name, usable, shared_usable)
         if np.isfinite(errors).all():
             candidates[name] = _error_summary(errors)
     if not candidates:
@@ -294,17 +395,27 @@ def fit_mapping(samples: Sequence[Sample]) -> Mapping:
     # Ante errores parecidos (menos de 1 mm), el mapeo más simple: el orden de CANDIDATES.
     best_error = min(item["media_mm"] for item in candidates.values())
     model = next(name for name in CANDIDATES if name in candidates and candidates[name]["media_mm"] <= best_error + 1.0)
-    targets = np.array([sample.table_xy for sample in usable])
+    params = _fit(model, usable, shared_usable)
+    # La zona calibrada es la que cubren las muestras del ajuste; las compartidas,
+    # llevadas al marco de este objeto.
+    zone = list(usable)
+    targets = [sample.table_xy for sample in usable]
+    if model == SHARED_MODEL:
+        zone += shared_usable
+        offset = np.asarray(params["corrimiento_compartidas_m"])
+        targets += [tuple(np.asarray(sample.table_xy) + offset) for sample in shared_usable]
+    targets = np.array(targets)
     return Mapping(
         model=model,
-        params=_fit(model, usable),
-        table_min=tuple(targets.min(axis=0)),
-        table_max=tuple(targets.max(axis=0)),
-        pixel_min={camera: tuple(np.min([s.pixels[camera] for s in usable], axis=0)) for camera in CAMERAS},
-        pixel_max={camera: tuple(np.max([s.pixels[camera] for s in usable], axis=0)) for camera in CAMERAS},
+        params=params,
+        table_min=tuple(map(float, targets.min(axis=0))),
+        table_max=tuple(map(float, targets.max(axis=0))),
+        pixel_min={camera: tuple(map(float, np.min([s.pixels[camera] for s in zone], axis=0))) for camera in CAMERAS},
+        pixel_max={camera: tuple(map(float, np.max([s.pixels[camera] for s in zone], axis=0))) for camera in CAMERAS},
         validation=candidates[model],
         candidates=candidates,
         samples=len(usable),
+        shared_samples=len(shared_usable) if model == SHARED_MODEL else 0,
     )
 
 
@@ -384,10 +495,11 @@ def settings_from_config(cameras_config: dict[str, Any]) -> dict[str, dict[str, 
 
 def fit_calibration(samples: Sequence[Sample], camera_settings: dict[str, dict[str, Any]]) -> CameraCalibration:
     """Ajusta el cubo (obligatorio) y el recipiente si tiene suficientes muestras propias."""
-    mappings = {"cubo": fit_mapping([sample for sample in samples if sample.kind == "cubo"])}
+    cubes = [sample for sample in samples if sample.kind == "cubo"]
     containers = [sample for sample in samples if sample.kind == "recipiente"]
-    if sum(all(camera in s.pixels for camera in CAMERAS) for s in containers) >= MINIMUM_SAMPLES:
-        mappings["recipiente"] = fit_mapping(containers)
+    mappings = {"cubo": fit_mapping(cubes, shared=containers)}
+    if len(_complete(containers)) >= MINIMUM_SAMPLES:
+        mappings["recipiente"] = fit_mapping(containers, shared=cubes)
     return CameraCalibration(
         mappings=mappings,
         camera_settings=camera_settings,
@@ -404,8 +516,12 @@ def describe(calibration: CameraCalibration) -> str:
             lines.append(f"{KIND_LABELS[kind].capitalize()}: usa el mapeo del cubo (sin muestras propias).")
             continue
         error = mapping.validation
+        shared = ""
+        if mapping.shared_samples:
+            other = next(item for item in KINDS if item != kind)
+            shared = f" (más {mapping.shared_samples} d{KIND_LABELS[other]})"  # «del recipiente»
         lines.append(
-            f"{KIND_LABELS[kind].capitalize()}: {mapping.model}, {mapping.samples} muestras. Error al dejar "
+            f"{KIND_LABELS[kind].capitalize()}: {mapping.model}, {mapping.samples} muestras{shared}. Error al dejar "
             f"cada una afuera: mediana {error['mediana_mm']:.0f} mm, 90 % ≤ {error['p90_mm']:.0f} mm, "
             f"máximo {error['maximo_mm']:.0f} mm."
         )
