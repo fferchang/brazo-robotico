@@ -35,8 +35,14 @@ cubo y del recipiente; no usa el modelo de aprendizaje ni las fotos.
 - El agarre es desde arriba, como en las 15 demostraciones reales. La IK prefiere
   la garra vertical; si no alcanza, la inclina hacia afuera dentro del plano del
   brazo: hasta 30° cerca del cubo y del recipiente, hasta 70° en tránsito.
-- El dedo fijo baja a 3 mm del costado del cubo, con la punta ~22 mm sobre la
-  mesa; al cerrar, el dedo móvil empuja el cubo contra el fijo. El dedo móvil
+- Agarre empujando: el dedo fijo baja a 18 mm del costado del cubo, con la
+  punta ~22 mm sobre la mesa, y avanza a esa altura, de a 4 mm, hasta 15 mm más
+  allá de donde debería estar el costado. Así arrastra el cubo y lo deja
+  apoyado contra sí mismo antes de cerrar, aunque la ubicación erre hasta unos
+  20 mm. El empuje nunca acerca el cubo al recipiente: el experto descarta ese
+  rumbo y, si el dedo no puede bajar al costado del cubo, prueba otro.
+  `PickPlaceExpert(push_clearance=None)` baja directo a 3 mm del costado, como
+  antes. Al cerrar, el dedo móvil empuja el cubo contra el fijo. El dedo móvil
   cierra en arco y toca primero cerca de la arista superior del cubo: con estas
   medidas toca el costado ~2 mm por debajo de la arista. Con 6 mm de holgura la
   tocaba justo en la arista y a veces el "contacto" se detectaba sin agarrar el
@@ -50,12 +56,12 @@ cubo y del recipiente; no usa el modelo de aprendizaje ni las fotos.
   y un retiro sobre el recipiente antes de volver al inicio.
 
 Un episodio es exitoso si la garra detecta el cubo, el cubo termina dentro del
-recipiente y ninguna pieza del brazo atraviesa otra ni la mesa.
+recipiente y ninguna pieza del brazo atraviesa otra, la mesa ni el recipiente.
 
 ## Restricciones
 
 Las únicas restricciones duras son físicas: que las piezas no se atraviesen entre
-sí y que el brazo no atraviese la mesa.
+sí y que el brazo no atraviese la mesa ni el recipiente.
 
 - Autocolisión: cada pieza choca con su envolvente convexa; la garra, con la
   parte de dedo de sus mallas reales. MuJoCo no compara piezas contiguas: para
@@ -68,6 +74,12 @@ sí y que el brazo no atraviese la mesa.
   Durante la física se cuenta cualquier contacto entre una pieza del brazo y la
   mesa, salvo el hombro, que se excluye junto con la base porque comparten el
   eje de M1.
+- Recipiente: al planificar, cada pose deja el brazo a más de 12 mm de sus
+  paredes, porque su ubicación sale de las cámaras con ~8 mm de error típico.
+  El cierre y la apertura de la garra se revisan cada 8° de M6: el dedo móvil
+  cierra en arco y con menos valores se escapaban choques con la pared.
+  Durante la física cuenta cualquier contacto del brazo con el recipiente. El
+  cubo sí puede tocarlo.
 
 Los límites de `config.json` y las reglas del planificador 2D se informan como
 avisos ("el brazo real hoy rechazaría esta pose"), pero no bloquean la
@@ -82,8 +94,10 @@ calibrar, 12 quedaban debajo de la mesa del modelo aunque en la realidad no toca
 
 Lote de 100 episodios (`--sin-visor --episodios 100 --semilla 11`), con las
 medidas reales del cubo y de la caja y la calibración del 30/10: 100 exitosos.
-La garra sostiene el cubo con M6 en 36,8–39,3°; en las demostraciones, 36–45°.
-Cada episodio dura ~25 s simulados y ~1 s de cálculo sin visor.
+Con M1 corregido, el agarre empujando y el recipiente como obstáculo (5/11),
+siguen siendo 100 de 100. La garra sostiene el cubo con M6 en 37,7–39,7°; en
+las demostraciones, 36–45°. Cada episodio dura ~25 s simulados y ~1 s de
+cálculo sin visor.
 
 Con las reglas reajustadas el 2/11 (`REGLAS_GEOMETRIA.md`), ninguna de las
 1200 poses clave queda fuera de las reglas del brazo real, y los tramos de los

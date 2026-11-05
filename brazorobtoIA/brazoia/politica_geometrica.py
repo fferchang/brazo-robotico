@@ -91,7 +91,8 @@ class GeometricPolicy:
         return self._clip(plan.keyframes[stage_index].pose)
 
     def via(self, stage_index: int, scene_features) -> list[dict[int, float]]:
-        """Puntos previos del experto: descenso y retiro verticales."""
+        """Puntos previos del experto: descenso vertical, empuje del cubo contra el dedo fijo
+        y retiro vertical."""
         _, plan = self.plan(scene_features)
         return [self._clip(pose) for pose in plan.keyframes[stage_index].via]
 

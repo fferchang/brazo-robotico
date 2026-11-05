@@ -175,7 +175,8 @@ de M2–M4 y M6. No modifica `calibracion.json`. Ver `CALIBRACION.md`.
 Alternativa al modelo aprendido para agarrar el cubo en cualquier lugar de la
 zona calibrada. Con la foto de Inicio calcula dónde están el cubo y el
 recipiente, y la cinemática inversa del modelo 3D calcula las doce poses, con
-descenso y retiro verticales. Se elige en **Ejecución automática supervisada**
+descenso y retiro verticales y un empuje que deja el cubo apoyado contra el dedo
+fijo antes de cerrar. Se elige en **Ejecución automática supervisada**
 y sigue pidiendo confirmación en cada etapa. Necesita una calibración hecha con
 **Calibración · cámaras**; `SIMULACION_GEOMETRICA.bat` lo prueba con cámaras
 virtuales. Ver `CALIBRACION_CAMARAS.md`.

@@ -48,11 +48,72 @@ class GeometricPolicyTests(unittest.TestCase):
     def test_object_center_comes_back_from_the_expert_poses(self) -> None:
         grasp = self.plan.keyframes[KEYFRAME_STAGES.index("agarre")].pose
         release = self.plan.keyframes[KEYFRAME_STAGES.index("soltado")].pose
-        # El experto deja 3 mm de holgura contra el dedo fijo antes de cerrar.
-        np.testing.assert_allclose(object_center(self.arm, {**grasp, 6: GRIPPER_HOLD_ESTIMATE}),
-                                   PLACEMENT.cube_xy, atol=0.005)
+        # Al empujar, el dedo fijo arrastra el cubo `push_extra` antes de cerrar.
+        moved = np.subtract(object_center(self.arm, {**grasp, 6: GRIPPER_HOLD_ESTIMATE}), PLACEMENT.cube_xy)
+        self.assertAlmostEqual(float(np.linalg.norm(moved)), self.expert.push_extra, delta=0.002)
         np.testing.assert_allclose(object_center(self.arm, {**release, 6: GRIPPER_HOLD_ESTIMATE}),
                                    PLACEMENT.container_xy, atol=0.005)
+        # Sin empuje, cierra con 3 mm de holgura contra el dedo fijo.
+        direct = PickPlaceExpert(self.arm, push_clearance=None).plan(PLACEMENT)
+        grasp = direct.keyframes[KEYFRAME_STAGES.index("agarre")].pose
+        np.testing.assert_allclose(object_center(self.arm, {**grasp, 6: GRIPPER_HOLD_ESTIMATE}),
+                                   PLACEMENT.cube_xy, atol=0.005)
+
+    def test_the_push_runs_level_toward_the_cube(self) -> None:
+        import mujoco
+
+        descent = self.plan.keyframes[KEYFRAME_STAGES.index("descenso_abierto")]
+        data = mujoco.MjData(self.arm.model)
+        sites = []
+        for pose in (*descent.via, descent.pose):
+            for motor in range(1, 6):
+                data.qpos[self.arm.qadr[motor]] = self.arm.to_qpos(motor, pose[motor])
+            mujoco.mj_kinematics(self.arm.model, data)
+            sites.append(data.site_xpos[self.arm.site_id].copy())
+        sites = np.array(sites)
+        # Los últimos puntos están a la altura del agarre y avanzan en línea recta hacia el dedo móvil.
+        level = [index for index, site in enumerate(sites) if abs(site[2] - sites[-1][2]) < 0.001]
+        self.assertGreaterEqual(len(level), 6)
+        start, end = sites[level[0]][:2], sites[-1][:2]
+        travel = float(np.linalg.norm(end - start))
+        self.assertAlmostEqual(travel, self.expert.push_clearance + self.expert.push_extra, delta=0.002)
+        for index in level:
+            offset = sites[index][:2] - start
+            across = abs(offset[0] * (end - start)[1] - offset[1] * (end - start)[0]) / travel
+            self.assertLess(across, 0.001)
+        self.assertEqual(descent.pose, self.plan.keyframes[KEYFRAME_STAGES.index("agarre")].pose)
+
+    def test_the_push_never_aims_the_cube_at_the_container(self) -> None:
+        cube = PLACEMENT.cube_xy
+        # El empuje corre el cubo hacia -rumbo; con el recipiente justo ahí, ese rumbo no sirve.
+        near = Placement(cube, 0.0, (cube[0] - 0.09, cube[1]), 0.0)
+        self.assertTrue(self.expert._pushes_into_container(near, 0.0))
+        self.assertFalse(self.expert._pushes_into_container(near, np.pi))
+        self.assertFalse(self.expert._pushes_into_container(PLACEMENT, 0.0))
+        grasp = self.expert.plan(near).keyframes[KEYFRAME_STAGES.index("agarre")].pose
+        moved = np.subtract(object_center(self.arm, {**grasp, 6: GRIPPER_HOLD_ESTIMATE}), cube)
+        # Elige otro rumbo: el cubo no se acerca al recipiente, que está hacia -x.
+        self.assertGreater(moved[0], -0.002)
+
+    def test_the_container_is_an_obstacle_only_while_planning(self) -> None:
+        release = self.plan.keyframes[KEYFRAME_STAGES.index("soltado")].pose
+        # El recipiente sobre el cubo: la pose de agarre quedaría dentro de sus paredes.
+        grasp = self.plan.keyframes[KEYFRAME_STAGES.index("agarre")].pose
+        on_top = Placement(PLACEMENT.cube_xy, 0.0, PLACEMENT.cube_xy, 0.0)
+        self.assertFalse(self.arm.obstacles)
+        self.arm.set_obstacles(on_top)
+        try:
+            self.assertTrue(any("recipiente" in p for p in self.arm.pose_problems({**grasp, 6: GRIPPER_HOLD_ESTIMATE})))
+        finally:
+            self.arm.obstacles = False
+        self.assertFalse(any("recipiente" in p for p in self.arm.pose_problems({**grasp, 6: GRIPPER_HOLD_ESTIMATE})))
+        # Con el recipiente donde está, la pose de soltado planificada lo respeta.
+        self.arm.set_obstacles(PLACEMENT)
+        try:
+            self.assertEqual([p for p in self.arm.pose_problems({**release, 6: GRIPPER_HOLD_ESTIMATE})
+                              if "recipiente" in p], [])
+        finally:
+            self.arm.obstacles = False
 
     def test_policy_returns_the_expert_plan_for_the_located_scene(self) -> None:
         placement, _ = self.policy.plan(self.scene)

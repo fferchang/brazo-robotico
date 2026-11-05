@@ -39,6 +39,7 @@ ROBOT = ARM | GRIPPER
 GRIPPER_OPEN = 137.0        # Apertura medida en las demostraciones reales.
 GRIPPER_CLOSED = 0.0
 GRIPPER_HOLD_ESTIMATE = 40.0  # Solo para revisar trayectos; la física decide el valor real.
+GRIPPER_SWEEP_STEP = 8.0    # Cada cuántos grados de M6 se revisa un barrido de la garra al planificar.
 GRIPPER_STEP = 1.5          # Mismo paso y período que el firmware.
 GRIPPER_STEP_SECONDS = 0.04
 GRIPPER_INRUSH_SECONDS = 0.25
@@ -53,6 +54,9 @@ FLOOR_MARGIN_MM = 5.0
 # con `margin`: en la física ese margen altera el agarre (el dedo móvil cerraba
 # ~6° menos), así que la física usa el modelo sin margen.
 PART_CLEARANCE = 0.003
+# Separación mínima entre el brazo y el recipiente al planificar. La ubicación del
+# recipiente sale de las cámaras, con ~8 mm de error típico (CALIBRACION_CAMARAS.md).
+CONTAINER_CLEARANCE = 0.012
 
 # Inclinaciones de la garra hacia afuera que prueba la IK, en orden de preferencia.
 # Cerca del cubo y del recipiente se exige garra casi vertical; en tránsito, no.
@@ -127,6 +131,12 @@ def _look_at(position, target):
 
 def _yaw_quat(yaw):
     return np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
+
+
+def _sweep(start, end, step=GRIPPER_SWEEP_STEP):
+    """Valores de M6 de `start` a `end`, ambos incluidos, a no más de `step` grados."""
+    count = max(1, math.ceil(abs(end - start) / step))
+    return tuple(start + (end - start) * index / count for index in range(count + 1))
 
 
 @dataclass(frozen=True)
@@ -311,6 +321,10 @@ class VirtualArm:
         self.cube_body = self.model.body("cubo").id
         self.cube_qadr = int(self.model.jnt_qposadr[self.model.body_jntadr[self.cube_body]])
         self.container_mocap = int(self.model.body_mocapid[self.model.body("recipiente").id])
+        self.container_geoms = frozenset(index for index in range(self.model.ngeom)
+                                         if self.model.geom(index).name.startswith("recipiente_"))
+        # La IK y la revisión de tramos evitan el recipiente una vez ubicado con set_obstacles.
+        self.obstacles = False
         self.floor_geom = self.model.geom("mesa").id
         self.m1_axis_xy = np.array(self.model.body("shoulder").pos[:2])
         self.ranges = {i: tuple(self.model.jnt_range[j]) for i, j in self.joint_ids.items()}
@@ -366,9 +380,12 @@ class VirtualArm:
                           [wall / 2, outer_y / 2, height / 2]))
             boxes.append((f"pared_y{sign:+d}", [0, sign * (inner_y + wall) / 2, height / 2],
                           [inner_x / 2, wall / 2, height / 2]))
+        # En el modelo de revisión el recipiente detecta el brazo desde CONTAINER_CLEARANCE.
+        container_margin = CONTAINER_CLEARANCE if clearance > 0 else 0.0
         for name, pos, size in boxes:
             container.add_geom(name=f"recipiente_{name}", type=mujoco.mjtGeom.mjGEOM_BOX, pos=pos, size=size,
-                               rgba=[0.62, 0.85, 0.16, 1], contype=ENV, conaffinity=ENV | ROBOT)
+                               rgba=[0.62, 0.85, 0.16, 1], contype=ENV, conaffinity=ENV | ROBOT,
+                               margin=container_margin, gap=container_margin)
 
         # Posiciones aproximadas de las cámaras reales; falta calibrarlas.
         for name, position, target in (("frontal", [0.0, -0.62, self.floor_z + 0.13], [0.0, -0.15, self.floor_z + 0.12]),
@@ -442,20 +459,34 @@ class VirtualArm:
     def _part(self, geom):
         return PART_NAMES.get(self.model.body(int(self.model.geom_bodyid[geom])).name, "?")
 
-    def _robot_contacts(self, data, clearance=0.0):
-        """Piezas del brazo a menos de `clearance` metros entre sí o de la mesa."""
+    def _robot_contacts(self, data, clearance=0.0, container_clearance=0.0):
+        """Piezas del brazo a menos de `clearance` metros entre sí o de la mesa, y a menos
+        de `container_clearance` del recipiente (None: no se revisa el recipiente)."""
         found = set()
         for contact in data.contact[:data.ncon]:
-            if contact.dist >= clearance:
-                continue
             first, second = int(contact.geom1), int(contact.geom2)
             robot_first = bool(self.model.geom_contype[first] & ROBOT)
             robot_second = bool(self.model.geom_contype[second] & ROBOT)
             if robot_first and robot_second:
-                found.add("autocolisión " + " ↔ ".join(sorted((self._part(first), self._part(second)))))
-            elif (robot_first and second == self.floor_geom) or (robot_second and first == self.floor_geom):
-                found.add(f"{self._part(first if robot_first else second)} ↔ mesa")
+                if contact.dist < clearance:
+                    found.add("autocolisión " + " ↔ ".join(sorted((self._part(first), self._part(second)))))
+            elif robot_first or robot_second:
+                robot, other = (first, second) if robot_first else (second, first)
+                if other == self.floor_geom and contact.dist < clearance:
+                    found.add(f"{self._part(robot)} ↔ mesa")
+                elif (other in self.container_geoms and container_clearance is not None
+                      and contact.dist < container_clearance):
+                    found.add(f"{self._part(robot)} ↔ recipiente")
         return found
+
+    def set_obstacles(self, placement: Placement):
+        """Ubica el recipiente en el modelo de revisión: hasta que `obstacles` vuelva a
+        False, la IK y la revisión de tramos lo evitan con CONTAINER_CLEARANCE de margen.
+        PickPlaceExpert.plan lo activa solo mientras planifica."""
+        for data in (self._ik_data, self._check_data):
+            data.mocap_pos[self.container_mocap] = [*placement.container_xy, self.floor_z]
+            data.mocap_quat[self.container_mocap] = _yaw_quat(placement.container_yaw)
+        self.obstacles = True
 
     def pose_problems(self, pose):
         """Revisa una pose estática completa (M1–M6) sin tocar la simulación en curso."""
@@ -463,7 +494,8 @@ class VirtualArm:
         for motor, value in pose.items():
             data.qpos[self.qadr[motor]] = self.to_qpos(motor, value)
         mujoco.mj_fwdPosition(self.check_model, data)
-        problems = sorted(self._robot_contacts(data, PART_CLEARANCE))
+        problems = sorted(self._robot_contacts(data, PART_CLEARANCE,
+                                               CONTAINER_CLEARANCE if self.obstacles else None))
         clearance = self.geometry.clearance(pose)["height_mm"]
         if clearance <= self.floor_margin_mm:
             problems.append(f"garra a {clearance:.1f} mm de la mesa")
@@ -628,7 +660,8 @@ class PickPlaceExpert:
                              {1: 180.0, 2: 190.0, 3: 122.0, 4: 242.0, 5: 263.0},
                              {1: 180.0, 2: 212.0, 3: 90.0, 4: 224.0, 5: 263.0})
 
-    def __init__(self, arm: VirtualArm, *, grasp_height=0.028, side_gap=0.003, release_margin=0.03):
+    def __init__(self, arm: VirtualArm, *, grasp_height=0.028, side_gap=0.003, release_margin=0.03,
+                 push_clearance=0.018, push_extra=0.015, push_step=0.004):
         self.arm = arm
         # El dedo móvil cierra en arco y toca primero cerca de la arista superior
         # del cubo. Con la punta ~22 mm sobre la mesa y 3 mm de holgura contra el
@@ -637,6 +670,16 @@ class PickPlaceExpert:
         self.grasp_height = grasp_height
         self.side_gap = side_gap
         self.release_margin = release_margin    # Base del cubo sobre el borde del recipiente.
+        # Agarre empujando: el dedo fijo baja a `push_clearance` del costado del cubo
+        # (si el cubo está más cerca, no cae encima) y avanza a la misma altura hasta
+        # `push_extra` más allá de donde estaría ese costado (si está más lejos, lo
+        # arrastra). Así el cubo queda apoyado contra el dedo fijo al cerrar, aunque
+        # la ubicación erre unos `push_clearance` hacia un lado o `push_extra` hacia
+        # el otro. Con push_clearance=None baja directo a `side_gap`, sin empujar.
+        # 18/15 mm: en la simulación aguanta 20 mm de error en cualquier dirección.
+        self.push_clearance = push_clearance
+        self.push_extra = push_extra
+        self.push_step = push_step
 
     def _solve(self, label, target_xy, heights, yaws, previous, *, tilts=IK_TILTS_DEGREES, grippers=(GRIPPER_CLOSED,)):
         """Primera altura alcanzable; entre `yaws`, menos inclinación y luego menos giro de M5."""
@@ -670,7 +713,43 @@ class PickPlaceExpert:
             via.append(previous)
         return tuple(via)
 
+    def _horizontal(self, start_xy, end_xy, yaw, height, previous, grippers):
+        """Puntos para correr la garra en línea recta a una altura: el inicio y los intermedios."""
+        start, end = np.asarray(start_xy(yaw), float), np.asarray(end_xy(yaw), float)
+        count = max(1, math.ceil(float(np.linalg.norm(end - start)) / self.push_step))
+        via = []
+        for index in range(count):
+            point = tuple(start + (end - start) * index / count)
+            _, previous, _ = self._solve("empuje", lambda _: point, [height], [yaw], previous, grippers=grippers)
+            via.append(previous)
+        return tuple(via)
+
+    def _pushes_into_container(self, placement: Placement, yaw: float) -> bool:
+        """Si con este rumbo el empuje acerca el cubo al recipiente hasta menos de
+        CONTAINER_CLEARANCE (con el cubo girado como peor caso)."""
+        dims = self.arm.dimensions
+        c, s = math.cos(-placement.container_yaw), math.sin(-placement.container_yaw)
+        half_x, half_y = (size / 2 for size in dims.container_outer)
+
+        def gap(point):
+            dx, dy = point[0] - placement.container_xy[0], point[1] - placement.container_xy[1]
+            local = (c * dx - s * dy, s * dx + c * dy)
+            return math.hypot(max(abs(local[0]) - half_x, 0.0), max(abs(local[1]) - half_y, 0.0))
+
+        start = np.asarray(placement.cube_xy, float)
+        end = start - self.push_extra * np.array([math.cos(yaw), math.sin(yaw)])
+        reach = dims.cube_size / 2 * math.sqrt(2) + CONTAINER_CLEARANCE
+        return gap(end) < gap(start) and gap(end) < reach
+
     def plan(self, placement: Placement) -> Plan:
+        # Mientras se planifica, el recipiente es un obstáculo: ningún tramo debe tocarlo.
+        self.arm.set_obstacles(placement)
+        try:
+            return self._plan(placement)
+        finally:
+            self.arm.obstacles = False
+
+    def _plan(self, placement: Placement) -> Plan:
         dims = self.arm.dimensions
 
         def beside(center, distance):
@@ -678,28 +757,53 @@ class PickPlaceExpert:
             # el cubo queda del lado del dedo móvil.
             return lambda yaw: (center[0] + distance * math.cos(yaw), center[1] + distance * math.sin(yaw))
 
-        at_cube = beside(placement.cube_xy, dims.cube_size / 2 + self.side_gap)
+        half = dims.cube_size / 2
+        pushing = self.push_clearance is not None
+        # Baja con el dedo fijo en `at_start` y cierra en `at_cube`; sin empuje, son el mismo punto.
+        at_start = beside(placement.cube_xy, half + (self.push_clearance if pushing else self.side_gap))
+        at_cube = beside(placement.cube_xy, half - self.push_extra) if pushing else at_start
         cube_yaws = [placement.cube_yaw + k * math.pi / 2 for k in range(4)]
-        # M6 con que se revisa cada pose: incluye el barrido de abrir o cerrar ahí.
-        opening = (GRIPPER_CLOSED, (GRIPPER_CLOSED + GRIPPER_OPEN) / 2, GRIPPER_OPEN)
-        gripping = (GRIPPER_OPEN, (GRIPPER_OPEN + GRIPPER_HOLD_ESTIMATE) / 2, GRIPPER_HOLD_ESTIMATE)
+        if pushing:
+            cube_yaws = [yaw for yaw in cube_yaws if not self._pushes_into_container(placement, yaw)]
+            if not cube_yaws:
+                raise PlanningError("agarre: con cualquier rumbo, el empuje llevaría el cubo contra el "
+                                    "recipiente; separalos")
+        # M6 con que se revisa cada pose: incluye el barrido de abrir o cerrar ahí. El dedo
+        # móvil cierra en arco; con solo tres valores se escapaba un choque con la pared del
+        # recipiente que pasaba entre 57° y 73°, así que se revisa cada GRIPPER_SWEEP_STEP.
+        opening = _sweep(GRIPPER_CLOSED, GRIPPER_OPEN)
+        gripping = _sweep(GRIPPER_OPEN, GRIPPER_HOLD_ESTIMATE)
         releasing = tuple(reversed(gripping))
-        yaw, grasp, _ = self._solve("agarre", at_cube, [self.grasp_height], cube_yaws, None, grippers=gripping)
-        _, hover, hover_height = self._solve("aproximacion_3", at_cube,
-                                             [dims.cube_size + h for h in (0.035, 0.025, 0.018)], [yaw], grasp,
-                                             grippers=opening)
-        _, approach_2, _ = self._solve("aproximacion_2", at_cube, [0.14, 0.12, 0.10], [yaw], hover,
-                                       tilts=TRANSIT_TILTS_DEGREES, grippers=opening)
-        _, approach_1, _ = self._solve("aproximacion_1", at_cube, [0.20, 0.17, 0.14], [yaw], approach_2,
-                                       tilts=TRANSIT_TILTS_DEGREES)
-        descent = self._vertical(at_cube, yaw, hover_height, self.grasp_height, hover, (GRIPPER_OPEN,))
-
         # Al subir, la base del cubo queda ~grasp_height por debajo del punto pinza.
         holding = (GRIPPER_HOLD_ESTIMATE,)
         clear = dims.container_wall_height + self.grasp_height + self.release_margin
-        _, lift, lift_height = self._solve("traslado_1", at_cube, [0.15, 0.13, 0.11, clear], [yaw], grasp,
-                                           tilts=TRANSIT_TILTS_DEGREES, grippers=holding)
-        lift_via = self._vertical(at_cube, yaw, self.grasp_height, min(lift_height, hover_height), grasp, holding)
+        # El rumbo se elige por la pose de agarre; si con él el dedo fijo no puede bajar o
+        # subir (por ejemplo, porque al costado del cubo está el recipiente), prueba otro.
+        remaining = list(cube_yaws)
+        while True:
+            yaw, grasp, _ = self._solve("agarre", at_cube, [self.grasp_height], remaining, None, grippers=gripping)
+            try:
+                _, hover, hover_height = self._solve("aproximacion_3", at_start,
+                                                     [dims.cube_size + h for h in (0.035, 0.025, 0.018)], [yaw],
+                                                     grasp, grippers=opening)
+                _, approach_2, _ = self._solve("aproximacion_2", at_start, [0.14, 0.12, 0.10], [yaw], hover,
+                                               tilts=TRANSIT_TILTS_DEGREES, grippers=opening)
+                _, approach_1, _ = self._solve("aproximacion_1", at_start, [0.20, 0.17, 0.14], [yaw], approach_2,
+                                               tilts=TRANSIT_TILTS_DEGREES)
+                descent = self._vertical(at_start, yaw, hover_height, self.grasp_height, hover, (GRIPPER_OPEN,))
+                if pushing:
+                    # Abajo, al costado del cubo; después, a la misma altura, hacia el dedo móvil.
+                    descent += self._horizontal(at_start, at_cube, yaw, self.grasp_height,
+                                                descent[-1] if descent else hover, (GRIPPER_OPEN,))
+                _, lift, lift_height = self._solve("traslado_1", at_cube, [0.15, 0.13, 0.11, clear], [yaw], grasp,
+                                                   tilts=TRANSIT_TILTS_DEGREES, grippers=holding)
+                lift_via = self._vertical(at_cube, yaw, self.grasp_height, min(lift_height, hover_height), grasp,
+                                          holding)
+                break
+            except PlanningError:
+                remaining.remove(yaw)
+                if not remaining:
+                    raise
         # Sostenido, el cubo queda apoyado contra el dedo fijo.
         at_container = beside(placement.container_xy, dims.cube_size / 2)
         container_yaws = [placement.container_yaw + k * math.pi / 2 for k in range(4)]

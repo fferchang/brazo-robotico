@@ -4,8 +4,10 @@ El modo geométrico mueve el brazo sin modelo aprendido. Con la foto de Inicio
 calcula dónde están el cubo y el recipiente sobre la mesa, y la cinemática
 inversa del modelo 3D (la misma de la simulación MuJoCo) calcula las doce
 poses. Cada etapa se sigue confirmando con **CONFIRMAR Y MOVER**, y el
-planificador y el firmware siguen validando cada tramo. En el descenso sobre el
-cubo y en el retiro final pasa por puntos intermedios verticales.
+planificador y el firmware siguen validando cada tramo. Pasa por puntos
+intermedios en el descenso sobre el cubo, que es vertical, en el empuje del
+cubo contra el dedo fijo, a la altura del agarre, y en el retiro final, también
+vertical.
 
 Para eso necesita una calibración que diga, para cada lugar de la imagen de
 cada cámara, a qué posición de la mesa corresponde. Se arma agarrando el cubo
@@ -70,9 +72,8 @@ el 4/11). Con las capturas del 4/11, la homografía frontal daba una mediana de
 18 mm (90 % ≤ 35 mm); el mapeo compartido da 8 mm (90 % ≤ 16 mm) para el cubo y
 8 mm (90 % ≤ 15 mm) para el recipiente.
 
-Como referencia, en la simulación el agarre del cubo aguanta unos 5 mm de
-error y el recipiente 30 mm (ver `--tolerancia` más abajo): con errores
-mayores, un dedo puede caer sobre el cubo al bajar.
+Como referencia, en la simulación el agarre empujando aguanta unos 20 mm de
+error en el cubo y el recipiente al menos 25 mm (ver `--tolerancia` más abajo).
 **Guardar como calibración activa** escribe `datos/calibracion/camaras.json`.
 
 ## Si cambia el modelo 3D
@@ -113,21 +114,43 @@ completo en MuJoCo: calibra las cámaras virtuales con escenas al azar y prueba
 escenas nuevas con física. Opciones: `--muestras`, `--episodios`, `--semilla`,
 `--con-recipiente`, `--giro-max`, `--comparar-ideal` y `--tolerancia`.
 
-`--tolerancia 0,5,10,15,20` no usa cámaras: el experto planifica con el cubo
+`--tolerancia 0,5,10,15,20,25` no usa cámaras: el experto planifica con el cubo
 (o el recipiente) corrido esa distancia en una dirección al azar, y la física
 dice si igual termina en el recipiente. Con semilla 3 y 20 escenas por valor
-(5/11): el recipiente aguanta hasta 30 mm (20 de 20), pero el agarre del cubo
-pasa de 20 de 20 sin error a 19 con 5 mm, 7 con 10 mm y 3 con 20 mm. El dedo
-fijo baja a 3 mm del costado del cubo: si el error va hacia ese lado, cae
-encima; si va hacia el otro, el dedo móvil, que cierra en arco, lo toca en la
-arista superior. Con el error actual de las cámaras (8–11 mm de mediana), el
-agarre del cubo es el cuello de botella, aun en este mundo ideal.
+(5/11, agarre empujando):
 
-Ajustar el experto no alcanza. Con las mismas 15 escenas por combinación, ni
-la altura del agarre (16, 22 o 28 mm) ni la holgura contra el dedo fijo (3, 8
-o 13 mm) pasan de 9 de 15 con 10 mm de error, y con 13 mm de holgura falla aun
-sin error (1 de 15): el dedo móvil solo cierra bien con el cubo a pocos
-milímetros del dedo fijo. Hace falta otra estrategia de agarre o menos error.
+| Error | 0 mm | 5 mm | 10 mm | 15 mm | 20 mm | 25 mm |
+|---|---|---|---|---|---|---|
+| Cubo, empujando | 20 | 20 | 20 | 20 | 19 | 12 |
+| Cubo, sin empujar | 20 | 19 | 7 | 8 | 3 | — |
+| Recipiente | 20 | 20 | 20 | 20 | 20 | 20 |
+
+Sin empujar, el dedo fijo bajaba a 3 mm del costado del cubo: si el error iba
+hacia ese lado, caía encima; si iba hacia el otro, el dedo móvil, que cierra en
+arco, lo tocaba en la arista superior. Ni la altura del agarre (16, 22 o 28 mm)
+ni la holgura contra el dedo fijo (3, 8 o 13 mm) pasaban de 9 de 15 con 10 mm
+de error: el dedo móvil solo cierra bien con el cubo a pocos milímetros del
+dedo fijo.
+
+Por eso el agarre ahora empuja (ver `SIMULACION_MUJOCO.md`): el dedo fijo baja
+a 18 mm del costado del cubo y avanza a la altura del agarre hasta 15 mm más
+allá, arrastrando el cubo hasta apoyarlo contra sí mismo. Con una versión anterior
+(12/12 mm), el cubo girado hasta 15° también funcionaba (20 de 20). El planificador del brazo real acepta los 1118
+tramos de 40 planes al azar. El empuje nunca acerca el cubo al recipiente.
+
+Con el recipiente cerca del cubo (semilla 21, centros a 80, 95, 110 y 130 mm),
+el plan evita el recipiente con 12 mm de margen y revisa el cierre de la garra
+cada 8°. Así, la mayoría de los casos que antes fallaban en la física ahora se
+rechazan al planificar, con un aviso:
+
+| Centros a | Éxitos | Rechazados | Fallas |
+|---|---|---|---|
+| 80 mm | 6 | 6 | 2 |
+| 95 mm | 6 | 5 | 1 |
+| 110 mm | 6 | 1 | 0 |
+| 130 mm | 6 | 1 | 0 |
+
+Conviene dejar unos 12 cm entre los centros del cubo y del recipiente.
 
 Resultado de referencia, con semilla 2, 15 escenas de calibración con
 recipiente y 12 de prueba: 11 éxitos, error de ubicación de 1–5 mm y una escena

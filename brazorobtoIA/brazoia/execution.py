@@ -190,7 +190,7 @@ class SupervisedExecution:
             }
         else:
             target = self.policy.predict(stage_index, self.scene_features)
-        # La política geométrica agrega puntos previos (descenso y retiro verticales);
+        # La política geométrica agrega puntos previos (descenso, empuje y retiro);
         # el modelo aprendido no tiene.
         via_points = self.policy.via(stage_index, self.scene_features) if hasattr(self.policy, "via") else []
         groups = []
