@@ -47,11 +47,10 @@ de las poses que planifica la simulación.
   la pose actual dentro de 5°. Otras 7 son agarres bajos e inclinados sosteniendo
   el cubo, que el contorno no permite alcanzar, pero sí abandonar.
 - Firmware: compila para ESP32 (`arduino-cli compile --fqbn esp32:esp32:esp32`).
+  Se cargó en el ESP32 del brazo (COM11) el 4/11/2026; su `help` muestra M4 75..278.
 
 ## Pendiente
 
-- **Cargar el firmware nuevo en el ESP32.** Hasta entonces el ESP32 aplica las
-  reglas anteriores y bloquea o ajusta los movimientos que la aplicación ya permite.
 - Las constantes dependen de `assets/calibracion.json` y de la altura del eje
   M2. Si se recalibra, hay que recalcularlas; `tests/test_planner.py` falla si
   dejan de coincidir con el modelo 3D.
