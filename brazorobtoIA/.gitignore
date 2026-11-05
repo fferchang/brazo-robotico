@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 # Fotos de las cámaras (pueden mostrar personas) y datos de cada prueba.
 datos/demostraciones/
+datos/demostraciones_anteriores/
 datos/muestras_eliminadas_*/
 datos/ejecuciones/
 datos/simulacion/
