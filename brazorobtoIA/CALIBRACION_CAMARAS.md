@@ -43,8 +43,8 @@ por toda la zona donde van a ir el cubo y el recipiente: cerca y lejos de la
 base, a izquierda y derecha, y también a media distancia. Las 17 muestras del
 4/11 quedaron en dos filas, a unos 16–20 cm y 27–30 cm hacia adelante de la
 base: entre 21 y 26 cm no hay ninguna, y el error ahí no está medido. La
-aplicación no ubica objetos a más de 3 cm de la zona
-calibrada. Cada muestra se guarda sola en
+aplicación no ubica objetos a más de 3 cm de la zona calibrada. Cada muestra
+se guarda sola en
 `datos/calibracion/camaras_capturas_<fecha>.json`, con los ángulos del agarre:
 si después cambia la calibración del modelo 3D (ceros de M3/M4, sentido de M1),
 la posición en la mesa se puede recalcular sin repetir la captura. **Cargar
@@ -70,9 +70,9 @@ el 4/11). Con las capturas del 4/11, la homografía frontal daba una mediana de
 18 mm (90 % ≤ 35 mm); el mapeo compartido da 8 mm (90 % ≤ 16 mm) para el cubo y
 8 mm (90 % ≤ 15 mm) para el recipiente.
 
-Como
-estimación, con un cubo de 5 cm conviene una mediana de 1 cm o menos: con
-errores mayores un dedo puede caer sobre el cubo al bajar.
+Como referencia, en la simulación el agarre del cubo aguanta unos 5 mm de
+error y el recipiente 30 mm (ver `--tolerancia` más abajo): con errores
+mayores, un dedo puede caer sobre el cubo al bajar.
 **Guardar como calibración activa** escribe `datos/calibracion/camaras.json`.
 
 ## Ejecutar
@@ -99,6 +99,12 @@ fijo baja a 3 mm del costado del cubo: si el error va hacia ese lado, cae
 encima; si va hacia el otro, el dedo móvil, que cierra en arco, lo toca en la
 arista superior. Con el error actual de las cámaras (8–11 mm de mediana), el
 agarre del cubo es el cuello de botella, aun en este mundo ideal.
+
+Ajustar el experto no alcanza. Con las mismas 15 escenas por combinación, ni
+la altura del agarre (16, 22 o 28 mm) ni la holgura contra el dedo fijo (3, 8
+o 13 mm) pasan de 9 de 15 con 10 mm de error, y con 13 mm de holgura falla aun
+sin error (1 de 15): el dedo móvil solo cierra bien con el cubo a pocos
+milímetros del dedo fijo. Hace falta otra estrategia de agarre o menos error.
 
 Resultado de referencia, con semilla 2, 15 escenas de calibración con
 recipiente y 12 de prueba: 11 éxitos, error de ubicación de 1–5 mm y una escena
