@@ -1,6 +1,6 @@
 {
   "serial": {
-    "port": "COM4",
+    "port": "COM11",
     "baud": 115200
   },
   "cameras": {
