@@ -13,7 +13,7 @@ restrictivas: rechazaban los 15 agarres de las demostraciones reales y el 81 %
 de las poses que planifica la simulación.
 
 - **Modelo plano calibrado.** Las constantes salen del modelo 3D calibrado con
-  toques de mesa (`CALIBRACION.md`): eje M2 a 121,9 mm de la mesa (antes 100),
+  toques de mesa (`docs/CALIBRACION.md`): eje M2 a 121,9 mm de la mesa (antes 100),
   eslabones de 116,0 / 135,0 / 60,1 mm y ceros angulares medidos. La cadena
   plana coincide con el modelo 3D a menos de 0,05 mm. Antes el antebrazo tenía
   7,7° de error, unos 18 mm de altura al extenderse.

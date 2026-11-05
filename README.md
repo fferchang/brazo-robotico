@@ -87,11 +87,13 @@ Key differences from the original:
 brazo-robotico/
 ├── brazorobtoIA/                    # ← Current version: Python app, firmware, simulation
 │   ├── app.py                       # Teaching, training and supervised execution
+│   ├── *_app.py, simulacion_*.py    # Other entry scripts (calibration, simulators, tests)
+│   ├── lanzadores/                  # Windows .bat launchers (install, app, simulations)
+│   ├── docs/                        # Guides: calibration, safety rules, diagnostics
 │   ├── brazoia/                     # Vision, policy, planner, MuJoCo sim, calibration
 │   ├── firmware/                    # ESP32 sketch with geometric safety rules
 │   ├── assets/                      # URDF + meshes (SO-ARM100), calibration, references
-│   ├── tests/                       # Automated tests (no hardware needed)
-│   └── *.md                         # Guides: simulation, calibration, safety rules
+│   └── tests/                       # Automated tests (no hardware needed)
 ├── app/                             # Earlier prototype: Electron app + WebSerial UI
 ├── firmware/                        # Earlier Arduino/ESP32 test sketches
 ├── kinematics/                      # Earlier Python geometric simulation
@@ -118,7 +120,7 @@ brazo-robotico/
 | MuJoCo simulation + inverse kinematics | ✅ 100/100 virtual pick & place episodes |
 | 3D model calibration | ✅ Table and gripper (Oct 2026); M1 direction fixed Nov 5 from the camera photos (confirm on the arm); M3/M4 zeros pending |
 | Geometric safety rules (planner + firmware) | ✅ Retuned Nov 2026 — firmware uploaded to the ESP32 on Nov 4 |
-| Gripper current protection | 🔄 Fixes pending (`brazorobtoIA/DIAGNOSTICO_GARRA.md`) |
+| Gripper current protection | 🔄 Fixes pending (`brazorobtoIA/docs/DIAGNOSTICO_GARRA.md`) |
 | Camera calibration (sim ↔ real) | 🔄 First real calibration (Nov 4, 17 samples), recomputed after the M1 fix: 6–8 mm median error; geometric mode not yet run on the real arm |
 | YOLO fine-tuning | ⏳ Pending — the current version detects by color |
 | Full sorting demo | ⏳ Target: Nov 2026 |
@@ -140,7 +142,7 @@ Fixed limits per motor (`brazorobtoIA/config.json`):
 
 The floor rule keeps the gripper outline (for any wrist roll and the current
 gripper opening) more than 5 mm above the table. Details in
-[`brazorobtoIA/REGLAS_GEOMETRIA.md`](brazorobtoIA/REGLAS_GEOMETRIA.md).
+[`brazorobtoIA/docs/REGLAS_GEOMETRIA.md`](brazorobtoIA/docs/REGLAS_GEOMETRIA.md).
 
 ---
 
@@ -163,7 +165,7 @@ git clone https://github.com/fferchang/brazo-robotico.git
 cd brazo-robotico/brazorobtoIA
 ```
 
-Then, from the `brazorobtoIA` folder:
+Then, from `brazorobtoIA/lanzadores/`:
 
 - `INSTALAR.bat` once, to create the virtual environment and install dependencies
 - `INICIAR.bat` for the main app (cameras, ESP32, teaching and execution)

@@ -1,6 +1,6 @@
 # Prueba de inicio a final, solamente en Rerun
 
-1. Abrir `TRAYECTO_SIMULADO.bat`. Inicia la aplicación principal y una ventana
+1. Abrir `lanzadores/TRAYECTO_SIMULADO.bat`. Inicia la aplicación principal y una ventana
    **TRAYECTO SIMULADO**. No conecta automáticamente el ESP32 ni mueve motores.
 2. Conectar el ESP32 desde la aplicación principal. Para acomodar M1–M5 a
    mano, usar el botón habitual de torque OFF, que conserva el torque de M6.
@@ -52,5 +52,5 @@ de cálculos pendientes. No se corrigen ángulos ni alturas silenciosamente.
 Solo verifica garra contra plano del piso. No comprueba autocollisiones,
 obstáculos, cubo, recipiente, cargas ni dinámica del servo. No valida la
 ejecución real ni modifica reglas del ESP32. Las diferencias de calibración
-documentadas en `DIAGNOSTICO_PISO_3D.md` siguen pendientes. No se generan
+documentadas en `docs/DIAGNOSTICO_PISO_3D.md` siguen pendientes. No se generan
 órdenes físicas, no se graban demostraciones ni se reentrena ningún modelo.

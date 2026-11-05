@@ -7,7 +7,7 @@ de ángulos de `assets/calibracion.json` que la visualización. Incluye M1–M6.
 
 El plano se coloca 121,9 mm debajo del eje M2 (`SHOULDER_HEIGHT_MM` en
 `brazoia/gripper_geometry.py`). Ese valor sale de 12 toques de la garra
-sobre la mesa (`CALIBRACION.md`); la medida a mano anterior era 100 mm. Supone
+sobre la mesa (`docs/CALIBRACION.md`); la medida a mano anterior era 100 mm. Supone
 que el brazo está montado verticalmente respecto a una mesa horizontal. No es
 equivalente a poner el piso en el origen del archivo URDF.
 
@@ -38,7 +38,7 @@ todas superaban 5 mm reales.
 ## Calibración del 30 de octubre de 2026
 
 Con 12 toques de la garra sobre la mesa y la garra cerrada sin nada
-(`CALIBRACION.md`, datos en `datos/calibracion/`) se ajustó:
+(`docs/CALIBRACION.md`, datos en `datos/calibracion/`) se ajustó:
 
 - altura del eje M2 sobre la mesa: 121,9 mm (antes 100 mm medidos a mano);
 - cero de M2: +1,5° (`visual_offset_degrees` 15 → 16,5);
@@ -54,7 +54,7 @@ fuente independiente: la simulación ahora sostiene el cubo de 5 cm con M6 en
 
 Faltan los ceros de M3 y M4, porque los toques fueron con la garra casi
 vertical, y la prueba de espejo de M1. El 2/11 el planificador 2D y el firmware
-se reajustaron con este modelo (`REGLAS_GEOMETRIA.md`); el firmware nuevo todavía
+se reajustaron con este modelo (`docs/REGLAS_GEOMETRIA.md`); el firmware nuevo todavía
 hay que cargarlo en el ESP32.
 
 Para sustituir la regla anterior también habrá que comprobar el recorrido

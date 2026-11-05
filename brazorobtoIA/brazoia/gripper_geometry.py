@@ -54,7 +54,7 @@ def stl_vertices(path):
 
 
 # Eje M2 sobre la mesa, ajustado con 12 toques de la garra el 30/10/2026
-# (CALIBRACION.md). Antes se usaban los 100 mm medidos a mano.
+# (docs/CALIBRACION.md). Antes se usaban los 100 mm medidos a mano.
 SHOULDER_HEIGHT_MM = 121.9
 
 

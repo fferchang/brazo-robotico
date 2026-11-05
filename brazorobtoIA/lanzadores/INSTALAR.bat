@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 if not exist ".venv\Scripts\python.exe" (
   rem Python 3.12 si esta instalado; si no, el Python 3 disponible.
   py -3.12 -m venv .venv 2>nul

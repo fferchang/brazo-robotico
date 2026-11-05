@@ -1,9 +1,9 @@
 """Calibración modelo-brazo: toques de mesa y garra cerrada. Solo lee telemetría.
 
 Se abre desde la aplicación principal («Calibración · toques de mesa» o
-CALIBRACION.bat), que le pasa una copia de la telemetría ya recibida. No abre
+lanzadores/CALIBRACION.bat), que le pasa una copia de la telemetría ya recibida. No abre
 puertos, no cambia torque, no envía movimientos y no modifica calibracion.json.
-Ver CALIBRACION.md.
+Ver docs/CALIBRACION.md.
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class CalibrationApp:
         ttk.Label(content, wraplength=950, text=(
             "Esta ventana solo copia la telemetría que ya recibe la aplicación principal: no cambia "
             "torque ni envía movimientos. Los toques se guardan solos en datos/calibracion/. "
-            "Guía completa: CALIBRACION.md.")).pack(anchor="w", pady=(4, 10))
+            "Guía completa: docs/CALIBRACION.md.")).pack(anchor="w", pady=(4, 10))
 
         touches = ttk.LabelFrame(content, text="1 · Toques de mesa", padding=10)
         touches.pack(fill="both", expand=True)

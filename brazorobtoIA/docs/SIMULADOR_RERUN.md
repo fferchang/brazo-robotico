@@ -1,6 +1,6 @@
 # Simulador manual de Rerun
 
-Abrir `SIMULADOR_RERUN.bat`, o usar **Simulador manual · Rerun** en la sección
+Abrir `lanzadores/SIMULADOR_RERUN.bat`, o usar **Simulador manual · Rerun** en la sección
 de entrenamiento de la aplicación principal. Se abre una ventana de controles
 y una grabación de Rerun identificada como `SIMULADOR MANUAL · SOLO VIRTUAL`.
 
@@ -21,4 +21,4 @@ Esta ventana no importa el controlador del robot, no abre puertos serie,
 no usa cámaras, no modifica muestras ni modelos entrenados y no envía órdenes
 al ESP32 al abrirse, mover controles o cerrarse. No representa presión,
 contactos dinámicos ni ejecución de trayectorias. La medición geométrica es
-diagnóstica; consultar `DIAGNOSTICO_PISO_3D.md` para la calibración pendiente.
+diagnóstica; consultar `docs/DIAGNOSTICO_PISO_3D.md` para la calibración pendiente.

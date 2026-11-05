@@ -7,7 +7,7 @@ sola: todo se hace a mano o con los botones habituales.
 
 ## Antes de empezar
 
-- Abrir `CALIBRACION.bat`: abre la aplicación principal y la ventana
+- Abrir `lanzadores/CALIBRACION.bat`: abre la aplicación principal y la ventana
   **CALIBRACIÓN · SOLO LECTURA**. También se abre desde **Calibración · toques
   de mesa**, en la sección de entrenamiento.
 - Conectar el ESP32 y pulsar **Abrir Rerun**: el modelo 3D sigue la telemetría
@@ -97,7 +97,7 @@ guardado sin abrir la aplicación:
 Doce toques (alcance de 8 a 34 cm, garra inclinada hasta 27°) y garra cerrada
 con 7 mm entre las puntas. Se aplicó: eje M2 a 121,9 mm de la mesa (antes
 100 mm), cero de M2 +1,5° y cero de M6 −5,5°. El error del modelo en los toques
-bajó de 17,8 a 2,2 mm RMS. Detalle y validación en `DIAGNOSTICO_PISO_3D.md`.
+bajó de 17,8 a 2,2 mm RMS. Detalle y validación en `docs/DIAGNOSTICO_PISO_3D.md`.
 
 Pendiente: los ceros de M3 y M4, que piden toques con la garra inclinada 30–45°.
 
