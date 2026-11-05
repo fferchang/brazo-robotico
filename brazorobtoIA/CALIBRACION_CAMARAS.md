@@ -88,7 +88,17 @@ y el recipiente. Tener la mano cerca de **EMERGENCIA · TORQUE OFF**.
 `SIMULACION_GEOMETRICA.bat` (`simulacion_geometrica.py`) corre el circuito
 completo en MuJoCo: calibra las cámaras virtuales con escenas al azar y prueba
 escenas nuevas con física. Opciones: `--muestras`, `--episodios`, `--semilla`,
-`--con-recipiente`, `--giro-max` y `--comparar-ideal`.
+`--con-recipiente`, `--giro-max`, `--comparar-ideal` y `--tolerancia`.
+
+`--tolerancia 0,5,10,15,20` no usa cámaras: el experto planifica con el cubo
+(o el recipiente) corrido esa distancia en una dirección al azar, y la física
+dice si igual termina en el recipiente. Con semilla 3 y 20 escenas por valor
+(5/11): el recipiente aguanta hasta 30 mm (20 de 20), pero el agarre del cubo
+pasa de 20 de 20 sin error a 19 con 5 mm, 7 con 10 mm y 3 con 20 mm. El dedo
+fijo baja a 3 mm del costado del cubo: si el error va hacia ese lado, cae
+encima; si va hacia el otro, el dedo móvil, que cierra en arco, lo toca en la
+arista superior. Con el error actual de las cámaras (8–11 mm de mediana), el
+agarre del cubo es el cuello de botella, aun en este mundo ideal.
 
 Resultado de referencia, con semilla 2, 15 escenas de calibración con
 recipiente y 12 de prueba: 11 éxitos, error de ubicación de 1–5 mm y una escena
@@ -100,8 +110,14 @@ reemplaza la calibración del brazo real.
 
 - No estima la rotación del cubo ni del recipiente: tienen que estar alineados
   con la base.
-- Con las 14 demostraciones del 26 y 29/10 como muestras, el error fue de unos
-  4 cm: no alcanza. Por eso esta captura dedicada.
+- Con las demostraciones del 26 y 29/10 como muestras, la homografía daba unos
+  3–4 cm, pero la reproyección da 10 mm: el problema era el mapeo, no los
+  datos. Esas demostraciones sirven de prueba independiente: la calibración
+  del 4/11 ubica sus escenas de Inicio con una mediana de 11 mm (90 % ≤ 23 mm)
+  para el cubo y 11 mm (90 % ≤ 22 mm) para el recipiente; la homografía que se
+  había guardado ese día daba 31 mm (90 % ≤ 53 mm) y 25 mm. Juntar los dos
+  conjuntos no mejora (10–12 mm), así que la calibración activa usa solo las
+  capturas del 4/11.
 - Las cámaras miran casi al ras de la mesa y resuelven mal la profundidad (la
   lateral sola dio 6–7 cm con aquellas demostraciones). Si el error sigue alto,
   subirlas para que miren la mesa desde arriba y recalibrar.

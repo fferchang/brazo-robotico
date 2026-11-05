@@ -26,7 +26,7 @@ import numpy as np
 
 from brazoia.calibracion_camaras import CAMERAS, Sample, describe, fit_calibration, object_pixels
 from brazoia.config import load_config
-from brazoia.mujoco_sim import PickPlaceExpert, VirtualArm, run_episode, sample_placement
+from brazoia.mujoco_sim import PickPlaceExpert, PlanningError, VirtualArm, run_episode, sample_placement
 from brazoia.politica_geometrica import GeometricPolicy
 from brazoia.vision import detect_scene, observation_features
 
@@ -103,6 +103,37 @@ def evaluate(policy: GeometricPolicy, cameras: VirtualCameras, rng, episodes: in
     return results
 
 
+def tolerance(arm: VirtualArm, expert: PickPlaceExpert, rng, magnitudes_mm, episodes: int, *,
+              max_yaw_degrees: float) -> list[dict]:
+    """Éxitos con un error de ubicación conocido, sin cámaras: ¿cuánto error aguanta el agarre?
+
+    Para cada objeto y cada magnitud, el experto planifica con el objeto corrido
+    esa distancia en una dirección al azar, y la física corre con la escena real.
+    """
+    rows = []
+    for kind, field in (("cubo", "cube_xy"), ("recipiente", "container_xy")):
+        for magnitude in magnitudes_mm:
+            row = {"objeto": kind, "error_mm": float(magnitude), "exitos": 0, "rechazados": 0, "episodios": episodes,
+                   "motivos": []}
+            for _ in range(episodes):
+                placement = placement_by_hand(rng, max_yaw_degrees)
+                angle = rng.uniform(0.0, 2.0 * math.pi)
+                shift = magnitude / 1000.0 * np.array([math.cos(angle), math.sin(angle)])
+                assumed = dataclasses.replace(placement, **{field: tuple(np.add(getattr(placement, field), shift))})
+                try:
+                    plan = expert.plan(assumed)
+                except PlanningError:
+                    row["rechazados"] += 1
+                    continue
+                result = run_episode(arm, expert, placement, plan=plan)
+                row["exitos"] += int(result.success)
+                row["motivos"] += list(result.reasons)
+            rows.append(row)
+            print(f"  error {magnitude:4.0f} mm en {kind:10s}: {row['exitos']:3d} de {episodes} éxitos"
+                  + (f" ({row['rechazados']} sin poses alcanzables)" if row["rechazados"] else ""), flush=True)
+    return rows
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Modo geométrico con cámaras virtuales en MuJoCo. No usa el ESP32.")
     parser.add_argument("--muestras", type=int, default=15, help="Escenas para calibrar (por defecto 15).")
@@ -114,7 +145,18 @@ def parse_args(argv=None):
                         help="Giro máximo del cubo y del recipiente respecto de la base, en grados (por defecto 5).")
     parser.add_argument("--comparar-ideal", action="store_true",
                         help="Repite cada episodio con la ubicación verdadera para separar errores de percepción.")
-    return parser.parse_args(argv)
+    parser.add_argument("--tolerancia", metavar="MM,MM,...",
+                        help="Sin cámaras: mide los éxitos con esos errores de ubicación del cubo y del recipiente, "
+                             "en mm (por ejemplo 0,5,10,15,20). Usa --episodios escenas por valor.")
+    args = parser.parse_args(argv)
+    if args.tolerancia is not None:
+        try:
+            args.tolerancia = [float(value) for value in args.tolerancia.split(",") if value.strip()]
+        except ValueError:
+            parser.error("--tolerancia lleva números separados por comas, por ejemplo 0,5,10,15,20.")
+        if not args.tolerancia or min(args.tolerancia) < 0:
+            parser.error("--tolerancia lleva números separados por comas, mayores o iguales a 0.")
+    return args
 
 
 def main(argv=None) -> int:
@@ -128,6 +170,19 @@ def main(argv=None) -> int:
     rng = np.random.default_rng(args.semilla)
     started = time.monotonic()
     arm = VirtualArm(limits=config.limits)
+    folder = ROOT / "datos" / "simulacion"
+    if args.tolerancia is not None:
+        print(f"Tolerancia del agarre: {args.episodios} escenas por valor, sin cámaras.", flush=True)
+        rows = tolerance(arm, PickPlaceExpert(arm), rng, args.tolerancia, args.episodios,
+                         max_yaw_degrees=args.giro_max)
+        summary = {"fecha": datetime.now().isoformat(timespec="seconds"), "tolerancia": rows,
+                   "segundos": round(time.monotonic() - started, 1), "giro_max_grados": args.giro_max,
+                   "semilla": args.semilla}
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"tolerancia_{datetime.now():%Y%m%d_%H%M%S}.json"
+        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"\nDetalle ({summary['segundos']:.0f} s): {path}")
+        return 0
     cameras = VirtualCameras(arm)
     print(f"Calibrando las cámaras virtuales con {args.muestras} escenas...", flush=True)
     samples = calibration_samples(cameras, rng, args.muestras, containers=args.con_recipiente,
@@ -155,7 +210,6 @@ def main(argv=None) -> int:
     if args.comparar_ideal:
         ideal = sum(item.get("exito_con_ubicacion_real", False) for item in results)
         print(f"Con la ubicación verdadera: {ideal} de {len(results)}.")
-    folder = ROOT / "datos" / "simulacion"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"geometrica_{datetime.now():%Y%m%d_%H%M%S}.json"
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
