@@ -3,7 +3,7 @@
     "joint": "1",
     "servo_zero_degrees": 180.0,
     "urdf_zero_radians": 0.0,
-    "direction": 1.0,
+    "direction": -1.0,
     "visual_offset_degrees": 0.0
   },
   "2": {

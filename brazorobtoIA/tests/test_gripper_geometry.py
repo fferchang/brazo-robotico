@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import rerun as rr
 
-from brazoia.gripper_geometry import SHOULDER_HEIGHT_MM, GripperGeometry, joint_angle
+from brazoia.gripper_geometry import SHOULDER_HEIGHT_MM, GripperGeometry, joint_angle, model_fingerprint
 from brazoia.rerun_view import RerunArmView
 
 
@@ -17,6 +17,33 @@ class GripperGeometryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.geometry = GripperGeometry(ASSETS)
+
+    def test_m1_turns_the_arm_like_the_real_one(self):
+        # Agarre real del 29/10 (prueba_20261029_234857): con M1 = 153,4° la cámara frontal,
+        # que mira al brazo de frente, muestra la garra a su derecha, que es la izquierda
+        # del brazo (+x del URDF). Con el sentido viejo de M1 el modelo la ponía en −x.
+        grasp = {1: 153.4, 2: 226.5, 3: 135.2, 4: 260.0, 5: 263.4, 6: 44.7}
+        release = {1: 213.0, 2: 159.2, 3: 204.5, 4: 260.0, 5: 263.4, 6: 137.4}
+        self.assertGreater(self.geometry.transforms(grasp)[0]["gripper"][0, 3], 0.08)
+        self.assertLess(self.geometry.transforms(release)[0]["gripper"][0, 3], -0.05)
+
+    def test_model_fingerprint_ignores_formatting_but_not_the_model(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            copy = Path(temporary)
+            (copy / "modelo").mkdir()
+            urdf = (ASSETS / "modelo" / "so100.urdf").read_bytes().replace(b"\r\n", b"\n")
+            (copy / "modelo" / "so100.urdf").write_bytes(urdf.replace(b"\n", b"\r\n"))
+            calibration = json.loads((ASSETS / "calibracion.json").read_text(encoding="utf-8"))
+            (copy / "calibracion.json").write_text(json.dumps(calibration), encoding="utf-8")
+            original = model_fingerprint(ASSETS)
+            self.assertEqual(model_fingerprint(copy), original)
+            self.assertNotEqual(model_fingerprint(copy, shoulder_height_mm=SHOULDER_HEIGHT_MM + 1), original)
+            calibration["1"]["direction"] = -float(calibration["1"]["direction"])
+            (copy / "calibracion.json").write_text(json.dumps(calibration), encoding="utf-8")
+            self.assertNotEqual(model_fingerprint(copy), original)
 
     def test_floor_reference_is_calibrated_height_below_m2_axis(self):
         # 121,9 mm según los toques de mesa del 30/10/2026 (antes, 100 mm medidos a mano).

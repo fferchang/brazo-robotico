@@ -11,6 +11,7 @@ import numpy as np
 from brazoia.calibracion_camaras import fit_calibration, settings_from_config
 from brazoia.config import INITIAL_POSE, KEYFRAME_STAGES, load_config
 from brazoia.execution import SupervisedExecution
+from brazoia.gripper_geometry import model_fingerprint
 from brazoia.mujoco_sim import GRIPPER_HOLD_ESTIMATE, PickPlaceExpert, Placement, VirtualArm
 from brazoia.politica_geometrica import GeometricPolicy, calibration_path, load_geometric_policy, object_center
 from brazoia.vision import Detection, SceneObservation
@@ -38,8 +39,9 @@ class GeometricPolicyTests(unittest.TestCase):
         cls.expert = PickPlaceExpert(cls.arm)
         cls.plan = cls.expert.plan(PLACEMENT)
         points = workspace_points(14)
+        cls.model = model_fingerprint(cls.arm.assets_root)
         cls.calibration = fit_calibration(samples_for(points) + samples_for(points, "recipiente"),
-                                          settings_from_config(CONFIG.cameras))
+                                          settings_from_config(CONFIG.cameras), model=cls.model)
         cls.policy = GeometricPolicy(cls.calibration, CONFIG.limits, arm=cls.arm, expert=cls.expert)
         cls.scene = scene_features(PLACEMENT.cube_xy, PLACEMENT.container_xy)
 
@@ -101,6 +103,15 @@ class GeometricPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no coincide"):
                 load_geometric_policy(dataclasses.replace(config, cameras=cameras), arm=self.arm, expert=self.expert)
 
+    def test_loading_refuses_a_calibration_from_another_3d_model(self) -> None:
+        # Con otro modelo (por ejemplo, M1 sin invertir) la misma foto daría el lado espejado.
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(CONFIG, root=Path(temporary))
+            for model, message in ((None, "no registra con qué modelo 3D"), ("0123456789abcdef", "otro modelo 3D")):
+                dataclasses.replace(self.calibration, model=model).save(calibration_path(config))
+                with self.assertRaisesRegex(ValueError, message):
+                    load_geometric_policy(config, arm=self.arm, expert=self.expert)
+
 
 class AppModeTests(unittest.TestCase):
     """Selector de modo de la ejecución automática, sin cámaras ni ESP32."""
@@ -125,8 +136,8 @@ class AppModeTests(unittest.TestCase):
             self.assertIsNone(App.automatic_policy(ui))
             self.assertIn("Falta la calibración", ui.status.set.call_args.args[0])
             points = workspace_points(12)
-            fit_calibration(samples_for(points), settings_from_config(CONFIG.cameras)).save(
-                calibration_path(ui.config))
+            fit_calibration(samples_for(points), settings_from_config(CONFIG.cameras),
+                            model=model_fingerprint(self.arm.assets_root)).save(calibration_path(ui.config))
             self.assertIsInstance(App.automatic_policy(ui), GeometricPolicy)
 
     def test_learned_mode_keeps_requiring_a_model(self) -> None:

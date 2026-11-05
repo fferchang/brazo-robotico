@@ -99,9 +99,10 @@ físicos.
   estimados. Se corrigen en `SceneDimensions` (`brazoia/mujoco_sim.py`).
 - Piso y ceros: calibrados el 30/10 con toques de mesa (eje M2 a 121,9 mm,
   ~2 mm de error); faltan los ceros de M3 y M4. Ver `DIAGNOSTICO_PISO_3D.md`.
-- Posible espejo en X: en una demostración revisada (M1 = 204°), ambas cámaras
-  muestran el cubo del lado contrario al que predice el modelo. Las pruebas 1 y
-  2 de `CALIBRACION.md` separan un espejo del modelo de uno de las cámaras.
+- Espejo en X corregido el 5/11: M1 estaba invertido en el modelo (las fotos
+  reales mostraban el brazo del lado contrario). Ver «M1 invertido» en
+  `CALIBRACION.md`. Los resultados anteriores de la simulación siguen valiendo:
+  el mundo simulado era el espejo del real, con la misma física.
 - Cámaras virtuales: ubicadas a ojo según las fotos reales. Falta calibrarlas
   antes de usar sus imágenes para entrenar.
 - El ejecutor real mueve uno o dos motores por tramo (`pair`); la simulación

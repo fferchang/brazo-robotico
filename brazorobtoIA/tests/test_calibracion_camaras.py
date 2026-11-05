@@ -172,6 +172,18 @@ class CameraCalibrationTests(unittest.TestCase):
         both = fit_calibration(samples_for(points) + samples_for(workspace_points(9, seed=4), "recipiente"), SETTINGS)
         self.assertIn("recipiente", both.mappings)
 
+    def test_the_3d_model_is_saved_and_checked(self) -> None:
+        calibration = fit_calibration(samples_for(workspace_points(12)), SETTINGS, model="aaaa")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "camaras.json"
+            calibration.save(path)
+            loaded = CameraCalibration.load(path)
+        self.assertEqual(loaded.model, "aaaa")
+        self.assertEqual(loaded.model_problems("aaaa"), [])
+        self.assertIn("otro modelo 3D", " ".join(loaded.model_problems("bbbb")))
+        old = fit_calibration(samples_for(workspace_points(12)), SETTINGS)
+        self.assertIn("no registra", " ".join(old.model_problems("aaaa")))
+
     def test_save_load_and_camera_changes(self) -> None:
         calibration = fit_calibration(samples_for(workspace_points(12)), SETTINGS)
         with tempfile.TemporaryDirectory() as temporary:

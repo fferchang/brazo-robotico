@@ -14,6 +14,7 @@ import numpy as np
 
 from .calibracion_camaras import KIND_LABELS, CameraCalibration
 from .config import INITIAL_POSE, KEYFRAME_STAGES, AppConfig
+from .gripper_geometry import model_fingerprint
 from .mujoco_sim import PickPlaceExpert, Placement, PlanningError, VirtualArm
 
 
@@ -125,5 +126,14 @@ def load_geometric_policy(config: AppConfig, **kwargs) -> GeometricPolicy:
             "La calibración de cámaras no coincide con la configuración actual ("
             + "; ".join(problems)
             + "). Volvé a calibrar."
+        )
+    arm = kwargs.get("arm")
+    model = model_fingerprint(arm.assets_root if arm is not None else config.root / "assets")
+    problems = calibration.model_problems(model)
+    if problems:
+        raise ValueError(
+            "La calibración de cámaras no sirve con el modelo 3D actual (" + "; ".join(problems) + "). "
+            "En «Calibración · cámaras», «Cargar capturas…» recalcula solas las capturas con ángulos; "
+            "las que no los tienen hay que repetirlas."
         )
     return GeometricPolicy(calibration, config.limits, **kwargs)

@@ -116,10 +116,10 @@ brazo-robotico/
 | Teaching app (12-pose demonstrations, two cameras) | ✅ Functional — 15 successful demonstrations |
 | Learned policy | 🔄 Experimental, not validated (validation error 44°; more demonstrations needed) |
 | MuJoCo simulation + inverse kinematics | ✅ 100/100 virtual pick & place episodes |
-| 3D model calibration | ✅ Table and gripper (Oct 2026); M3/M4 zeros and M1 direction pending |
+| 3D model calibration | ✅ Table and gripper (Oct 2026); M1 direction fixed Nov 5 from the camera photos (confirm on the arm); M3/M4 zeros pending |
 | Geometric safety rules (planner + firmware) | ✅ Retuned Nov 2026 — firmware uploaded to the ESP32 on Nov 4 |
 | Gripper current protection | 🔄 Fixes pending (`brazorobtoIA/DIAGNOSTICO_GARRA.md`) |
-| Camera calibration (sim ↔ real) | 🔄 First real calibration (Nov 4, 17 samples): ~8 mm median error; geometric mode not yet run on the real arm |
+| Camera calibration (sim ↔ real) | 🔄 First real calibration (Nov 4, 17 samples), recomputed after the M1 fix: 6–8 mm median error; geometric mode not yet run on the real arm |
 | YOLO fine-tuning | ⏳ Pending — the current version detects by color |
 | Full sorting demo | ⏳ Target: Nov 2026 |
 

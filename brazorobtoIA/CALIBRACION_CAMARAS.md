@@ -75,6 +75,29 @@ error y el recipiente 30 mm (ver `--tolerancia` más abajo): con errores
 mayores, un dedo puede caer sobre el cubo al bajar.
 **Guardar como calibración activa** escribe `datos/calibracion/camaras.json`.
 
+## Si cambia el modelo 3D
+
+La posición de cada muestra en la mesa sale del modelo 3D. Si cambian
+`assets/calibracion.json`, el URDF o la altura del eje M2 (por ejemplo, al
+calibrar los ceros de M3/M4), las posiciones viejas ya no valen: con M1
+invertido, el brazo habría ido al lado espejado. Por eso `camaras.json` y cada
+archivo de capturas guardan la huella del modelo (`modelo_3d`), y el modo
+geométrico rechaza una calibración de otro modelo o sin huella. **Cargar
+capturas…** recalcula sola la posición de las capturas con ángulos y descarta
+las que no los tienen; después hay que volver a calcular y guardar.
+
+Las capturas del 4/11 se hicieron sin guardar ángulos y con M1 todavía sin
+invertir. Se reconstruyeron (`camaras_capturas_20261104_200930_m1_corregido.json`;
+las originales quedan en `camaras_capturas_20261104_200930.json`): el modelo
+viejo y el nuevo difieren solo en M1, que gira el brazo rígido alrededor de su
+eje, y lo que falta saber se completó con lo que pide el procedimiento (cubo
+alineado con la base, garra vertical y el giro de M5 más chico desde la pose
+inicial). Esa suposición explica mejor las demostraciones de octubre que la de
+dejar la muñeca sin girar (12 contra 14 mm de mediana para el cubo). La
+calibración activa sale de esas capturas: cubo 6 mm de mediana (90 % ≤ 17 mm)
+y recipiente 8 mm (90 % ≤ 15 mm). Conviene reemplazarlas por capturas nuevas,
+que ya guardan los ángulos.
+
 ## Ejecutar
 
 En **Ejecución automática supervisada**, elegir **Geométrico (cámaras

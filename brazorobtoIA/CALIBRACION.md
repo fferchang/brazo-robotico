@@ -99,8 +99,30 @@ con 7 mm entre las puntas. Se aplicó: eje M2 a 121,9 mm de la mesa (antes
 100 mm), cero de M2 +1,5° y cero de M6 −5,5°. El error del modelo en los toques
 bajó de 17,8 a 2,2 mm RMS. Detalle y validación en `DIAGNOSTICO_PISO_3D.md`.
 
-Pendiente: las pruebas 1 y 2 (espejo de M1 y de las cámaras) y los ceros de M3
-y M4, que piden toques con la garra inclinada 30–45°.
+Pendiente: los ceros de M3 y M4, que piden toques con la garra inclinada 30–45°.
+
+## M1 invertido (5 de noviembre de 2026)
+
+Se invirtió el sentido de M1 en `assets/calibracion.json` (`direction` −1). Sin
+el brazo, con tres pruebas sobre datos ya guardados:
+
+- **Fotos.** En el agarre de `prueba_20261029_234857` (M1 = 153,4°), la cámara
+  frontal, que mira el brazo de frente, muestra la garra a su derecha; en el
+  soltado (M1 = 213°), a la izquierda. La cámara frontal de la simulación, con
+  esos mismos ángulos, dibujaba el brazo del lado opuesto; con M1 invertido,
+  del mismo. El usuario confirmó el 2/11 que las cámaras no espejan la imagen.
+- **Muñeca.** En los 16 agarres a mano de octubre, el rumbo de la garra (módulo
+  90°) solo es consistente con M1 o M5 invertido (R = 0,58 contra 0,37; al
+  azar, R > 0,42 el 5 % de las veces). Esta prueba no separa M1 de M5; las
+  fotos sí.
+- **Punta a punta.** Con la calibración de cámaras recalculada, el modo
+  geométrico planifica el agarre de 11 escenas de octubre con un M1 a 1,3° de
+  mediana (máximo 5°) del que usó la persona.
+
+La calibración con toques de mesa no cambia: mide alturas, y M1 gira alrededor
+de un eje vertical. La prueba 1 sigue sirviendo para confirmarlo en el brazo
+real y para revisar M2–M5. Las capturas de cámaras del 4/11 se recalcularon
+(`CALIBRACION_CAMARAS.md`).
 
 ## Alcance
 

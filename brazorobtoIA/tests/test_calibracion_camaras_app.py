@@ -70,6 +70,37 @@ class CameraCalibrationWindowTests(unittest.TestCase):
                 reloaded.load_captures(app.captures_path)
                 self.assertEqual(len(reloaded.samples), 19)
                 self.assertEqual(reloaded.samples[0].pose, {motor: 180.0 for motor in range(1, 7)})
+                self.assertEqual(saved["modelo_3d"], app.current_model)
+            finally:
+                root.destroy()
+
+    def test_captures_from_another_3d_model_are_recomputed_or_dropped(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        pixels = {"frontal": [0.4, 0.6], "lateral": [0.5, 0.7]}
+        pose = {str(motor): 150.0 + motor for motor in range(1, 7)}
+        captures = {"version": 1, "modelo_3d": "viejo", "muestras": [
+            {"tipo": "cubo", "pixeles": pixels, "mesa_m": [0.5, 0.5], "origen": "con ángulos", "angulos": pose},
+            {"tipo": "cubo", "pixeles": pixels, "mesa_m": [0.5, 0.5], "origen": "sin ángulos"},
+        ]}
+
+        def locator(value):
+            return value[1] / 1000, -value[2] / 1000
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "capturas.json"
+            path.write_text(json.dumps(captures), encoding="utf-8")
+            try:
+                app = CameraCalibrationApp(root, project_root=Path(temporary), locator=locator, model="nuevo")
+                app.load_captures(path)
+                self.assertEqual([s.source for s in app.samples], ["con ángulos"])
+                self.assertEqual(app.samples[0].table_xy, (0.151, -0.152))
+                self.assertIn("1 recalculadas", app.status.get())
+                self.assertIn("1 descartadas", app.status.get())
+                # Con el mismo modelo se conservan tal cual, aunque no tengan ángulos.
+                same = CameraCalibrationApp(root, project_root=Path(temporary), locator=locator, model="viejo")
+                same.load_captures(path)
+                self.assertEqual([s.table_xy for s in same.samples], [(0.5, 0.5), (0.5, 0.5)])
             finally:
                 root.destroy()
 

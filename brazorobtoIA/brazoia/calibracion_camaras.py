@@ -425,6 +425,9 @@ class CameraCalibration:
     camera_settings: dict[str, dict[str, Any]]
     samples: tuple[Sample, ...]
     created: str
+    # Huella del modelo 3D con que se calcularon las posiciones de mesa
+    # (gripper_geometry.model_fingerprint); None en calibraciones anteriores.
+    model: str | None = None
 
     def locate(self, features: Iterable[float]) -> dict[str, tuple[float, float]]:
         """Posición del cubo y del recipiente (metros, marco del modelo) en una escena."""
@@ -448,10 +451,21 @@ class CameraCalibration:
                     problems.append(f"{camera}: {label} {saved.get(key)} al calibrar, ahora {current.get(key)}")
         return problems
 
+    def model_problems(self, current_model: str) -> list[str]:
+        """Si las posiciones de mesa se calcularon con otro modelo 3D, no sirven: el
+        brazo iría a otro lugar (con M1 invertido, al lado espejado)."""
+        if self.model is None:
+            return ["no registra con qué modelo 3D se calculó"]
+        if self.model != current_model:
+            return [f"se calculó con otro modelo 3D (huella {self.model}, ahora {current_model}): cambiaron "
+                    "calibracion.json, el URDF o la altura del eje M2"]
+        return []
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": CALIBRATION_VERSION,
             "fecha": self.created,
+            "modelo_3d": self.model,
             "camaras": self.camera_settings,
             "mapeos": {kind: mapping.to_dict() for kind, mapping in self.mappings.items()},
             "muestras": [sample.to_dict() for sample in self.samples],
@@ -477,6 +491,7 @@ class CameraCalibration:
             camera_settings=dict(data["camaras"]),
             samples=tuple(Sample.from_dict(item) for item in data.get("muestras", [])),
             created=str(data.get("fecha", "")),
+            model=data.get("modelo_3d"),
         )
 
 
@@ -493,8 +508,11 @@ def settings_from_config(cameras_config: dict[str, Any]) -> dict[str, dict[str, 
     }
 
 
-def fit_calibration(samples: Sequence[Sample], camera_settings: dict[str, dict[str, Any]]) -> CameraCalibration:
-    """Ajusta el cubo (obligatorio) y el recipiente si tiene suficientes muestras propias."""
+def fit_calibration(samples: Sequence[Sample], camera_settings: dict[str, dict[str, Any]], *,
+                    model: str | None = None) -> CameraCalibration:
+    """Ajusta el cubo (obligatorio) y el recipiente si tiene suficientes muestras propias.
+
+    `model` es la huella del modelo 3D con que se calcularon las posiciones de mesa."""
     cubes = [sample for sample in samples if sample.kind == "cubo"]
     containers = [sample for sample in samples if sample.kind == "recipiente"]
     mappings = {"cubo": fit_mapping(cubes, shared=containers)}
@@ -505,6 +523,7 @@ def fit_calibration(samples: Sequence[Sample], camera_settings: dict[str, dict[s
         camera_settings=camera_settings,
         samples=tuple(samples),
         created=datetime.now().isoformat(timespec="seconds"),
+        model=model,
     )
 
 

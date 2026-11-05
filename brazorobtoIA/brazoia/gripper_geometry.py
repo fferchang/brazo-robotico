@@ -5,6 +5,7 @@ el motor de la garra, incluyendo M5 y M6. No estima flexión ni error de encoder
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import xml.etree.ElementTree as ET
@@ -55,6 +56,21 @@ def stl_vertices(path):
 # Eje M2 sobre la mesa, ajustado con 12 toques de la garra el 30/10/2026
 # (CALIBRACION.md). Antes se usaban los 100 mm medidos a mano.
 SHOULDER_HEIGHT_MM = 121.9
+
+
+def model_fingerprint(assets_root: Path, *, shoulder_height_mm=SHOULDER_HEIGHT_MM) -> str:
+    """Huella del modelo 3D: calibracion.json, el URDF y la altura del eje M2.
+
+    Lo que se calcula con el modelo (por ejemplo, dónde quedó el cubo según los
+    ángulos de un agarre) solo vale con la misma huella. Ignora espacios del JSON
+    y finales de línea del URDF, que cambian entre Windows y Linux.
+    """
+    assets_root = Path(assets_root)
+    calibration = json.loads((assets_root / "calibracion.json").read_text(encoding="utf-8"))
+    urdf = (assets_root / "modelo" / "so100.urdf").read_bytes().replace(b"\r\n", b"\n")
+    payload = json.dumps({"calibracion": calibration, "urdf_sha256": hashlib.sha256(urdf).hexdigest(),
+                          "altura_eje_m2_mm": float(shoulder_height_mm)}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 class GripperGeometry:

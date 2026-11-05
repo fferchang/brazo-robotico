@@ -7,6 +7,7 @@ principal. Ver CALIBRACION_CAMARAS.md.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import tkinter as tk
@@ -42,13 +43,14 @@ INSTRUCTIONS = (
 
 class CameraCalibrationApp:
     def __init__(self, root, *, project_root=ROOT, scene_provider=None, pose_provider=None,
-                 camera_settings=None, locator=None, captures_dir=None, output_path=None):
+                 camera_settings=None, locator=None, captures_dir=None, output_path=None, model=None):
         self.root = root
         self.project_root = Path(project_root)
         self.scene_provider = scene_provider
         self.pose_provider = pose_provider
         self.camera_settings = dict(camera_settings or {})
         self._locator = locator  # pose → (x, y) en metros; por defecto, el modelo 3D
+        self._model = model  # huella del modelo 3D del locator; por defecto, la de assets/
         folder = Path(captures_dir) if captures_dir else self.project_root / "datos" / "calibracion"
         self.captures_path = folder / f"camaras_capturas_{datetime.now():%Y%m%d_%H%M%S}.json"
         self.output_path = Path(output_path) if output_path else folder / "camaras.json"
@@ -146,6 +148,15 @@ class CameraCalibrationApp:
             self._locator = lambda value: object_center(arm, value)
         return self._locator(pose)
 
+    @property
+    def current_model(self):
+        """Huella del modelo 3D con que `locate` calcula la posición en la mesa."""
+        if self._model is None:
+            from brazoia.gripper_geometry import model_fingerprint
+
+            self._model = model_fingerprint(ROOT / "assets")
+        return self._model
+
     def register(self, kind):
         label = KIND_LABELS[kind]
         if self.pending is None:
@@ -192,23 +203,42 @@ class CameraCalibrationApp:
             self.load_captures(Path(path))
 
     def load_captures(self, path):
+        """Carga capturas. Si son de otro modelo 3D, recalcula la mesa con los ángulos
+        guardados y descarta las que no los tienen: sus posiciones ya no valen."""
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             loaded = [Sample.from_dict(item) for item in data["muestras"]]
+            same_model = data.get("modelo_3d") == self.current_model
+            usable, relabeled, skipped = [], 0, 0
+            for sample in loaded:
+                if not same_model:
+                    if sample.pose is None:
+                        skipped += 1
+                        continue
+                    x, y = self.locate(sample.pose)
+                    sample = dataclasses.replace(sample, table_xy=(float(x), float(y)))
+                    relabeled += 1
+                usable.append(sample)
         except Exception as exc:
             self.status.set(f"No se pudieron cargar las capturas: {exc}")
             return
-        for sample in loaded:
+        for sample in usable:
             self.samples.append(sample)
             self._insert_row(sample)
         self.save_captures()
         self.refresh_count()
-        self.status.set(f"{len(loaded)} muestras cargadas de {Path(path).name}.")
+        message = f"{len(usable)} muestras cargadas de {Path(path).name}."
+        if relabeled:
+            message += f" {relabeled} recalculadas con el modelo 3D actual a partir de sus ángulos."
+        if skipped:
+            message += (f" {skipped} descartadas: se hicieron con otro modelo 3D (o no registran cuál) y no "
+                        "guardaron ángulos; hay que repetirlas.")
+        self.status.set(message)
 
     # ----- cálculo -----
     def calculate(self):
         try:
-            self.calibration = fit_calibration(self.samples, self.camera_settings)
+            self.calibration = fit_calibration(self.samples, self.camera_settings, model=self.current_model)
         except ValueError as exc:
             self.calibration = None
             self.result.set(str(exc))
@@ -224,7 +254,7 @@ class CameraCalibrationApp:
         self.status.set(f"Guardada en {self.output_path}. El modo geométrico de la ejecución automática la usa.")
 
     def save_captures(self):
-        payload = {"version": 1, "camaras": self.camera_settings,
+        payload = {"version": 1, "modelo_3d": self.current_model, "camaras": self.camera_settings,
                    "muestras": [sample.to_dict() for sample in self.samples]}
         self.captures_path.parent.mkdir(parents=True, exist_ok=True)
         self.captures_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

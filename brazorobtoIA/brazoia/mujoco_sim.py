@@ -395,6 +395,16 @@ class VirtualArm:
     def logical_pose(self):
         return {i: self.to_logical(i, float(self.data.qpos[self.qadr[i]])) for i in range(1, 7)}
 
+    def m1_toward(self, xy):
+        """M1 lógico que orienta el plano del brazo hacia `xy` (semilla de la IK).
+
+        El eje de M1 es +z del mundo y con M1 = 180° el brazo apunta a −y: el
+        ángulo articular es el azimut desde −y hacia +x. El sentido de M1 sale de
+        calibracion.json, no se supone.
+        """
+        dx, dy = float(xy[0]) - self.m1_axis_xy[0], float(xy[1]) - self.m1_axis_xy[1]
+        return self.to_logical(1, self.to_qpos(1, 180.0) + math.atan2(dx, -dy))
+
     def cube_position(self):
         return self.data.xpos[self.cube_body].copy()
 
@@ -636,8 +646,8 @@ class PickPlaceExpert:
             best = None
             for yaw in yaws:
                 xy = target_xy(yaw)
-                azimuth = math.degrees(math.atan2(xy[0], -xy[1]))
-                seeds = ([previous] if previous else []) + [{**seed, 1: 180.0 + azimuth} for seed in pool]
+                m1 = self.arm.m1_toward(xy)
+                seeds = ([previous] if previous else []) + [{**seed, 1: m1} for seed in pool]
                 solution = self.arm.solve_ik([xy[0], xy[1], self.arm.floor_z + height], yaw, seeds,
                                              grippers=grippers, tilts=tilts)
                 if not solution.ok:
