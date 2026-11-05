@@ -101,6 +101,21 @@ class VisionConfig:
     frontal_minimum_lime_confidence: float
 
 
+def detection_parameters(vision: VisionConfig, camera_index: int) -> dict:
+    """Argumentos de `detect_scene` para la cámara 0 (frontal) o 1 (lateral)."""
+    frontal = camera_index == 0
+    return dict(
+        minimum_red_area_ratio=vision.minimum_red_area_ratio,
+        minimum_lime_area_ratio=(
+            vision.frontal_minimum_lime_area_ratio if frontal else vision.minimum_lime_area_ratio
+        ),
+        lime_hsv_lower=vision.frontal_lime_hsv_lower if frontal else (30, 50, 50),
+        lime_hsv_upper=vision.frontal_lime_hsv_upper if frontal else (90, 255, 255),
+        minimum_lime_shape_ratio=vision.frontal_minimum_lime_shape_ratio if frontal else 0.0,
+        minimum_lime_confidence=vision.frontal_minimum_lime_confidence if frontal else 0.0,
+    )
+
+
 @dataclass(frozen=True)
 class AppConfig:
     root: Path

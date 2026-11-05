@@ -11,3 +11,4 @@ datos/simulacion/
 datos/prueba_hardware/
 modelos/**/*.npz
 *.log
+datos/gemelo/

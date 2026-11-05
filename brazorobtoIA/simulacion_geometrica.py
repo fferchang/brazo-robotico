@@ -20,59 +20,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import mujoco
 import numpy as np
 
-from brazoia.calibracion_camaras import CAMERAS, Sample, describe, fit_calibration, object_pixels
+from brazoia.calibracion_camaras import CAMERAS, describe, fit_calibration
 from brazoia.config import load_config
-from brazoia.mujoco_sim import PickPlaceExpert, PlanningError, VirtualArm, run_episode, sample_placement
+# Las cámaras virtuales y su calibración viven en el gemelo digital, que las comparte.
+from brazoia.gemelo import VirtualCameras, calibration_samples, placement_by_hand
+from brazoia.mujoco_sim import PickPlaceExpert, PlanningError, VirtualArm, run_episode
 from brazoia.politica_geometrica import GeometricPolicy
-from brazoia.vision import detect_scene, observation_features
 
 
 ROOT = Path(__file__).resolve().parent
-# Las cámaras virtuales están ubicadas a ojo y ven el recipiente más chico que la
-# frontal real; los umbrales estrictos de esa cámara no aplican aquí.
-SIM_DETECTION = dict(minimum_red_area_ratio=0.001, minimum_lime_area_ratio=0.004,
-                     lime_hsv_lower=(30, 50, 50), lime_hsv_upper=(90, 255, 255))
-
-
-class VirtualCameras:
-    def __init__(self, arm: VirtualArm, height=480, width=640):
-        self.arm = arm
-        self.renderer = mujoco.Renderer(arm.model, height=height, width=width)
-
-    def features(self, placement) -> np.ndarray:
-        """Las 32 características de la escena de Inicio, como las calcula la aplicación."""
-        self.arm.reset(placement)
-        observations = []
-        for camera in CAMERAS:
-            self.renderer.update_scene(self.arm.data, camera=camera)
-            frame = cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
-            observations.append(detect_scene(frame, **SIM_DETECTION))
-        return observation_features(observations)
-
-
-def placement_by_hand(rng, max_yaw_degrees: float):
-    """Escena al azar con el cubo y el recipiente alineados a mano con la base."""
-    limit = math.radians(max_yaw_degrees)
-    return dataclasses.replace(sample_placement(rng), cube_yaw=float(rng.uniform(-limit, limit)),
-                               container_yaw=float(rng.uniform(-limit, limit)))
-
-
-def calibration_samples(cameras: VirtualCameras, rng, count: int, *, containers: bool,
-                        max_yaw_degrees: float) -> list[Sample]:
-    samples = []
-    for index in range(count):
-        placement = placement_by_hand(rng, max_yaw_degrees)
-        features = cameras.features(placement)
-        objects = [("cubo", placement.cube_xy)] + ([("recipiente", placement.container_xy)] if containers else [])
-        for kind, xy in objects:
-            pixels = object_pixels(features, kind)
-            if all(camera in pixels for camera in CAMERAS):
-                samples.append(Sample(kind, pixels, (float(xy[0]), float(xy[1])), f"simulación {index + 1}"))
-    return samples
 
 
 def evaluate(policy: GeometricPolicy, cameras: VirtualCameras, rng, episodes: int, *, ideal: bool,

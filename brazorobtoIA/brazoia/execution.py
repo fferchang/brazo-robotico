@@ -8,13 +8,31 @@ from typing import Callable
 import numpy as np
 
 from .config import KEYFRAME_STAGES, STAGE_LABELS
-from .planner import MotionGroup, build_motion_plan
+from .planner import MotionGroup, build_motion_plan, planning_start
 from .policy import StagePolicy
 from .robot import RobotSerial
 from .vision import SceneObservation, observation_features
 
 
 StatusCallback = Callable[[str], None]
+
+# El firmware abre con WritePosEx(6, 150 real, 300, 25): 300 pasos/s son ~26,4°/s,
+# así que de cerrada (0°) a abierta (140°) tarda unos 5,3 s. Lo midió el gemelo digital.
+GRIPPER_OPEN_DEGREES = 140.0
+GRIPPER_OPEN_SPEED_DEG_S = 300 * 360.0 / 4095.0
+
+
+ARRIVAL_TOLERANCE = 1.2         # llegada normal
+LOADED_ARRIVAL_TOLERANCE = 3.0  # llegada aceptada si el motor ya no se mueve
+STILL_SAMPLES = 12              # ~0,6 s de lecturas cada 50 ms
+STILL_RANGE = 0.3               # variación máxima para considerarlo quieto
+
+
+def gripper_open_timeout(current_m6: float | None) -> float:
+    """Espera de la apertura: lo que tarda el servo en recorrer lo que falta, con margen."""
+    start = 0.0 if current_m6 is None else current_m6
+    distance = abs(GRIPPER_OPEN_DEGREES - start)
+    return max(5.0, 1.5 + 1.25 * distance / GRIPPER_OPEN_SPEED_DEG_S)
 
 
 @dataclass(frozen=True)
@@ -55,8 +73,9 @@ class MotionExecutor:
             self._wait_gripper("holding", timeout=16.0)
         elif proposal.gripper_action == "open":
             self.status("Abriendo la garra...")
+            timeout = gripper_open_timeout(self.robot.snapshot().positions.get(6))
             self.robot.send("gripper open")
-            self._wait_motor(6, 140.0, timeout=5.0)
+            self._wait_motor(6, GRIPPER_OPEN_DEGREES, timeout=timeout)
 
     def _move_group(self, group: MotionGroup) -> None:
         targets = dict(group.targets)
@@ -79,18 +98,37 @@ class MotionExecutor:
         timeout = min(8.0, max(2.0, 0.8 + largest / 45.0))
         deadline = time.monotonic() + timeout
         stable = 0
+        recent: list[dict[int, float]] = []
         while time.monotonic() < deadline:
             if self.stop_event.wait(0.05):
                 raise RuntimeError("Movimiento detenido por el operador.")
             snapshot = self.robot.snapshot()
             if snapshot.fault:
                 raise RuntimeError(snapshot.fault)
-            arrived = all(
-                abs(snapshot.positions.get(motor_id, target + 1000.0) - target) <= 1.2
+            errors = {
+                motor_id: abs(snapshot.positions.get(motor_id, target + 1000.0) - target)
                 for motor_id, target in targets.items()
-            )
-            stable = stable + 1 if arrived else 0
+            }
+            stable = stable + 1 if max(errors.values()) <= ARRIVAL_TOLERANCE else 0
             if stable >= 3:
+                time.sleep(0.08)
+                return
+            # Con el brazo estirado y carga, el hombro cede por la gravedad y se queda quieto
+            # algo antes de la orden (en el gemelo, M2 1,1–1,4°). Se acepta si quedó quieto cerca.
+            recent = (recent + [{motor_id: snapshot.positions.get(motor_id, 1e9) for motor_id in targets}])[
+                -STILL_SAMPLES:
+            ]
+            if (
+                len(recent) == STILL_SAMPLES
+                and max(errors.values()) <= LOADED_ARRIVAL_TOLERANCE
+                and all(
+                    max(sample[motor_id] for sample in recent) - min(sample[motor_id] for sample in recent)
+                    <= STILL_RANGE
+                    for motor_id in targets
+                )
+            ):
+                detail = ", ".join(f"M{i} a {errors[i]:.1f}°" for i in targets)
+                self.status(f"Llegada con desvío (motor quieto): {detail}")
                 time.sleep(0.08)
                 return
         description = ", ".join(f"M{i}={value:.1f}°" for i, value in targets.items())
@@ -161,9 +199,11 @@ class SupervisedExecution:
         needs_recovery = max(
             abs(current[motor_id] - canonical[motor_id]) for motor_id in range(1, 6)
         ) > 2.0
+        # El encoder puede quedar unas décimas fuera de un límite tras una orden al límite.
+        start = planning_start(current, self.limits)
         if self.next_stage_index == 1 and needs_recovery:
             target = canonical
-            groups = build_motion_plan(current, target, self.limits)
+            groups = build_motion_plan(start, target, self.limits)
             self.proposal = MotionProposal(
                 stage_index=None,
                 stage="recuperacion_inicio",
@@ -194,7 +234,6 @@ class SupervisedExecution:
         # el modelo aprendido no tiene.
         via_points = self.policy.via(stage_index, self.scene_features) if hasattr(self.policy, "via") else []
         groups = []
-        start = dict(current)
         for waypoint in (*via_points, target):
             planned = build_motion_plan(start, waypoint, self.limits)
             groups.extend(planned)

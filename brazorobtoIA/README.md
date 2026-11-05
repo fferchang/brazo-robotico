@@ -125,6 +125,16 @@ desactiva reglas geométricas, límites de motores ni protecciones del firmware.
 
 ## Ejecución supervisada
 
+### Gemelo digital: el brazo virtual hace la tarea solo
+
+`lanzadores/GEMELO_DIGITAL.bat` muestra el brazo de MuJoCo haciendo la tarea
+completa sin ayuda, con el mismo código de ejecución que el brazo real:
+`RobotSerial` habla con un firmware virtual y las cámaras virtuales reemplazan a
+las reales. `lanzadores/INICIAR_GEMELO.bat` abre esta aplicación conectada al
+gemelo (puerto `SIMULADO`), con un botón para hacer las doce etapas solo. No usa
+el ESP32 ni las cámaras, y no mezcla datos con los reales. Ver
+`docs/GEMELO_DIGITAL.md`.
+
 ### Probar un modelo sin hardware
 
 Abrí `lanzadores/PRUEBA_OFFLINE.bat`, o **Probar modelo OFFLINE** junto al botón de entrenar.

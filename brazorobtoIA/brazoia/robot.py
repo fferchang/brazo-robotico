@@ -101,8 +101,11 @@ def discard_partial_line(connection: serial.Serial) -> None:
 class RobotSerial:
     """Un solo hilo posee el puerto y publica telemetria inmutable."""
 
-    def __init__(self, port: str, baud: int, history_seconds: float = 3.0):
+    def __init__(self, port: str, baud: int, history_seconds: float = 3.0, opener=None):
+        """`opener`: reemplazo de `serial.Serial` con su misma firma; el gemelo
+        digital pasa `DigitalTwin.open_port`. Sin él se abre el puerto real."""
         self.port = port
+        self.opener = opener or serial.Serial
         self.baud = baud
         self.history_seconds = history_seconds
         self.connection: serial.Serial | None = None
@@ -128,7 +131,7 @@ class RobotSerial:
         if self.connected:
             return
         self.stop_event.clear()
-        connection = serial.Serial(
+        connection = self.opener(
             self.port, self.baud, timeout=0.1, write_timeout=0.5
         )
         connection.dtr = False

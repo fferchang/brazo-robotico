@@ -23,12 +23,13 @@ from brazoia.config import (
     REFERENCE_POSE,
     STAGE_INSTRUCTIONS,
     STAGE_LABELS,
+    detection_parameters,
     load_config,
     validate_stage_gripper,
 )
 from brazoia.dataset import DemonstrationSession, load_successful_demonstrations
 from brazoia.execution import MotionExecutor, MotionProposal, SupervisedExecution
-from brazoia.planner import MotionGroup, build_motion_plan, edge_safe, floor_escape
+from brazoia.planner import MotionGroup, build_motion_plan, edge_safe, floor_escape, planning_start
 from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
 from brazoia.rerun_view import RerunArmView
 from brazoia.robot import RobotEvent, RobotSerial
@@ -48,21 +49,8 @@ def build_reference_pose_plan(
     if missing:
         raise ValueError("Falta telemetría de " + ", ".join(f"M{i}" for i in missing) + ".")
 
-    planning_current = dict(current)
-    for motor_id in range(1, 6):
-        low, high = limits[motor_id]
-        value = current[motor_id]
-        if value < low - 5.0 or value > high + 5.0:
-            raise ValueError(
-                f"M{motor_id}={value:.1f}° está demasiado fuera del límite para planificar."
-            )
-        if value < low:
-            # Quedar 0,5° dentro hace que el plan incluya una orden exacta al
-            # límite, en vez de perder la corrección por el recorte.
-            planning_current[motor_id] = min(high, low + 0.5)
-        elif value > high:
-            planning_current[motor_id] = max(low, high - 0.5)
-
+    planning_current = planning_start({motor_id: current[motor_id] for motor_id in range(1, 6)}, limits)
+    planning_current.update({key: value for key, value in current.items() if key not in planning_current})
     return tuple(build_motion_plan(planning_current, target, limits))
 
 
@@ -97,9 +85,21 @@ def manual_motor_proposal(snapshot, motor_id, target, limits, maximum_age, now):
 
 
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, *, gemelo: bool = False):
         self.root = root
         self.config = load_config()
+        # Gemelo digital: el brazo y las cámaras de MuJoCo detrás del mismo puerto serie
+        # y la misma interfaz de cámara (brazoia/gemelo.py). Nunca abre COM ni DirectShow.
+        self.twin = None
+        self.twin_viewer = None
+        self.twin_stop = threading.Event()        # Detener/Emergencia para la tarea sin confirmación
+        self.twin_scene_used = False              # la tarea ya se hizo en esta escena
+        self.twin_calibration_ready = threading.Event()
+        if gemelo:
+            from brazoia.gemelo import DigitalTwin, twin_config
+
+            self.config = twin_config(self.config)
+            self.twin = DigitalTwin(self.config)
         self.cameras: list[CameraStream] = []
         self.snapshots = []
         self.observations = []
@@ -128,7 +128,7 @@ class App:
         self.auto_status = tk.StringVar(value="Modo automático detenido")
         # "aprendido": modelo entrenado con demostraciones; "geometrico": cámaras calibradas
         # y cinemática inversa del modelo 3D (brazoia/politica_geometrica.py).
-        self.automatic_mode = tk.StringVar(value="aprendido")
+        self.automatic_mode = tk.StringVar(value="geometrico" if self.twin is not None else "aprendido")
         self.geometric_model = None  # (VirtualArm, PickPlaceExpert): armarlo tarda ~1 s
         self.notes = tk.StringVar()
         self.port = tk.StringVar(value=self.config.port)
@@ -154,15 +154,21 @@ class App:
         self.camera_setting_widgets = []
         self.angle_vars = {i: tk.StringVar(value="—") for i in range(1, 7)}
         self.manual_angle_vars = {i: tk.StringVar(value="") for i in range(1, 7)}
+        self.twin_status = tk.StringVar(value="")
         self.build()
         self.refresh_ports()
+        if self.twin is not None:
+            self.status.set("GEMELO DIGITAL: abrí las cámaras virtuales y conectá SIMULADO. El brazo real no se usa.")
+            self.describe_twin_scene()
+            self.run_async(self.prepare_twin_calibration)
         self.load_model_if_present()
         self.update_demo_count()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(50, self.tick)
 
     def build(self) -> None:
-        self.root.title("Brazo Robot IA · cubo rojo → recipiente verde lima")
+        title = "Brazo Robot IA · cubo rojo → recipiente verde lima"
+        self.root.title(("GEMELO DIGITAL · " + title) if self.twin is not None else title)
         self.root.geometry("1400x920")
 
         footer = ttk.Frame(self.root, padding=6)
@@ -200,6 +206,15 @@ class App:
             ),
         )
         self.root.bind("<MouseWheel>", self.scroll_page)
+
+        if self.twin is not None:
+            twin = tk.LabelFrame(self.content, text="GEMELO DIGITAL · brazo y cámaras virtuales (MuJoCo)",
+                                 padx=8, pady=8, fg="#1d4ed8")
+            twin.pack(fill="x", padx=8, pady=5)
+            ttk.Button(twin, text="Nueva escena", command=self.new_twin_scene).pack(side="left", padx=3)
+            ttk.Button(twin, text="Hacer la tarea solo (12 etapas)", command=self.run_twin_task).pack(side="left", padx=3)
+            ttk.Button(twin, text="Ver en 3D (MuJoCo)", command=self.open_twin_viewer).pack(side="left", padx=3)
+            ttk.Label(twin, textvariable=self.twin_status, wraplength=800).pack(side="left", padx=10)
 
         top = ttk.LabelFrame(self.content, text="Conexiones", padding=8)
         top.pack(fill="x", padx=8, pady=5)
@@ -413,6 +428,13 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def refresh_ports(self) -> None:
+        if self.twin is not None:
+            from brazoia.gemelo import VIRTUAL_PORT
+
+            self.port_combo["values"] = [VIRTUAL_PORT]
+            self.port.set(VIRTUAL_PORT)
+            self.log(f"Gemelo digital: único puerto {VIRTUAL_PORT} (firmware virtual).")
+            return
         discovered = list(list_ports.comports())
         ports = [item.device for item in discovered]
         self.port_combo["values"] = ports
@@ -478,6 +500,9 @@ class App:
         self.status.set("Ajustes neutros aplicados. Pulsá Guardar si querés conservarlos.")
 
     def save_camera_settings(self) -> None:
+        if self.twin is not None:
+            self.status.set("En el gemelo digital los ajustes de cámara no se guardan en config.json.")
+            return
         if self.demonstration is not None or self.execution is not None:
             self.status.set("Terminá la demostración o tarea antes de guardar ajustes.")
             return
@@ -510,6 +535,15 @@ class App:
             self.status.set("Una cámara anterior no se liberó. Cerrá otra aplicación que pueda estar usándola.")
             return
         self.cameras = []
+        if self.twin is not None:
+            from brazoia.gemelo import VirtualCameraStream
+
+            self.cameras = [
+                VirtualCameraStream(self.twin, "frontal", 0, self.camera_rotation_values[0], **self.camera_parameters(0)),
+                VirtualCameraStream(self.twin, "lateral", 1, self.camera_rotation_values[1], **self.camera_parameters(1)),
+            ]
+            self.status.set("Cámaras virtuales del gemelo abiertas.")
+            return
         front_config = self.config.cameras["frontal"]
         side_config = self.config.cameras["lateral"]
         front_index = discover_camera_index(front_config.name, front_config.fallback_index)
@@ -546,7 +580,10 @@ class App:
     def connect_robot(self) -> None:
         if self.robot is not None and self.robot.connected:
             return
-        robot = RobotSerial(self.port.get().strip(), self.config.baud)
+        if self.twin is not None:
+            robot = RobotSerial(self.port.get().strip(), self.config.baud, opener=self.twin.open_port)
+        else:
+            robot = RobotSerial(self.port.get().strip(), self.config.baud)
         self.robot = robot
         self.connection_status.set("Conectando...")
 
@@ -741,6 +778,9 @@ class App:
         )
 
     def start_demonstration(self) -> None:
+        if self.twin is not None:
+            self.status.set("En el gemelo digital no se graban demostraciones: no se mezclan con las reales.")
+            return
         if self.execution is not None:
             self.status.set("Terminá primero la tarea automática.")
             return
@@ -960,6 +1000,9 @@ class App:
         return observation_features(self.observations)
 
     def open_camera_calibration(self):
+        if self.twin is not None:
+            self.status.set("En el gemelo las cámaras virtuales se calibran solas; camaras.json es del brazo real.")
+            return
         from brazoia.calibracion_camaras import settings_from_config
         from calibracion_camaras_app import CameraCalibrationApp
 
@@ -973,6 +1016,9 @@ class App:
         )
 
     def open_calibration(self):
+        if self.twin is not None:
+            self.status.set("La calibración por toques de mesa es del brazo real; no está disponible en el gemelo.")
+            return
         from calibracion_app import CalibrationApp
         window = tk.Toplevel(self.root)
         window.calibration = CalibrationApp(window, project_root=self.config.root,
@@ -1048,7 +1094,9 @@ class App:
         self.executor = MotionExecutor(
             self.robot, status=lambda text: self.worker_messages.put(("log", text))
         )
-        self.execution_log = ExecutionLog(self.config.root / "datos" / "ejecuciones")
+        self.execution_log = ExecutionLog(
+            self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "ejecuciones"
+        )
         self.automatic_verification = None
         self.execution_busy = False
         self.set_camera_controls_enabled(False)
@@ -1067,7 +1115,14 @@ class App:
                     self.geometric_model = (arm, PickPlaceExpert(arm))
                 arm, expert = self.geometric_model
                 # Se relee en cada tarea: toma una calibración recién guardada.
-                policy = load_geometric_policy(self.config, arm=arm, expert=expert)
+                if self.twin is not None:
+                    if not self.twin_calibration_ready.is_set():
+                        raise ValueError("todavía se están calibrando las cámaras virtuales; probá en unos segundos")
+                    from brazoia.gemelo import load_twin_policy
+
+                    policy = load_twin_policy(self.config, arm=arm, expert=expert)
+                else:
+                    policy = load_geometric_policy(self.config, arm=arm, expert=expert)
             except (OSError, ValueError) as exc:
                 self.status.set(f"Modo geométrico: {exc}")
                 return None
@@ -1152,6 +1207,8 @@ class App:
         )
 
     def stop_automatic(self) -> None:
+        if self.twin is not None:
+            self.twin_stop.set()
         if self.executor is not None:
             self.executor.stop()
         self.auto_status.set("Detenido por el operador.")
@@ -1186,6 +1243,8 @@ class App:
         self.auto_status.set("Modo automático detenido")
 
     def emergency(self) -> None:
+        if self.twin is not None:
+            self.twin_stop.set()
         if self.executor is not None:
             self.executor.stop()
         if self.manual_executor is not None:
@@ -1200,6 +1259,146 @@ class App:
             self.finish_demonstration("interrupted")
         self.auto_status.set("EMERGENCIA: torque OFF solicitado. Sostené el brazo.")
 
+    # ----- gemelo digital -----
+    def prepare_twin_calibration(self) -> None:
+        from brazoia.gemelo import ensure_twin_calibration
+
+        try:
+            ensure_twin_calibration(self.config, progress=lambda text: self.worker_messages.put(("log", text)))
+            self.worker_messages.put(("log", "Gemelo: calibración de las cámaras virtuales lista."))
+        finally:
+            self.twin_calibration_ready.set()
+
+    def describe_twin_scene(self) -> None:
+        placement = self.twin.placement
+        self.twin_status.set(
+            f"Escena: cubo en ({placement.cube_xy[0] * 1000:.0f}, {placement.cube_xy[1] * 1000:.0f}) mm, "
+            f"recipiente en ({placement.container_xy[0] * 1000:.0f}, {placement.container_xy[1] * 1000:.0f}) mm. "
+            "Nada de esto mueve el brazo real."
+        )
+
+    def new_twin_scene(self) -> None:
+        if self.twin is None:
+            return
+        if self.execution_busy:
+            self.status.set("Esperá a que termine el movimiento o usá Detener.")
+            return
+        if self.execution is not None:
+            self.finish_execution("interrupted")
+        self.twin.new_scene()
+        self.twin_scene_used = False
+        if self.robot is not None:
+            self.robot.clear_fault()
+        # La telemetría de la escena anterior tarda un instante en renovarse.
+        self.execution_busy = True
+        self.root.after(int((self.config.capture.stable_window_seconds + 0.3) * 1000),
+                        lambda: setattr(self, "execution_busy", False))
+        self.describe_twin_scene()
+        self.log("Gemelo: escena nueva; brazo en Inicio con la garra cerrada.")
+
+    def open_twin_viewer(self) -> None:
+        if self.twin is None:
+            return
+        if self.twin_viewer is not None and self.twin_viewer.is_running():
+            self.status.set("El visor 3D ya está abierto.")
+            return
+        import mujoco.viewer
+
+        self.twin_viewer = mujoco.viewer.launch_passive(self.twin.arm.model, self.twin.arm.data)
+        self.twin.viewer = self.twin_viewer
+
+    def run_twin_task(self) -> None:
+        """Las doce etapas sin pedir confirmación: solo existe con el gemelo digital."""
+        if self.twin is None:
+            return
+        if self.execution_busy:
+            self.status.set("Ya hay un movimiento en curso.")
+            return
+        robot = self.robot
+        if robot is None or not robot.connected or len(self.cameras) != 2:
+            self.status.set("Abrí las cámaras virtuales y conectá SIMULADO.")
+            return
+        if self.twin_scene_used:
+            self.status.set("La tarea ya se hizo en esta escena: pulsá Nueva escena.")
+            return
+        self.twin_stop.clear()
+        self.execution_busy = True
+
+        def operation():
+            if robot.snapshot().torque_enabled is not True:
+                robot.send("arm torque on")
+                deadline = time.monotonic() + 3.0
+                while robot.snapshot().torque_enabled is not True:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("M1–M5 no confirmaron torque ON.")
+                    time.sleep(0.05)
+            time.sleep(0.5)  # telemetría y cuadros nuevos antes de leer la escena
+
+        def start(_result):
+            self.execution_busy = False
+            if self.twin_stop.is_set():
+                self.auto_status.set("Detenido por el operador.")
+                return
+            if self.execution is None:
+                self.automatic_mode.set("geometrico")
+                self.start_automatic()
+                if self.execution is None:
+                    return
+            self._run_twin_stages()
+
+        self.run_async(operation, success=start, failure=self._twin_task_failed)
+
+    def _run_twin_stages(self) -> None:
+        execution, executor, run_log = self.execution, self.executor, self.execution_log
+        robot = self.robot
+        self.execution_busy = True
+        self.auto_status.set("Gemelo: haciendo la tarea solo, sin pedir confirmación...")
+
+        def stopped():
+            # execute() limpia el stop_event del ejecutor: la tarea usa su propia señal.
+            if self.twin_stop.is_set():
+                raise RuntimeError("Detenido por el operador.")
+
+        def operation():
+            while not execution.finished:
+                stopped()
+                snapshot = robot.snapshot()
+                if snapshot.fault:
+                    raise RuntimeError(snapshot.fault)
+                proposal = execution.prepare(snapshot.positions, self.observations)
+                if proposal.stage_index == 1 and hasattr(execution.policy, "describe"):
+                    self.worker_messages.put(("log", execution.policy.describe(execution.scene_features)))
+                self.worker_messages.put(("log", f"Gemelo · {proposal.label}: {len(proposal.groups)} tramos"))
+                if run_log is not None:
+                    run_log.proposal(proposal)
+                stopped()
+                executor.execute(proposal)
+                stopped()
+                if run_log is not None:
+                    run_log.completed(proposal.stage)
+                execution.mark_completed()
+                time.sleep(0.3)  # cuadros nuevos para la etapa siguiente
+            time.sleep(1.0)  # que el cubo se asiente antes de mirar
+            return self.twin.cube_in_container()
+
+        def finished(inside):
+            self.execution_busy = False
+            self.twin_scene_used = True
+            self.verify_final_result()
+            verdict = "quedó" if inside else "NO quedó"
+            self.log(f"Gemelo: según la física, el cubo {verdict} dentro del recipiente.")
+            self.notes.set("Gemelo digital: resultado según la física de MuJoCo.")
+            self.finish_execution("success" if inside else "failed_place")
+            self.auto_status.set(f"Gemelo: tarea terminada; el cubo {verdict} en el recipiente. "
+                                 "Nueva escena para repetir.")
+
+        self.run_async(operation, success=finished, failure=self._twin_task_failed)
+
+    def _twin_task_failed(self, exc) -> None:
+        self.execution_busy = False
+        self.auto_status.set(f"BLOQUEADO: {exc}")
+        self.log(f"Gemelo: tarea bloqueada: {exc}")
+
     def open_data_folder(self) -> None:
         path = self.config.root / "datos"
         path.mkdir(exist_ok=True)
@@ -1211,43 +1410,19 @@ class App:
         try:
             self._drain_workers()
             self.snapshots = [camera.snapshot() for camera in self.cameras]
-            self.observations = []
+            observations = []
             for index, snapshot in enumerate(self.snapshots):
                 if snapshot.frame is None:
                     self.camera_labels[index].configure(image="", text=snapshot.status)
                     continue
                 observation = detect_scene(
-                    snapshot.frame,
-                    minimum_red_area_ratio=self.config.vision.minimum_red_area_ratio,
-                    minimum_lime_area_ratio=(
-                        self.config.vision.frontal_minimum_lime_area_ratio
-                        if index == 0
-                        else self.config.vision.minimum_lime_area_ratio
-                    ),
-                    lime_hsv_lower=(
-                        self.config.vision.frontal_lime_hsv_lower
-                        if index == 0
-                        else (30, 50, 50)
-                    ),
-                    lime_hsv_upper=(
-                        self.config.vision.frontal_lime_hsv_upper
-                        if index == 0
-                        else (90, 255, 255)
-                    ),
-                    minimum_lime_shape_ratio=(
-                        self.config.vision.frontal_minimum_lime_shape_ratio
-                        if index == 0
-                        else 0.0
-                    ),
-                    minimum_lime_confidence=(
-                        self.config.vision.frontal_minimum_lime_confidence
-                        if index == 0
-                        else 0.0
-                    ),
+                    snapshot.frame, **detection_parameters(self.config.vision, index)
                 )
-                self.observations.append(observation)
+                observations.append(observation)
                 frame = draw_observation(snapshot.frame, observation)
                 self._show_frame(index, frame)
+            # Se publica entera: otro hilo (la tarea del gemelo) puede leerla en cualquier momento.
+            self.observations = observations
             self._update_robot_state()
         except Exception as exc:
             self.log(f"ERROR: {exc}")
@@ -1330,12 +1505,16 @@ class App:
             except Exception:
                 pass
             self.robot.disconnect()
+        if self.twin is not None:
+            self.twin.stop()
+            if self.twin_viewer is not None:
+                self.twin_viewer.close()
         self.root.destroy()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    application = App(root)
+    application = App(root, gemelo="--gemelo" in sys.argv)
     if "--trayecto-simulado" in sys.argv:
         root.after(200, application.open_trajectory_simulator)
     if "--calibracion" in sys.argv:

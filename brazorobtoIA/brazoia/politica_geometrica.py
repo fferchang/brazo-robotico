@@ -116,8 +116,11 @@ def calibration_path(config: AppConfig) -> Path:
     return config.root / CALIBRATION_FILE
 
 
-def load_geometric_policy(config: AppConfig, **kwargs) -> GeometricPolicy:
-    path = calibration_path(config)
+def load_geometric_policy(config: AppConfig, *, path: Path | None = None, model_suffix: str = "",
+                          **kwargs) -> GeometricPolicy:
+    """`path`: otra calibración (el gemelo digital usa la de sus cámaras virtuales, cuya
+    huella agrega `model_suffix` a la del modelo 3D)."""
+    path = path or calibration_path(config)
     if not path.is_file():
         raise ValueError("Falta la calibración de cámaras: hacela con «Calibración · cámaras».")
     calibration = CameraCalibration.load(path)
@@ -130,7 +133,7 @@ def load_geometric_policy(config: AppConfig, **kwargs) -> GeometricPolicy:
         )
     arm = kwargs.get("arm")
     model = model_fingerprint(arm.assets_root if arm is not None else config.root / "assets")
-    problems = calibration.model_problems(model)
+    problems = calibration.model_problems(model + model_suffix)
     if problems:
         raise ValueError(
             "La calibración de cámaras no sirve con el modelo 3D actual (" + "; ".join(problems) + "). "

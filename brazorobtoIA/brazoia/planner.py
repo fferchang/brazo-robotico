@@ -319,6 +319,31 @@ def plan_path(start, goal, step=5.0, m6=None, escape_from=None):
     return compressed[1:], "OK"
 
 
+START_LIMIT_TOLERANCE = 5.0
+
+
+def planning_start(current, limits, tolerance=START_LIMIT_TOLERANCE):
+    """Pose de partida para planificar, tolerando pequeños desvíos del encoder en los límites.
+
+    Un motor ordenado justo al límite puede quedar unas décimas afuera (M3 descansa en
+    89,8° con límite 90°; el gemelo digital dejó M4 en 278,2° con límite 278°). Sin esto,
+    la etapa siguiente no se podía planificar. Se planifica desde 0,5° adentro, así el
+    plan incluye una orden exacta al límite en vez de perder la corrección por el recorte.
+    """
+    result = dict(current)
+    for motor_id, value in current.items():
+        if motor_id not in limits or motor_id == 6:
+            continue
+        low, high = limits[motor_id]
+        if value < low - tolerance or value > high + tolerance:
+            raise ValueError(f"M{motor_id}={value:.1f}° está demasiado fuera del límite para planificar.")
+        if value < low:
+            result[motor_id] = min(high, low + 0.5)
+        elif value > high:
+            result[motor_id] = max(low, high - 0.5)
+    return result
+
+
 @dataclass(frozen=True)
 class MotionGroup:
     targets: tuple[tuple[int, float], ...]

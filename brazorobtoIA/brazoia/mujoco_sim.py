@@ -60,6 +60,7 @@ CONTAINER_CLEARANCE = 0.012
 
 # Inclinaciones de la garra hacia afuera que prueba la IK, en orden de preferencia.
 # Cerca del cubo y del recipiente se exige garra casi vertical; en tránsito, no.
+IK_LIMIT_MARGIN_DEGREES = 1.0
 IK_TILTS_DEGREES = (0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, -5.0, -10.0)
 TRANSIT_TILTS_DEGREES = (0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, -10.0, -20.0)
 
@@ -330,9 +331,14 @@ class VirtualArm:
         self.ranges = {i: tuple(self.model.jnt_range[j]) for i, j in self.joint_ids.items()}
         # La IK planifica dentro de los límites del brazo real para que el plan sea
         # ejecutable; la física conserva los topes físicos.
+        # Con 1° de margen en M1–M5: un servo ordenado justo al límite queda unas décimas
+        # afuera con la carga, y el firmware rechaza los `pair` siguientes (lo mostró el
+        # gemelo digital con M4 = 278°).
         self.ik_ranges = {}
         for motor, (low, high) in self.ranges.items():
-            wanted = sorted(self.to_qpos(motor, value) for value in self.limits[motor])
+            margin = IK_LIMIT_MARGIN_DEGREES if motor != 6 else 0.0
+            low_limit, high_limit = self.limits[motor]
+            wanted = sorted(self.to_qpos(motor, value) for value in (low_limit + margin, high_limit - margin))
             self.ik_ranges[motor] = (max(low, wanted[0]), min(high, wanted[1]))
         self.commanded = {**INITIAL_POSE, 6: GRIPPER_CLOSED}
         self.observer = None  # callable(arm) llamado cada 20 ms simulados.
