@@ -597,6 +597,28 @@ class ExecutionSequenceTests(unittest.TestCase):
         for features in policy.scenes:
             np.testing.assert_array_equal(features, expected)
 
+    def test_small_steps_between_via_points_still_add_up(self) -> None:
+        # Diez puntos previos que corren M1 de a 0,3°: menos que la tolerancia del
+        # planificador en cada uno, pero 3° en total. El brazo tiene que llegar.
+        class StepPolicy:
+            canonical_start = np.asarray([180.0, 180.0, 160.0, 180.0, 170.0])
+            canonical_guard = canonical_start.copy()
+
+            def predict(self, _stage_index, _features):
+                return {1: 183.0, 2: 180.0, 3: 160.0, 4: 180.0, 5: 170.0}
+
+            def via(self, _stage_index, _features):
+                return [{1: 180.0 + 0.3 * step, 2: 180.0, 3: 160.0, 4: 180.0, 5: 170.0} for step in range(1, 10)]
+
+        execution = SupervisedExecution(StepPolicy(), load_config().limits)
+        current = {1: 180.0, 2: 180.0, 3: 160.0, 4: 180.0, 5: 170.0, 6: 0.0}
+        proposal = execution.prepare(current, [SceneObservation(None, None), SceneObservation(None, None)])
+        commanded = dict(current)
+        for group in proposal.groups:
+            commanded.update(dict(group.targets))
+        self.assertAlmostEqual(commanded[1], 183.0)
+        self.assertGreaterEqual(sum(1 for group in proposal.groups if 1 in dict(group.targets)), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -196,8 +196,13 @@ class SupervisedExecution:
         groups = []
         start = dict(current)
         for waypoint in (*via_points, target):
-            groups.extend(build_motion_plan(start, waypoint, self.limits))
-            start = {**start, **waypoint}
+            planned = build_motion_plan(start, waypoint, self.limits)
+            groups.extend(planned)
+            # El planificador no mueve un motor por menos de 0,5°: el tramo siguiente
+            # parte de lo ordenado, no del punto. Si no, con puntos cercanos (el empuje
+            # avanza de a 4 mm) un motor que cambia poco en cada uno nunca se movería.
+            for group in planned:
+                start.update(dict(group.targets))
         gripper_action = {
             "aproximacion_2": "open",
             "aproximacion_3": "close",
