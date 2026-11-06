@@ -99,7 +99,8 @@ con 7 mm entre las puntas. Se aplicó: eje M2 a 121,9 mm de la mesa (antes
 100 mm), cero de M2 +1,5° y cero de M6 −5,5°. El error del modelo en los toques
 bajó de 17,8 a 2,2 mm RMS. Detalle y validación en `docs/DIAGNOSTICO_PISO_3D.md`.
 
-Pendiente: los ceros de M3 y M4, que piden toques con la garra inclinada 30–45°.
+Quedaban pendientes los ceros de M3 y M4. Con los toques del 5/11 se vio que
+la mesa no alcanza para medirlos (ver abajo).
 
 ## M1 invertido (5 de noviembre de 2026)
 
@@ -123,6 +124,35 @@ La calibración con toques de mesa no cambia: mide alturas, y M1 gira alrededor
 de un eje vertical. La prueba 1 sigue sirviendo para confirmarlo en el brazo
 real y para revisar M2–M5. Las capturas de cámaras del 4/11 se recalcularon
 (`CALIBRACION_CAMARAS.md`).
+
+## Resultados del 5 de noviembre de 2026 (brazo real)
+
+- **Prueba 1.** El modelo de Rerun sigue al brazo sin espejo en todos los
+  motores: queda confirmado el M1 invertido del mismo día.
+- **Prueba 3.** 36 toques (`calibracion_20261105_200846.json`), con la garra
+  vertical e inclinada (M4 de 177° a 263°) y M5 en dos giros. El modelo actual
+  les erra 4,1 mm RMS con un sesgo de −0,8 ± 0,7 mm; a los 12 toques del 30/10,
+  2,2 mm. **No se cambió nada.** La ventana propone mesa +4,6 mm (eje M2 a
+  117,3 mm) y M2 −1,7°: baja el error de estos toques a 3,5 mm (3,7 mm dejando
+  cada uno afuera), pero empeora la predicción de los toques del 30/10 de 2,5 a
+  3,3 mm. Es ruido de cada día (cuánto se apoya la garra), no un error del
+  modelo.
+- **Ceros de M3 y M4.** Los toques de mesa no los separan: M3 sube o baja la
+  garra 2 a 3,8 mm por grado en todos los toques, casi igual que mover la mesa
+  (el valor singular más chico del ajuste es 0,39 contra 27,7). Ajustados igual,
+  dan M3 +5,4 ± 3,4° y M4 −3,9 ± 2,3°, con la mesa 7 mm más abajo, y el error
+  baja apenas de 4,0 a 3,4 mm. Como el modelo ya acierta la altura en poses muy
+  variadas, se dejan como están. Un error de cero que no cambia la altura corre
+  la garra en la mesa, pero eso lo absorbe la calibración de cámaras, que se
+  ajusta con los ángulos del brazo.
+- **Prueba 4.** Puntas a 3 mm con M6 = −0,1°. El modelo da 5,2 mm a esa lectura
+  (corrimiento −1,6°), pero el 30/10 se midieron 7 mm a 1,2° y el modelo da
+  exactamente eso. Las dos medidas difieren en 2 mm, lo que el modelo explica
+  con 1,8 mm por grado. El promedio pide −0,8° (alrededor de 1 mm en las
+  puntas), menos que la precisión de la regla: no se cambió.
+- **Apertura de la garra.** De cerrada a 140° tarda unos 5,6 s medidos a ojo
+  (el gemelo calcula 5,3 s). La espera de `gripper_open_timeout` desde cerrada
+  es de 8,1 s, así que alcanza.
 
 ## Alcance
 

@@ -96,8 +96,28 @@ alineado con la base, garra vertical y el giro de M5 más chico desde la pose
 inicial). Esa suposición explica mejor las demostraciones de octubre que la de
 dejar la muñeca sin girar (12 contra 14 mm de mediana para el cubo). La
 calibración activa sale de esas capturas: cubo 6 mm de mediana (90 % ≤ 17 mm)
-y recipiente 8 mm (90 % ≤ 15 mm). Conviene reemplazarlas por capturas nuevas,
-que ya guardan los ángulos.
+y recipiente 8 mm (90 % ≤ 15 mm).
+
+El 5/11 se hicieron 16 capturas nuevas con ángulos medidos
+(`camaras_capturas_20261105_202522.json`, de 16 a 31 cm de la base). Solas dan
+12 mm de mediana dejando cada una afuera: el 6 mm del 4/11 era optimista,
+porque salía de ángulos reconstruidos. Las cámaras no se movieron: el mapeo
+del 4/11 les erra a las capturas nuevas lo mismo, de 3 a 36 mm. La calibración
+activa usa **las dos tandas juntas**
+(`camaras_capturas_20261105_juntas.json`; para recalcularla, cargar ese
+archivo). Con las demostraciones de octubre como prueba independiente:
+
+| Capturas | Escenas ubicadas | Cubo, mediana (90 %) | Recipiente, mediana (90 %) |
+|---|---|---|---|
+| Solo 4/11 | 11 de 15 | 10 mm (16 mm) | 7 mm (21 mm) |
+| Solo 5/11 | 6 de 15 | 15 mm (20 mm) | 14 mm (26 mm) |
+| Juntas | 13 de 15 | 7 mm (18 mm) | 8 mm (27 mm) |
+
+En la simulación, el agarre empujando aguanta 17 mm de error en el cubo (20 de
+20) y 22 mm en 15 de 20; el recipiente aguanta 22 mm (20 de 20). Los errores
+más grandes del cubo (22–24 mm) aparecen a más de 30 cm de la base, donde se
+hicieron las capturas 1 y 3 del 5/11: para las primeras pruebas conviene dejar
+el cubo entre 18 y 29 cm de la base.
 
 ## Ejecutar
 
