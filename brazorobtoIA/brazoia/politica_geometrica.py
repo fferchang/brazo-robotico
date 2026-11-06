@@ -22,6 +22,19 @@ CALIBRATION_FILE = Path("datos") / "calibracion" / "camaras.json"
 # Sostenido, el cubo queda apretado contra la cara interna del dedo fijo, donde
 # está el punto «pinza» del modelo; su centro queda medio cubo hacia el dedo móvil.
 CUBE_HALF_SIZE_M = 0.025
+# En el gemelo, todas las escenas con el cubo hasta 30,7 cm de la base salen bien y
+# las de 33–34 cm fallan: el agarre con el brazo estirado queda al límite
+# (docs/GEMELO_DIGITAL.md). La tarea autónoma no arranca más allá.
+MAX_CUBE_DISTANCE_CM = 30.0
+
+
+def cube_distance_problem(summary: dict[str, object]) -> str | None:
+    """Aviso si el cubo quedó más lejos de la base de lo que el agarre aguanta."""
+    distance = summary.get("cubo_a_la_base_cm")
+    if isinstance(distance, (int, float)) and distance > MAX_CUBE_DISTANCE_CM:
+        return (f"el cubo está a {distance:.0f} cm de la base, más de {MAX_CUBE_DISTANCE_CM:.0f} cm: "
+                "con el brazo tan estirado el agarre falla. Acercalo.")
+    return None
 
 
 def object_center(arm: VirtualArm, pose: dict[int, float], offset_m: float = CUBE_HALF_SIZE_M) -> tuple[float, float]:

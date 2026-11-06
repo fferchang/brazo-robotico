@@ -52,26 +52,47 @@ class MotionProposal:
 
 
 class MotionExecutor:
-    def __init__(self, robot: RobotSerial, status: StatusCallback | None = None):
+    def __init__(
+        self,
+        robot: RobotSerial,
+        status: StatusCallback | None = None,
+        abort: threading.Event | None = None,
+    ):
         self.robot = robot
         self.status = status or (lambda text: None)
         self.stop_event = threading.Event()
+        # Parada externa (Detener/EMERGENCIA de la app). A diferencia de stop_event,
+        # execute() no la borra: una parada pedida entre dos etapas no se pierde.
+        self.abort = abort
 
     def stop(self) -> None:
         self.stop_event.set()
 
+    def _stop_requested(self, timeout: float = 0.0) -> bool:
+        if self.abort is not None and self.abort.is_set():
+            return True
+        if timeout > 0:
+            return self.stop_event.wait(timeout) or (self.abort is not None and self.abort.is_set())
+        return self.stop_event.is_set()
+
     def execute(self, proposal: MotionProposal) -> None:
         self.stop_event.clear()
+        if self._stop_requested():
+            raise RuntimeError("Movimiento detenido por el operador.")
         snapshot = self.robot.snapshot()
         if snapshot.fault:
             raise RuntimeError(f"Fallo activo del firmware: {snapshot.fault}")
         if snapshot.torque_enabled is not True:
             raise RuntimeError("Activá torque antes de confirmar el movimiento.")
         for index, group in enumerate(proposal.groups, start=1):
-            if self.stop_event.is_set():
+            if self._stop_requested():
                 raise RuntimeError("Movimiento detenido por el operador.")
             self.status(f"Tramo {index}/{len(proposal.groups)}: {group.targets}")
             self._move_group(group)
+        # La garra vuelve a tener torque con estas órdenes: una parada pedida durante
+        # el último tramo no tiene que deshacerse acá.
+        if proposal.gripper_action is not None and self._stop_requested():
+            raise RuntimeError("Movimiento detenido por el operador.")
         if proposal.gripper_action == "close":
             self.status("Cerrando la garra por presión...")
             self.robot.send("gripper close")
@@ -105,7 +126,7 @@ class MotionExecutor:
         stable = 0
         recent: list[dict[int, float]] = []
         while time.monotonic() < deadline:
-            if self.stop_event.wait(0.05):
+            if self._stop_requested(0.05):
                 raise RuntimeError("Movimiento detenido por el operador.")
             snapshot = self.robot.snapshot()
             if snapshot.fault:
@@ -147,7 +168,7 @@ class MotionExecutor:
         recent: list[float] = []
         last = None
         while time.monotonic() < deadline:
-            if self.stop_event.wait(0.05):
+            if self._stop_requested(0.05):
                 raise RuntimeError("Movimiento detenido por el operador.")
             snapshot = self.robot.snapshot()
             if snapshot.fault:
@@ -171,7 +192,7 @@ class MotionExecutor:
     def _wait_gripper(self, expected: str, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.stop_event.wait(0.05):
+            if self._stop_requested(0.05):
                 raise RuntimeError("Movimiento detenido por el operador.")
             snapshot = self.robot.snapshot()
             if snapshot.fault:

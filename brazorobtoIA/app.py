@@ -39,6 +39,8 @@ from brazoia.vision import detect_scene, draw_observation, observation_features,
 # Avisos del ejecutor que se guardan en el registro de la ejecución (el resto es progreso).
 RUN_LOG_WARNINGS = ("Llegada con desvío", "Garra abierta a")
 # Del modelo aprendido solo lo que lo identifica; su metadata trae las predicciones de validación.
+# Vista previa de cada cámara: las dos lado a lado y las pestañas debajo, sin desplazar.
+PREVIEW_SIZE = (480, 272)
 POLICY_SUMMARY_KEYS = ("tipo", "calibracion", "demonstrations", "mean_absolute_error_degrees", "validation_passed")
 
 
@@ -89,6 +91,10 @@ def manual_motor_proposal(snapshot, motor_id, target, limits, maximum_age, now):
                           (MotionGroup(((motor_id, target),)),), None)
 
 
+class _Rejected(RuntimeError):
+    """La tarea autónoma no arranca o no sigue: no se movió nada."""
+
+
 class App:
     def __init__(self, root: tk.Tk, *, gemelo: bool = False):
         self.root = root
@@ -97,7 +103,7 @@ class App:
         # y la misma interfaz de cámara (brazoia/gemelo.py). Nunca abre COM ni DirectShow.
         self.twin = None
         self.twin_viewer = None
-        self.twin_stop = threading.Event()        # Detener/Emergencia para la tarea sin confirmación
+        self.auto_stop = threading.Event()        # Detener/Emergencia para la tarea sin confirmación
         self.twin_scene_used = False              # la tarea ya se hizo en esta escena
         self.twin_calibration_ready = threading.Event()
         if gemelo:
@@ -108,6 +114,8 @@ class App:
         self.cameras: list[CameraStream] = []
         self.snapshots = []
         self.observations = []
+        self.latest_scene = ([], [])               # (cuadros, detecciones) del mismo tick
+        self.emergency_active = False
         self.preview_images = [None, None]
         self.robot: RobotSerial | None = None
         self.demonstration: DemonstrationSession | None = None
@@ -176,6 +184,10 @@ class App:
         title = "Brazo Robot IA · cubo rojo → recipiente verde lima"
         self.root.title(("GEMELO DIGITAL · " + title) if self.twin is not None else title)
         self.root.geometry("1400x920")
+        try:
+            self.root.state("zoomed")  # en una notebook la ventana fija no entra entera
+        except tk.TclError:
+            pass
 
         footer = ttk.Frame(self.root, padding=6)
         footer.pack(side="bottom", fill="x")
@@ -185,6 +197,7 @@ class App:
             text="EMERGENCIA · TORQUE OFF",
             bg="#b42332",
             fg="white",
+            font=("Segoe UI", 10, "bold"),
             command=self.emergency,
         ).pack(side="right")
 
@@ -215,15 +228,35 @@ class App:
 
         if self.twin is not None:
             twin = tk.LabelFrame(self.content, text="GEMELO DIGITAL · brazo y cámaras virtuales (MuJoCo)",
-                                 padx=8, pady=8, fg="#1d4ed8")
-            twin.pack(fill="x", padx=8, pady=5)
+                                 padx=8, pady=6, fg="#1d4ed8")
+            twin.pack(fill="x", padx=8, pady=4)
             ttk.Button(twin, text="Nueva escena", command=self.new_twin_scene).pack(side="left", padx=3)
-            ttk.Button(twin, text="Hacer la tarea solo (12 etapas)", command=self.run_twin_task).pack(side="left", padx=3)
             ttk.Button(twin, text="Ver en 3D (MuJoCo)", command=self.open_twin_viewer).pack(side="left", padx=3)
-            ttk.Label(twin, textvariable=self.twin_status, wraplength=800).pack(side="left", padx=10)
+            ttk.Label(twin, textvariable=self.twin_status, wraplength=900).pack(side="left", padx=10)
 
-        top = ttk.LabelFrame(self.content, text="Conexiones", padding=8)
-        top.pack(fill="x", padx=8, pady=5)
+        self._build_connection_bar(self.content)
+        self._build_cameras(self.content)
+
+        notebook = ttk.Notebook(self.content)
+        notebook.pack(fill="x", padx=8, pady=4)
+        self.notebook = notebook
+        for title, builder in (
+            ("Tarea automática", self._build_task_tab),
+            ("Mover a mano", self._build_manual_tab),
+            ("Enseñar y entrenar", self._build_teaching_tab),
+            ("Cámaras y calibración", self._build_calibration_tab),
+        ):
+            tab = ttk.Frame(notebook, padding=8)
+            notebook.add(tab, text=f"  {title}  ")
+            builder(tab)
+
+        self.log_box = tk.Text(self.content, height=8, state="disabled", font=("Consolas", 9))
+        self.log_box.pack(fill="both", expand=True, padx=8, pady=4)
+
+    def _build_connection_bar(self, parent) -> None:
+        """Conexiones y telemetría: siempre a la vista."""
+        top = ttk.Frame(parent, padding=(8, 6, 8, 2))
+        top.pack(fill="x")
         ttk.Button(top, text="Abrir / reabrir cámaras", command=self.open_cameras).pack(side="left")
         ttk.Label(top, text="Puerto:").pack(side="left", padx=(14, 2))
         self.port_combo = ttk.Combobox(top, textvariable=self.port, width=10)
@@ -234,34 +267,103 @@ class App:
         ttk.Button(top, text="Abrir Rerun", command=self.open_rerun).pack(side="left", padx=8)
         ttk.Label(top, textvariable=self.connection_status).pack(side="left", padx=8)
 
-        readings = ttk.LabelFrame(self.content, text="Telemetría lógica", padding=8)
-        readings.pack(fill="x", padx=8, pady=5)
+        readings = ttk.Frame(parent, padding=(8, 2, 8, 4))
+        readings.pack(fill="x")
         for motor_id in range(1, 7):
-            frame = ttk.Frame(readings)
-            frame.grid(row=0, column=motor_id - 1, padx=10, sticky="nsew")
-            readings.columnconfigure(motor_id - 1, weight=1)
-            ttk.Label(frame, text=f"M{motor_id}", font=("Segoe UI", 10, "bold")).pack()
-            ttk.Label(frame, textvariable=self.angle_vars[motor_id], font=("Segoe UI", 18, "bold")).pack()
             low, high = self.config.limits[motor_id]
-            ttk.Label(frame, text=f"{low:.0f}..{high:.0f}°").pack()
-        ttk.Label(readings, textvariable=self.torque_status).grid(row=1, column=0, columnspan=3, sticky="w")
-        ttk.Label(readings, textvariable=self.gripper_status).grid(row=1, column=3, columnspan=3, sticky="e")
+            cell = ttk.Frame(readings)
+            cell.pack(side="left", padx=(0, 18))
+            ttk.Label(cell, text=f"M{motor_id}", font=("Segoe UI", 9, "bold")).pack(side="left")
+            ttk.Label(cell, textvariable=self.angle_vars[motor_id], width=7, anchor="e",
+                      font=("Segoe UI", 14, "bold")).pack(side="left", padx=(4, 2))
+            ttk.Label(cell, text=f"{low:.0f}..{high:.0f}°", foreground="#666").pack(side="left")
+        ttk.Label(readings, textvariable=self.gripper_status).pack(side="right")
+        ttk.Label(readings, textvariable=self.torque_status).pack(side="right", padx=14)
 
-        reference = ttk.Frame(self.content, padding=(8, 0, 8, 4))
-        reference.pack(fill="x")
+    def _build_cameras(self, parent) -> None:
+        views = ttk.Frame(parent, padding=(8, 2))
+        views.pack(fill="x")
+        self.camera_labels = []
+        for index, title in enumerate(("FRONTAL", "LATERAL")):
+            panel = ttk.Frame(views)
+            panel.pack(side="left", fill="both", expand=True, padx=3)
+            heading = ttk.Frame(panel)
+            heading.pack()
+            ttk.Label(heading, text=title, font=("Segoe UI", 10, "bold")).pack(side="left", padx=6)
+            ttk.Button(
+                heading,
+                textvariable=self.rotation_vars[index],
+                command=lambda camera_index=index: self.rotate_camera(camera_index),
+            ).pack(side="left")
+            label = ttk.Label(panel, text="Cámara cerrada", anchor="center")
+            label.pack(fill="both", expand=True)
+            self.camera_labels.append(label)
+
+    def _build_task_tab(self, tab) -> None:
+        main = ttk.Frame(tab)
+        main.pack(fill="x")
+        modes = ttk.Frame(main)
+        modes.pack(side="left", padx=(0, 14))
+        ttk.Label(modes, text="Cómo ubica el cubo:").pack(anchor="w")
+        ttk.Radiobutton(modes, text="Geométrico (cámaras calibradas)", value="geometrico",
+                        variable=self.automatic_mode).pack(anchor="w")
+        ttk.Radiobutton(modes, text="Modelo aprendido", value="aprendido",
+                        variable=self.automatic_mode).pack(anchor="w")
+        tk.Button(
+            main, text="▶  HACER LA TAREA SOLA", command=self.run_autonomous_task,
+            bg="#15803d", fg="white", activebackground="#166534", activeforeground="white",
+            font=("Segoe UI", 13, "bold"), padx=18, pady=8,
+        ).pack(side="left", padx=4)
+        tk.Button(
+            main, text="■  Detener", command=self.stop_automatic,
+            font=("Segoe UI", 12, "bold"), padx=14, pady=8,
+        ).pack(side="left", padx=8)
+        ttk.Label(
+            main,
+            text="Las 12 etapas seguidas, sin confirmar cada una.\nDetener o EMERGENCIA la cortan.",
+            foreground="#555",
+        ).pack(side="left", padx=8)
+
+        ttk.Label(tab, textvariable=self.auto_status, wraplength=1250,
+                  font=("Segoe UI", 10, "bold")).pack(fill="x", pady=(8, 6))
+
+        lower = ttk.Frame(tab)
+        lower.pack(fill="x")
+        step = ttk.LabelFrame(lower, text="Paso a paso · confirmás cada etapa", padding=6)
+        step.pack(side="left", padx=(0, 8))
+        ttk.Button(step, text="Iniciar", command=self.start_automatic).pack(side="left", padx=3)
+        ttk.Button(step, text="Preparar etapa", command=self.prepare_next_stage).pack(side="left", padx=3)
+        ttk.Button(step, text="CONFIRMAR Y MOVER", command=self.confirm_stage).pack(side="left", padx=3)
+
+        results = ttk.LabelFrame(lower, text="Resultado real (lo marcás vos al final)", padding=6)
+        results.pack(side="left", fill="x", expand=True)
+        for label, result in (
+            ("Correcto", "success"),
+            ("Falló agarre", "failed_grasp"),
+            ("Falló depósito", "failed_place"),
+            ("Detenido", "interrupted"),
+        ):
+            ttk.Button(results, text=label, command=lambda value=result: self.finish_execution(value)).pack(side="left", padx=3)
+        ttk.Label(results, text="Nota:").pack(side="left", padx=(12, 3))
+        ttk.Entry(results, textvariable=self.notes).pack(side="left", fill="x", expand=True)
+        ttk.Button(results, text="Abrir carpeta de datos", command=self.open_data_folder).pack(side="left", padx=(8, 0))
+
+    def _build_manual_tab(self, tab) -> None:
+        poses = ttk.Frame(tab)
+        poses.pack(fill="x")
         ttk.Button(
-            reference,
-            text="Llevar M1–M5 a 180°, 90°, 270°, 180°, 270° (M6 sin cambios)",
-            command=self.move_to_reference_pose,
-        ).pack(side="left")
-        ttk.Button(
-            reference,
+            poses,
             text="Pose inicial: 180°, 180°, 90°, 180°, 263° (M6 sin cambios)",
             command=lambda: self.move_to_reference_pose(INITIAL_POSE, "Pose inicial"),
+        ).pack(side="left")
+        ttk.Button(
+            poses,
+            text="Llevar M1–M5 a 180°, 90°, 270°, 180°, 270° (M6 sin cambios)",
+            command=self.move_to_reference_pose,
         ).pack(side="left", padx=(8, 0))
 
-        manual = ttk.LabelFrame(self.content, text="Ángulos manuales · grados lógicos", padding=8)
-        manual.pack(fill="x", padx=8, pady=5)
+        manual = ttk.LabelFrame(tab, text="Ángulos manuales · grados lógicos", padding=6)
+        manual.pack(fill="x", pady=6)
         for motor_id in range(1, 7):
             panel = ttk.Frame(manual)
             panel.grid(row=0, column=motor_id - 1, padx=8, sticky="ew")
@@ -277,26 +379,53 @@ class App:
         ttk.Label(manual, text="Escribir no mueve el brazo: pulsá Mover y confirmá. M6 por ángulo NO es cierre por presión.").grid(
             row=1, column=2, columnspan=4, sticky="w", pady=(6, 0))
 
-        camera_frame = ttk.LabelFrame(self.content, text="Cámaras y detección local", padding=6)
-        camera_frame.pack(fill="x", padx=8, pady=5)
-        views = ttk.Frame(camera_frame)
-        views.pack(fill="x")
-        self.camera_labels = []
-        for index, title in enumerate(("FRONTAL", "LATERAL")):
-            panel = ttk.Frame(views)
-            panel.pack(side="left", fill="both", expand=True, padx=3)
-            ttk.Label(panel, text=title, font=("Segoe UI", 10, "bold")).pack()
-            ttk.Button(
-                panel,
-                textvariable=self.rotation_vars[index],
-                command=lambda camera_index=index: self.rotate_camera(camera_index),
-            ).pack()
-            label = ttk.Label(panel, text="Cámara cerrada", anchor="center")
-            label.pack(fill="both", expand=True)
-            self.camera_labels.append(label)
+        controls = ttk.LabelFrame(tab, text="Torque y garra", padding=6)
+        controls.pack(fill="x")
+        ttk.Button(
+            controls,
+            text="Torque ON",
+            # Compatible con firmware anterior y nuevo. Encender M6 no altera
+            # su posición; la separación crítica es al apagar para enseñanza.
+            command=lambda: self.send_robot("torque on"),
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            controls,
+            text="Torque brazo OFF (M1–M5)",
+            command=lambda: self.send_robot("arm torque off"),
+        ).pack(side="left", padx=3)
+        ttk.Button(controls, text="Abrir garra", command=lambda: self.send_robot("gripper open")).pack(side="left", padx=(12, 3))
+        ttk.Button(controls, text="Cerrar garra por presión", command=lambda: self.send_robot("gripper close")).pack(side="left", padx=3)
+        ttk.Button(controls, text="Parar garra", command=lambda: self.send_robot("gripper stop")).pack(side="left", padx=3)
+        ttk.Button(controls, text="Leer posiciones", command=lambda: self.send_robot("posall")).pack(side="left", padx=(12, 3))
 
-        settings = ttk.LabelFrame(self.content, text="Ajustes de imagen en vivo", padding=6)
-        settings.pack(fill="x", padx=8, pady=5)
+    def _build_teaching_tab(self, tab) -> None:
+        teaching = ttk.LabelFrame(tab, text=f"Demostración · {len(KEYFRAME_STAGES)} poses", padding=6)
+        teaching.pack(fill="x")
+        ttk.Button(teaching, text="Nueva demostración", command=self.start_demonstration).pack(side="left", padx=3)
+        ttk.Button(teaching, text="Tomar foto", command=self.take_keyframe).pack(side="left", padx=3)
+        ttk.Button(teaching, text="Reintentar última foto", command=self.retry_last_keyframe).pack(side="left", padx=3)
+        ttk.Button(teaching, text="Guardar como exitosa", command=lambda: self.finish_demonstration("success")).pack(side="left", padx=3)
+        ttk.Button(teaching, text="Interrumpir", command=lambda: self.finish_demonstration("interrupted")).pack(side="left", padx=3)
+        ttk.Label(teaching, textvariable=self.demo_status, wraplength=650).pack(side="left", padx=10)
+
+        training = ttk.LabelFrame(tab, text="Modelo aprendido", padding=6)
+        training.pack(fill="x", pady=6)
+        self.demo_count = tk.StringVar(value="0 demostraciones exitosas")
+        ttk.Label(training, textvariable=self.demo_count).pack(side="left")
+        ttk.Button(training, text="Entrenar / actualizar modelo", command=self.train_model).pack(side="left", padx=12)
+        ttk.Button(training, text="Probar modelo OFFLINE", command=self.open_offline_test).pack(side="left", padx=4)
+        ttk.Button(training, text="Simulador manual · Rerun", command=self.open_manual_simulator).pack(side="left", padx=4)
+        ttk.Label(training, textvariable=self.training_status).pack(side="left", padx=8)
+
+    def _build_calibration_tab(self, tab) -> None:
+        tools = ttk.LabelFrame(tab, text="Calibración y simulación", padding=6)
+        tools.pack(fill="x")
+        ttk.Button(tools, text="Calibración · cámaras", command=self.open_camera_calibration).pack(side="left", padx=3)
+        ttk.Button(tools, text="Calibración · toques de mesa", command=self.open_calibration).pack(side="left", padx=3)
+        ttk.Button(tools, text="Trayecto desde brazo · simulación", command=self.open_trajectory_simulator).pack(side="left", padx=3)
+
+        settings = ttk.LabelFrame(tab, text="Ajustes de imagen en vivo", padding=6)
+        settings.pack(fill="x", pady=6)
         parameter_definitions = (
             ("Brillo %", "brightness_percent", -100.0, 100.0, 5.0),
             ("Contraste %", "contrast_percent", -100.0, 200.0, 5.0),
@@ -315,7 +444,7 @@ class App:
                     to=maximum,
                     resolution=resolution,
                     orient="horizontal",
-                    length=145,
+                    length=130,
                     command=lambda _value, index=camera_index: self.apply_camera_settings(index),
                 )
                 control.pack(side="left", fill="x", expand=True, padx=2)
@@ -336,78 +465,6 @@ class App:
         )
         self.camera_edit_button.pack(fill="x", pady=(8, 2))
         self.set_camera_controls_enabled(True)
-
-        manual = ttk.LabelFrame(self.content, text="Controles separados de enseñanza", padding=8)
-        manual.pack(fill="x", padx=8, pady=5)
-        ttk.Button(
-            manual,
-            text="Torque ON",
-            # Compatible con firmware anterior y nuevo. Encender M6 no altera
-            # su posición; la separación crítica es al apagar para enseñanza.
-            command=lambda: self.send_robot("torque on"),
-        ).pack(side="left", padx=3)
-        ttk.Button(
-            manual,
-            text="Torque brazo OFF (M1–M5)",
-            command=lambda: self.send_robot("arm torque off"),
-        ).pack(side="left", padx=3)
-        ttk.Button(manual, text="Abrir garra", command=lambda: self.send_robot("gripper open")).pack(side="left", padx=12)
-        ttk.Button(manual, text="Cerrar garra por presión", command=lambda: self.send_robot("gripper close")).pack(side="left", padx=3)
-        ttk.Button(manual, text="Parar garra", command=lambda: self.send_robot("gripper stop")).pack(side="left", padx=3)
-        ttk.Button(manual, text="Leer posiciones", command=lambda: self.send_robot("posall")).pack(side="left", padx=12)
-
-        teaching = ttk.LabelFrame(self.content, text=f"Enseñanza · {len(KEYFRAME_STAGES)} poses", padding=8)
-        teaching.pack(fill="x", padx=8, pady=5)
-        ttk.Button(teaching, text="Nueva demostración", command=self.start_demonstration).pack(side="left", padx=3)
-        ttk.Button(teaching, text="Tomar foto", command=self.take_keyframe).pack(side="left", padx=3)
-        ttk.Button(teaching, text="Reintentar última foto", command=self.retry_last_keyframe).pack(side="left", padx=3)
-        ttk.Button(teaching, text="Guardar como exitosa", command=lambda: self.finish_demonstration("success")).pack(side="left", padx=3)
-        ttk.Button(teaching, text="Interrumpir", command=lambda: self.finish_demonstration("interrupted")).pack(side="left", padx=3)
-        ttk.Button(teaching, text="Abrir carpeta", command=self.open_data_folder).pack(side="left", padx=12)
-        ttk.Label(teaching, textvariable=self.demo_status, wraplength=700).pack(
-            side="left", padx=10
-        )
-
-        training = ttk.LabelFrame(self.content, text="Entrenamiento local", padding=8)
-        training.pack(fill="x", padx=8, pady=5)
-        ttk.Button(training, text="Trayecto desde brazo · simulación", command=self.open_trajectory_simulator).pack(side="bottom", anchor="w", pady=4)
-        ttk.Button(training, text="Calibración · toques de mesa", command=self.open_calibration).pack(side="bottom", anchor="w", pady=4)
-        ttk.Button(training, text="Calibración · cámaras", command=self.open_camera_calibration).pack(side="bottom", anchor="w", pady=4)
-        self.demo_count = tk.StringVar(value="0 demostraciones exitosas")
-        ttk.Label(training, textvariable=self.demo_count).pack(side="left")
-        ttk.Button(training, text="Entrenar / actualizar modelo", command=self.train_model).pack(side="left", padx=12)
-        ttk.Button(training, text="Probar modelo OFFLINE", command=self.open_offline_test).pack(side="left", padx=6)
-        ttk.Button(training, text="Simulador manual · Rerun", command=self.open_manual_simulator).pack(side="left", padx=6)
-        ttk.Label(training, textvariable=self.training_status).pack(side="left", padx=8)
-
-        automatic = ttk.LabelFrame(self.content, text="Ejecución automática supervisada", padding=8)
-        automatic.pack(fill="x", padx=8, pady=5)
-        modes = ttk.Frame(automatic)
-        modes.pack(side="left", padx=(0, 8))
-        ttk.Radiobutton(modes, text="Modelo aprendido", value="aprendido",
-                        variable=self.automatic_mode).pack(anchor="w")
-        ttk.Radiobutton(modes, text="Geométrico (cámaras calibradas)", value="geometrico",
-                        variable=self.automatic_mode).pack(anchor="w")
-        ttk.Button(automatic, text="Iniciar tarea", command=self.start_automatic).pack(side="left", padx=3)
-        ttk.Button(automatic, text="Preparar siguiente etapa", command=self.prepare_next_stage).pack(side="left", padx=3)
-        ttk.Button(automatic, text="CONFIRMAR Y MOVER", command=self.confirm_stage).pack(side="left", padx=10)
-        ttk.Button(automatic, text="Detener", command=self.stop_automatic).pack(side="left", padx=3)
-        ttk.Label(automatic, textvariable=self.auto_status, wraplength=650).pack(side="left", padx=10)
-
-        results = ttk.LabelFrame(self.content, text="Resultado final", padding=8)
-        results.pack(fill="x", padx=8, pady=5)
-        for label, result in (
-            ("Correcto", "success"),
-            ("Falló agarre", "failed_grasp"),
-            ("Falló depósito", "failed_place"),
-            ("Detenido", "interrupted"),
-        ):
-            ttk.Button(results, text=label, command=lambda value=result: self.finish_execution(value)).pack(side="left", padx=4)
-        ttk.Label(results, text="Nota:").pack(side="left", padx=(15, 3))
-        ttk.Entry(results, textvariable=self.notes).pack(side="left", fill="x", expand=True)
-
-        self.log_box = tk.Text(self.content, height=10, state="disabled", font=("Consolas", 9))
-        self.log_box.pack(fill="both", expand=True, padx=8, pady=5)
 
     def scroll_page(self, event):
         if event.widget.winfo_class() == "Text":
@@ -1076,6 +1133,9 @@ class App:
                 self.training_status.set(f"Modelo inválido: {exc}")
 
     def start_automatic(self) -> None:
+        if self.execution_busy:
+            self.status.set("Esperá a que termine el movimiento actual.")
+            return
         if self.demonstration is not None:
             self.status.set("Terminá primero la demostración activa.")
             return
@@ -1118,9 +1178,11 @@ class App:
         def executor_status(text: str) -> None:
             self.worker_messages.put(("log", text))
             if text.startswith(RUN_LOG_WARNINGS):
-                run_log.note("aviso", text)
+                proposal = self.execution.proposal if self.execution is not None else None
+                run_log.note("aviso", text, None if proposal is None else proposal.stage)
 
-        self.executor = MotionExecutor(self.robot, status=executor_status)
+        # Detener/EMERGENCIA cortan también una parada pedida entre dos etapas.
+        self.executor = MotionExecutor(self.robot, status=executor_status, abort=self.auto_stop)
         self.execution_log = run_log
         self.logged_scene = None
         self.automatic_verification = None
@@ -1177,10 +1239,15 @@ class App:
             return
         if proposal.stage_index == 1 and hasattr(self.execution.policy, "describe"):
             self.log(self.execution.policy.describe(self.execution.scene_features))
+        warning = ""
         if proposal.stage_index == 1:
             self._log_scene(self.execution, self.execution_log)
+            problem = self._scene_problem(self.execution)
+            if problem:
+                warning = f"AVISO: {problem} "
+                self.log("Aviso: " + problem)
         target_text = " | ".join(f"M{i}={v:.1f}°" for i, v in proposal.target.items())
-        self.auto_status.set(f"PROPUESTA: {proposal.label} · {target_text}")
+        self.auto_status.set(f"{warning}PROPUESTA: {proposal.label} · {target_text}")
         self.status.set("Revisá la propuesta y Rerun. Nada se moverá hasta confirmar.")
         if self.execution_log is not None:
             self.execution_log.proposal(proposal)
@@ -1209,6 +1276,9 @@ class App:
             self.status.set("Etapa no confirmada; el brazo no se movió.")
             return
         self.execution_busy = True
+        # Confirmar es una orden nueva: deja atrás un Detener o una EMERGENCIA anterior.
+        self.auto_stop.clear()
+        self.emergency_active = False
         self.auto_status.set(f"Ejecutando: {proposal.label}")
 
         def success(_result):
@@ -1239,8 +1309,7 @@ class App:
         )
 
     def stop_automatic(self) -> None:
-        if self.twin is not None:
-            self.twin_stop.set()
+        self.auto_stop.set()
         if self.executor is not None:
             self.executor.stop()
         self.auto_status.set("Detenido por el operador.")
@@ -1315,8 +1384,8 @@ class App:
         self.auto_status.set("Modo automático detenido")
 
     def emergency(self) -> None:
-        if self.twin is not None:
-            self.twin_stop.set()
+        self.auto_stop.set()
+        self.emergency_active = True
         if self.executor is not None:
             self.executor.stop()
         if self.manual_executor is not None:
@@ -1379,22 +1448,35 @@ class App:
         self.twin_viewer = mujoco.viewer.launch_passive(self.twin.arm.model, self.twin.arm.data)
         self.twin.viewer = self.twin_viewer
 
-    def run_twin_task(self) -> None:
-        """Las doce etapas sin pedir confirmación: solo existe con el gemelo digital."""
-        if self.twin is None:
-            return
+    # ----- tarea autónoma: las doce etapas seguidas, sin confirmar cada una -----
+    def run_autonomous_task(self) -> None:
+        """Hace la tarea entera sola, con el brazo real o el gemelo.
+
+        Usa lo mismo que el flujo supervisado (política, planificador, ejecutor y
+        reglas del firmware) pero no pide confirmación: Detener o EMERGENCIA la cortan
+        en cualquier momento. Si una etapa se bloquea, la tarea queda en esa etapa y
+        se puede seguir paso a paso o volver a pulsar este botón.
+        """
         if self.execution_busy:
             self.status.set("Ya hay un movimiento en curso.")
             return
+        if self.demonstration is not None:
+            self.status.set("Terminá primero la demostración activa.")
+            return
         robot = self.robot
         if robot is None or not robot.connected or len(self.cameras) != 2:
-            self.status.set("Abrí las cámaras virtuales y conectá SIMULADO.")
+            self.status.set("Abrí las dos cámaras y conectá el robot.")
             return
-        if self.twin_scene_used:
+        if self.twin is not None and self.twin_scene_used:
             self.status.set("La tarea ya se hizo en esta escena: pulsá Nueva escena.")
             return
-        self.twin_stop.clear()
+        if self.execution is not None and self.execution.finished:
+            # La anterior terminó y nadie marcó el resultado: se guarda así.
+            self.finish_execution("sin_marcar")
+        self.auto_stop.clear()
+        self.emergency_active = False
         self.execution_busy = True
+        self.auto_status.set("Preparando la tarea autónoma...")
 
         def operation():
             if robot.snapshot().torque_enabled is not True:
@@ -1408,52 +1490,139 @@ class App:
 
         def start(_result):
             self.execution_busy = False
-            if self.twin_stop.is_set():
+            if self.auto_stop.is_set():
                 self.auto_status.set("Detenido por el operador.")
                 return
             if self.execution is None:
-                self.automatic_mode.set("geometrico")
+                if self.twin is not None:
+                    self.automatic_mode.set("geometrico")
                 self.start_automatic()
                 if self.execution is None:
+                    self.auto_status.set("No se pudo iniciar: " + self.status.get())
                     return
-            self._run_twin_stages()
+            self._run_autonomous_stages()
 
-        self.run_async(operation, success=start, failure=self._twin_task_failed)
+        self.run_async(operation, success=start, failure=self._autonomous_failed)
 
-    def _run_twin_stages(self) -> None:
+    def _wait_stable_pose(self, robot: RobotSerial, timeout: float = 5.0) -> dict[int, float]:
+        capture = self.config.capture
+        deadline = time.monotonic() + timeout
+        reason = ""
+        while time.monotonic() < deadline:
+            if self.auto_stop.is_set():
+                raise RuntimeError("Detenido por el operador.")
+            pose, reason = robot.stable_pose(
+                time.monotonic(),
+                maximum_age=capture.maximum_telemetry_age_seconds,
+                window_seconds=capture.stable_window_seconds,
+                maximum_range=capture.stable_max_range_degrees,
+            )
+            if pose is not None:
+                return pose
+            time.sleep(0.05)
+        raise RuntimeError(f"El brazo no se quedó quieto: {reason}")
+
+    def _scene_problem(self, execution: SupervisedExecution) -> str | None:
+        """Lo que impide hacer la tarea sola con esta escena (hoy: el cubo demasiado lejos)."""
+        if not hasattr(execution.policy, "summary") or execution.scene_features is None:
+            return None
+        from brazoia.politica_geometrica import cube_distance_problem
+
+        try:
+            return cube_distance_problem(execution.policy.summary(execution.scene_features))
+        except Exception:
+            return None  # el plan ya falló o falló al ubicar: lo informa prepare()
+
+    def _inicio_problem(self, snapshots, observations, now: float | None = None) -> str | None:
+        """La foto de Inicio con la que se planifica todo tiene que ser actual y el cubo
+        tiene que estar afuera del recipiente (si no, es la escena de la tarea anterior)."""
+        stale = validate_frame_pair(
+            snapshots,
+            time.monotonic() if now is None else now,
+            maximum_age=self.config.capture.maximum_camera_age_seconds + 0.3,
+            maximum_skew=1.0,
+        )
+        if stale:
+            return f"las cámaras no tienen imagen actual ({stale})"
+        if len(observations) != 2:
+            return "falta la detección de una cámara"
+        inside, _ = verify_cube_in_container([item.frame for item in snapshots], observations)
+        if inside:
+            return "el cubo ya está dentro del recipiente. Sacalo para empezar otra tarea."
+        return None
+
+    def _set_auto_status_from_worker(self, text: str) -> None:
+        self.worker_messages.put(("ui", (self.auto_status.set, text)))
+
+    def _run_autonomous_stages(self) -> None:
         execution, executor, run_log = self.execution, self.executor, self.execution_log
         robot = self.robot
+        twin = self.twin is not None
+        who = "Gemelo" if twin else "Brazo"
         self.execution_busy = True
-        self.auto_status.set("Gemelo: haciendo la tarea solo, sin pedir confirmación...")
+        self.auto_status.set(f"{who}: haciendo la tarea solo, sin pedir confirmación. Detener lo corta.")
 
         def stopped():
             # execute() limpia el stop_event del ejecutor: la tarea usa su propia señal.
-            if self.twin_stop.is_set():
+            if self.auto_stop.is_set():
                 raise RuntimeError("Detenido por el operador.")
 
         def operation():
+            # Lo que quedó preparado en el modo paso a paso se planificó desde otra pose.
+            execution.cancel_proposal()
+            if execution.next_stage_index > 1:
+                # La etapa 1 ya se hizo paso a paso, donde el cubo lejos solo avisa.
+                problem = self._scene_problem(execution)
+                if problem:
+                    raise _Rejected("No sigue: " + problem)
+            recoveries = 0
             while not execution.finished:
                 stopped()
                 snapshot = robot.snapshot()
                 if snapshot.fault:
                     raise RuntimeError(snapshot.fault)
-                proposal = execution.prepare(snapshot.positions, self.observations)
-                if proposal.stage_index == 1 and hasattr(execution.policy, "describe"):
-                    self.worker_messages.put(("log", execution.policy.describe(execution.scene_features)))
-                self.worker_messages.put(("log", f"Gemelo · {proposal.label}: {len(proposal.groups)} tramos"))
-                if run_log is not None:
-                    run_log.proposal(proposal)
-                if proposal.stage_index == 1:
-                    self._log_scene(execution, run_log)
-                stopped()
+                current = self._wait_stable_pose(robot)
+                time.sleep(0.15)  # cuadros tomados con el brazo ya quieto
+                snapshots, observations = self.latest_scene
+                taken_at = time.monotonic()  # planificar la etapa 1 tarda más de 1 s
+                stage = KEYFRAME_STAGES[execution.next_stage_index]
                 try:
+                    if execution.next_stage_index == 1:
+                        # Antes de planificar: con el cubo en el recipiente la ubicación ya falla.
+                        problem = self._inicio_problem(snapshots, observations, taken_at)
+                        if problem:
+                            raise _Rejected("No arranca: " + problem)
+                    proposal = execution.prepare(current, observations)
+                    stage = proposal.stage
+                    if proposal.recovery:
+                        recoveries += 1
+                        if recoveries > 2:
+                            raise _Rejected("el brazo no queda en la pose de Inicio después de dos "
+                                            "recuperaciones (algún motor a más de 2°). Revisalo en «Mover a mano».")
+                    elif proposal.stage_index == 1:
+                        if hasattr(execution.policy, "describe"):
+                            self.worker_messages.put(("log", execution.policy.describe(execution.scene_features)))
+                        self._log_scene(execution, run_log)
+                        problem = self._scene_problem(execution)
+                        if problem:
+                            raise _Rejected("No arranca: " + problem)
+                    step = f"{who} · {proposal.label}: {len(proposal.groups)} tramos"
+                    self.worker_messages.put(("log", step))
+                    self._set_auto_status_from_worker(f"{step} · sin pedir confirmación. Detener lo corta.")
+                    if run_log is not None:
+                        run_log.proposal(proposal)
+                    stopped()
                     executor.execute(proposal)
                 except Exception as exc:
+                    # Si se vuelve a intentar, se replanifica desde donde quedó el brazo.
+                    execution.cancel_proposal()
                     if run_log is not None:
-                        run_log.note("bloqueo", str(exc), proposal.stage)
-                        self._run_capture(run_log, f"{proposal.stage}_bloqueo")
+                        if isinstance(exc, _Rejected):
+                            run_log.note("rechazo", str(exc), stage)
+                        else:
+                            run_log.note("bloqueo", str(exc), stage)
+                            self._run_capture(run_log, f"{stage}_bloqueo")
                     raise
-                stopped()
                 if run_log is not None:
                     run_log.completed(proposal.stage, *self._robot_state())
                 execution.mark_completed()
@@ -1461,12 +1630,14 @@ class App:
                 if not execution.finished:
                     self._run_capture(run_log, proposal.stage)
             time.sleep(1.0)  # que el cubo se asiente antes de mirar
-            return self.twin.cube_in_container()
+            return self.twin.cube_in_container() if twin else None
 
         def finished(inside):
             self.execution_busy = False
-            self.twin_scene_used = True
             self.verify_final_result()
+            if not twin:
+                return  # verify_final_result pide marcar el resultado humano
+            self.twin_scene_used = True
             verdict = "quedó" if inside else "NO quedó"
             self.log(f"Gemelo: según la física, el cubo {verdict} dentro del recipiente.")
             self.notes.set("Gemelo digital: resultado según la física de MuJoCo.")
@@ -1474,12 +1645,27 @@ class App:
             self.auto_status.set(f"Gemelo: tarea terminada; el cubo {verdict} en el recipiente. "
                                  "Nueva escena para repetir.")
 
-        self.run_async(operation, success=finished, failure=self._twin_task_failed)
+        self.run_async(operation, success=finished, failure=self._autonomous_failed)
 
-    def _twin_task_failed(self, exc) -> None:
+    def _autonomous_failed(self, exc) -> None:
         self.execution_busy = False
-        self.auto_status.set(f"BLOQUEADO: {exc}")
-        self.log(f"Gemelo: tarea bloqueada: {exc}")
+        if self.emergency_active:
+            self.auto_status.set("EMERGENCIA: torque OFF solicitado. Sostené el brazo.")
+            self.log(f"Tarea autónoma cortada por EMERGENCIA: {exc}")
+            return
+        if self.auto_stop.is_set():
+            text = "Detenido por el operador."
+        else:
+            text = f"BLOQUEADO: {exc}"
+        stage = ""
+        if isinstance(exc, _Rejected):
+            stage = " No se movió nada: corregí la escena y volvé a pulsar el botón."
+        elif self.execution is not None and not self.execution.finished:
+            index = self.execution.next_stage_index
+            stage = f" Quedó antes de {STAGE_LABELS[KEYFRAME_STAGES[index]]}: podés seguir paso a paso, " \
+                    "volver a «Hacer la tarea sola» o marcar el resultado."
+        self.auto_status.set(text + stage)
+        self.log(f"Tarea autónoma: {text}")
 
     def open_data_folder(self) -> None:
         path = self.config.root / "datos"
@@ -1505,6 +1691,7 @@ class App:
                 self._show_frame(index, frame)
             # Se publica entera: otro hilo (la tarea del gemelo) puede leerla en cualquier momento.
             self.observations = observations
+            self.latest_scene = (list(self.snapshots), observations)
             self._update_robot_state()
         except Exception as exc:
             self.log(f"ERROR: {exc}")
@@ -1512,7 +1699,7 @@ class App:
 
     def _show_frame(self, index: int, frame) -> None:
         height, width = frame.shape[:2]
-        scale = min(650 / width, 390 / height)
+        scale = min(PREVIEW_SIZE[0] / width, PREVIEW_SIZE[1] / height)
         resized = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))))
         image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
         self.preview_images[index] = image
@@ -1568,6 +1755,7 @@ class App:
             ):
                 return
         self.closing = True
+        self.auto_stop.set()  # la tarea autónoma no empieza otra etapa
         if self.executor is not None:
             self.executor.stop()
         if self.manual_executor is not None:

@@ -23,11 +23,13 @@ Ningún resultado habilita movimientos del brazo real.
   «Abrir cámaras» abre las virtuales y el único puerto es `SIMULADO`. Arriba
   aparece el recuadro del gemelo:
   - **Nueva escena**: cubo y recipiente en otro lugar; el brazo vuelve a Inicio.
-  - **Hacer la tarea solo (12 etapas)**: prepara y ejecuta cada etapa sin pedir
-    confirmación y anota el resultado según la física. Solo existe en el gemelo.
   - **Ver en 3D (MuJoCo)**: el visor 3D, con la física en marcha.
 
-  El flujo supervisado (Iniciar tarea → Preparar → CONFIRMAR Y MOVER) también
+  En la pestaña **Tarea automática**, **HACER LA TAREA SOLA** prepara y ejecuta
+  las etapas sin pedir confirmación y, en el gemelo, anota el resultado según la
+  física. Desde el 6/11 el mismo botón existe con el brazo real.
+
+  El flujo paso a paso (Iniciar → Preparar etapa → CONFIRMAR Y MOVER) también
   funciona, igual que con el brazo real. Las ejecuciones se guardan en
   `datos/gemelo/ejecuciones/`, separadas de las reales. Demostraciones,
   calibraciones y «Guardar ajustes» de cámara están deshabilitados.

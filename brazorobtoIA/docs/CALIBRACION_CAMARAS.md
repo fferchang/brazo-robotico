@@ -3,7 +3,8 @@
 El modo geométrico mueve el brazo sin modelo aprendido. Con la foto de Inicio
 calcula dónde están el cubo y el recipiente sobre la mesa, y la cinemática
 inversa del modelo 3D (la misma de la simulación MuJoCo) calcula las doce
-poses. Cada etapa se sigue confirmando con **CONFIRMAR Y MOVER**, y el
+poses. En el modo paso a paso cada etapa se confirma con **CONFIRMAR Y MOVER**;
+**HACER LA TAREA SOLA** las encadena sin preguntar. En los dos, el
 planificador y el firmware siguen validando cada tramo. Pasa por puntos
 intermedios en el descenso sobre el cubo, que es vertical, en el empuje del
 cubo contra el dedo fijo, a la altura del agarre, y en el retiro final, también
@@ -121,11 +122,16 @@ el cubo entre 18 y 29 cm de la base.
 
 ## Ejecutar
 
-En **Ejecución automática supervisada**, elegir **Geométrico (cámaras
-calibradas)**, pulsar **Iniciar tarea** y avanzar etapa por etapa:
-**Preparar siguiente etapa**, revisar la propuesta en Rerun y **CONFIRMAR Y
-MOVER**. Al preparar la primera etapa, el registro muestra dónde ubicó el cubo
-y el recipiente. Tener la mano cerca de **EMERGENCIA · TORQUE OFF**.
+En la pestaña **Tarea automática**, elegir **Geométrico (cámaras calibradas)**
+y después:
+
+- **HACER LA TAREA SOLA**: las etapas seguidas, sin confirmar cada una. No
+  arranca si el cubo está a más de 30 cm de la base.
+- O **Paso a paso**: **Iniciar**, **Preparar etapa**, revisar la propuesta en
+  Rerun y **CONFIRMAR Y MOVER**. Con el cubo a más de 30 cm solo avisa.
+
+Al preparar la primera etapa, el registro muestra dónde ubicó el cubo y el
+recipiente. Tener la mano cerca de **EMERGENCIA · TORQUE OFF**.
 
 ## Simulación con cámaras virtuales
 

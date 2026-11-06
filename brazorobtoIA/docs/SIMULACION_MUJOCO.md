@@ -112,13 +112,17 @@ físicos.
   50 mm de alto. La masa del cubo (60 g) y el fondo de la caja (5 mm) son
   estimados. Se corrigen en `SceneDimensions` (`brazoia/mujoco_sim.py`).
 - Piso y ceros: calibrados el 30/10 con toques de mesa (eje M2 a 121,9 mm,
-  ~2 mm de error); faltan los ceros de M3 y M4. Ver `DIAGNOSTICO_PISO_3D.md`.
+  ~2 mm de error). El 5/11, 36 toques en el brazo real dieron 4,1 mm RMS sin
+  sesgo y no se cambió nada; los ceros de M3 y M4 no se pueden separar de la
+  altura de la mesa con toques. Ver «Ceros de M3 y M4» en `CALIBRACION.md`.
 - Espejo en X corregido el 5/11: M1 estaba invertido en el modelo (las fotos
   reales mostraban el brazo del lado contrario). Ver «M1 invertido» en
   `CALIBRACION.md`. Los resultados anteriores de la simulación siguen valiendo:
   el mundo simulado era el espejo del real, con la misma física.
-- Cámaras virtuales: ubicadas a ojo según las fotos reales. Falta calibrarlas
-  antes de usar sus imágenes para entrenar.
+- Cámaras virtuales: ubicadas a ojo según las fotos reales. El gemelo digital
+  las calibra solo (25 escenas, `datos/gemelo/camaras_virtuales.json`); no
+  reproducen exactamente las reales, así que sus imágenes todavía no sirven
+  para entrenar el modelo aprendido.
 - El ejecutor real mueve uno o dos motores por tramo (`pair`); la simulación
   interpola los cinco a la vez.
 - No modela juego mecánico, flexión, error de encoders ni la protección de

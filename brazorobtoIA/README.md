@@ -143,7 +143,7 @@ el ESP32 ni las cámaras, y no mezcla datos con los reales. Ver
 
 ### Probar un modelo sin hardware
 
-Abrí `lanzadores/PRUEBA_OFFLINE.bat`, o **Probar modelo OFFLINE** junto al botón de entrenar.
+Abrí `lanzadores/PRUEBA_OFFLINE.bat`, o **Probar modelo OFFLINE** en la pestaña **Enseñar y entrenar**.
 Es una ventana/proceso separado: no abre COM, no captura cámaras en vivo y no
 envía órdenes al brazo. Puede abrir modelos experimentales sin habilitarlos en
 la aplicación de control físico.
@@ -165,11 +165,34 @@ M6 copia el ángulo grabado: no es una predicción ni simula presión. Las fotos
 características son las guardadas, no hay interacción simulada con los objetos.
 Esta prueba no verifica colisiones, trayectorias ni éxito físico.
 
-La aplicación primero propone una pose. **No mueve el brazo** hasta pulsar
-**CONFIRMAR Y MOVER** y aceptar el cuadro de confirmación de esa etapa. Si la
-pose inicial se desvió, la primera propuesta es una recuperación a la pose de
-inicio aprendida. Al terminar, se realiza una comprobación visual automática y
-el operador registra el resultado real.
+La interfaz tiene cámaras y telemetría siempre a la vista y cuatro pestañas:
+**Tarea automática**, **Mover a mano** (poses de referencia, ángulos, torque y
+garra), **Enseñar y entrenar** y **Cámaras y calibración**. La ventana abre
+maximizada y **EMERGENCIA · TORQUE OFF** queda siempre abajo a la derecha.
+
+En **Tarea automática** hay dos formas:
+
+- **HACER LA TAREA SOLA**: las etapas seguidas, sin confirmar cada una. Enciende
+  el torque de M1–M5 si estaba apagado, espera a que el brazo quede quieto entre
+  etapas y pasa por el mismo planificador y las mismas reglas del firmware.
+  **Detener** o **EMERGENCIA** la cortan en cualquier momento, también entre dos
+  etapas y antes de abrir o cerrar la garra. Cada etapa se planifica desde la
+  pose medida en ese momento: una etapa que quedó preparada paso a paso se
+  vuelve a planificar. No arranca (y no mueve nada) si las cámaras no tienen
+  imagen actual, si el cubo ya está dentro del recipiente (la escena de la tarea
+  anterior) o si el modo geométrico lo ubica a más de 30 cm de la base (ahí el
+  agarre falla en el gemelo). Si después de dos recuperaciones el brazo no queda
+  en Inicio, se frena. Si una etapa se bloquea, la tarea queda ahí: se puede
+  seguir paso a paso, volver a pulsar el botón o marcar el resultado. Los
+  rechazos y bloqueos quedan en el registro de la ejecución. Si una tarea terminada no se marcó, al empezar la
+  siguiente se guarda como `sin_marcar`.
+- **Paso a paso**: la aplicación primero propone una pose y **no mueve el
+  brazo** hasta pulsar **CONFIRMAR Y MOVER** y aceptar el cuadro de esa etapa.
+  Con el cubo a más de 30 cm solo avisa.
+
+Si la pose inicial se desvió, la primera etapa es una recuperación a la pose de
+inicio. Al terminar, se realiza una comprobación visual automática y el operador
+registra el resultado real.
 
 La comprobación visual busca rojo **dentro** del recipiente en cada cámara: da
 «posible éxito» si alguna lo ve adentro y ninguna ve el recipiente vacío (una
@@ -191,8 +214,8 @@ sin demostraciones. No abre puertos serie ni usa las cámaras reales. Ver
 
 ## Calibración modelo-brazo
 
-`lanzadores/CALIBRACION.bat`, o **Calibración · toques de mesa** en la sección de
-entrenamiento, abre una ventana de solo lectura. Captura toques de la garra
+`lanzadores/CALIBRACION.bat`, o **Calibración · toques de mesa** en la pestaña
+**Cámaras y calibración**, abre una ventana de solo lectura. Captura toques de la garra
 sobre la mesa y la garra cerrada, y estima la altura real de la mesa y los ceros
 de M2–M4 y M6. No modifica `calibracion.json`. Ver `docs/CALIBRACION.md`.
 
@@ -202,8 +225,8 @@ Alternativa al modelo aprendido para agarrar el cubo en cualquier lugar de la
 zona calibrada. Con la foto de Inicio calcula dónde están el cubo y el
 recipiente, y la cinemática inversa del modelo 3D calcula las doce poses, con
 descenso y retiro verticales y un empuje que deja el cubo apoyado contra el dedo
-fijo antes de cerrar. Se elige en **Ejecución automática supervisada**
-y sigue pidiendo confirmación en cada etapa. Necesita una calibración hecha con
+fijo antes de cerrar. Se elige en la pestaña **Tarea automática**, paso a paso
+o con **HACER LA TAREA SOLA**. Necesita una calibración hecha con
 **Calibración · cámaras**; `lanzadores/SIMULACION_GEOMETRICA.bat` lo prueba con cámaras
 virtuales. Ver `docs/CALIBRACION_CAMARAS.md`.
 
