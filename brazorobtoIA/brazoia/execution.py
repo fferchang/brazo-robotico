@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +21,10 @@ StatusCallback = Callable[[str], None]
 # así que de cerrada (0°) a abierta (140°) tarda unos 5,3 s. Lo midió el gemelo digital.
 GRIPPER_OPEN_DEGREES = 140.0
 GRIPPER_OPEN_SPEED_DEG_S = 300 * 360.0 / 4095.0
+# En el brazo real la garra abierta se queda entre 135,6° y 139° (casi siempre
+# ~137,2°), sin llegar nunca a 1,5° de los 140° pedidos: demostraciones y
+# ejecuciones de octubre y noviembre de 2026. Se acepta quieta a menos de esto.
+GRIPPER_OPEN_TOLERANCE = 6.0
 
 
 ARRIVAL_TOLERANCE = 1.2         # llegada normal
@@ -75,7 +80,7 @@ class MotionExecutor:
             self.status("Abriendo la garra...")
             timeout = gripper_open_timeout(self.robot.snapshot().positions.get(6))
             self.robot.send("gripper open")
-            self._wait_motor(6, GRIPPER_OPEN_DEGREES, timeout=timeout)
+            self._wait_gripper_open(timeout=timeout)
 
     def _move_group(self, group: MotionGroup) -> None:
         targets = dict(group.targets)
@@ -134,20 +139,34 @@ class MotionExecutor:
         description = ", ".join(f"M{i}={value:.1f}°" for i, value in targets.items())
         raise RuntimeError(f"Sin confirmación de llegada: {description}")
 
-    def _wait_motor(self, motor_id: int, target: float, timeout: float) -> None:
+    def _wait_gripper_open(self, timeout: float) -> None:
+        """Abierta: M6 a 1,5° de 140°, o quieta a menos de GRIPPER_OPEN_TOLERANCE."""
+        target = GRIPPER_OPEN_DEGREES
         deadline = time.monotonic() + timeout
         stable = 0
+        recent: list[float] = []
+        last = None
         while time.monotonic() < deadline:
             if self.stop_event.wait(0.05):
                 raise RuntimeError("Movimiento detenido por el operador.")
             snapshot = self.robot.snapshot()
             if snapshot.fault:
                 raise RuntimeError(snapshot.fault)
-            arrived = abs(snapshot.positions.get(motor_id, target + 1000.0) - target) <= 1.5
-            stable = stable + 1 if arrived else 0
+            last = snapshot.positions.get(6)
+            error = abs(last - target) if last is not None else math.inf
+            stable = stable + 1 if error <= 1.5 else 0
             if stable >= 3:
                 return
-        raise RuntimeError(f"M{motor_id} no confirmó {target:.1f}°.")
+            recent = (recent + [last if last is not None else math.inf])[-STILL_SAMPLES:]
+            if (
+                len(recent) == STILL_SAMPLES
+                and error <= GRIPPER_OPEN_TOLERANCE
+                and max(recent) - min(recent) <= STILL_RANGE
+            ):
+                self.status(f"Garra abierta a {last:.1f}° (quieta, a {error:.1f}° de {target:.0f}°).")
+                return
+        reading = "sin lectura" if last is None else f"quedó en {last:.1f}°"
+        raise RuntimeError(f"M6 no confirmó {target:.1f}°: {reading}.")
 
     def _wait_gripper(self, expected: str, timeout: float) -> None:
         deadline = time.monotonic() + timeout

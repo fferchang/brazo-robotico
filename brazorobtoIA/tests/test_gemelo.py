@@ -66,6 +66,46 @@ class LoadedArrivalTest(unittest.TestCase):
             executor._move_group(MotionGroup(((2, 220.0),)))
 
 
+class GripperOpenArrivalTest(unittest.TestCase):
+    """La garra real abierta queda en ~137° (135,6–139°): se acepta quieta cerca de 140°."""
+
+    def executor(self, positions):
+        from types import SimpleNamespace
+
+        from brazoia.execution import MotionExecutor
+
+        sequence = iter(positions)
+        state = {"value": positions[0]}
+
+        def snapshot():
+            state["value"] = next(sequence, state["value"])
+            return SimpleNamespace(positions={6: state["value"]}, fault="", torque_enabled=True)
+
+        messages = []
+        robot = SimpleNamespace(send=lambda command: None, snapshot=snapshot)
+        return MotionExecutor(robot, status=messages.append), messages
+
+    def test_real_open_readings_are_accepted(self):
+        for reading in (135.6, 137.2, 139.0):
+            executor, messages = self.executor([0.0, 60.0, 120.0, reading] + [reading] * 40)
+            executor._wait_gripper_open(timeout=3.0)
+            if abs(reading - 140.0) > 1.5:
+                self.assertTrue(any("Garra abierta a" in text for text in messages), reading)
+
+    def test_still_far_from_open_is_refused(self):
+        executor, _ = self.executor([0.0, 60.0, 120.0] + [130.0] * 80)
+        with self.assertRaisesRegex(RuntimeError, "quedó en 130.0°"):
+            executor._wait_gripper_open(timeout=2.0)
+
+    def test_still_moving_is_not_taken_as_open(self):
+        # Ya dentro de los 6°, pero todavía abriendo 0,1° por lectura: 134° → 137°.
+        readings = [134.0 + 0.1 * index for index in range(31)]
+        executor, messages = self.executor(readings)
+        with self.assertRaises(RuntimeError):
+            executor._wait_gripper_open(timeout=1.4)  # corta antes de que se quede quieta
+        self.assertFalse(any("Garra abierta a" in text for text in messages))
+
+
 class PlanningStartTest(unittest.TestCase):
     def test_encoder_slightly_past_a_limit_still_plans(self):
         from brazoia.planner import build_motion_plan, planning_start
@@ -190,7 +230,8 @@ class VirtualFirmwareTest(unittest.TestCase):
         self.assertEqual("GRIPPER_OPEN_OK target=140.0", self.send("gripper open", 4.5)[0])
         self.assertLess(self.twin.logical_pose()[6], 130.0)
         self.run_for(1.5)
-        self.assertAlmostEqual(140.0, self.twin.logical_pose()[6], delta=1.0)
+        # Como el servo real: se queda ~2,8° antes de los 140° pedidos.
+        self.assertAlmostEqual(137.2, self.twin.logical_pose()[6], delta=1.0)
 
     def test_closing_on_nothing_stops_at_the_closed_limit(self):
         self.send("gripper open", 6.0)

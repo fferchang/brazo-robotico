@@ -75,6 +75,9 @@ MOVE_COOLDOWN_S = 0.050
 AUTO_POS_INTERVAL_S = 0.050
 POST_MOVE_REPORT_S = 0.200
 GRIPPER_OPEN_DEGREES = 140.0
+# El servo real de la garra se queda ~2,8° antes al abrir (137,2° en vez de 140°;
+# demostraciones y ejecuciones reales de oct–nov 2026). El gemelo lo imita.
+GRIPPER_OPEN_SHORTFALL_DEGREES = 2.8
 GRIPPER_CLOSED_DEGREES = 0.0
 GRIPPER_STEP_DEGREES = 1.5
 GRIPPER_STEP_INTERVAL_S = 0.040
@@ -636,7 +639,7 @@ class DigitalTwin:
         self.gripper_closing = False
         self.gripper_samples = 0
         self._enable_torque(6, True)
-        self._write_pos(6, GRIPPER_OPEN_DEGREES, 300, 25)
+        self._write_pos(6, GRIPPER_OPEN_DEGREES - GRIPPER_OPEN_SHORTFALL_DEGREES, 300, 25)
         self.gripper_command = GRIPPER_OPEN_DEGREES
         self.println("GRIPPER_OPEN_OK target=140.0")
 

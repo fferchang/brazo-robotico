@@ -69,8 +69,8 @@ Ningún resultado habilita movimientos del brazo real.
 - **La espera de apertura de la garra era corta.** Abrir de 0° a 140° a 300
   pasos/s lleva ~5,3 s, y `MotionExecutor` esperaba 5 s: la tarea se cortaba en
   Aproximación 2/3 con «M6 no confirmó 140°». Ahora la espera depende de cuánto
-  falta abrir (`gripper_open_timeout`, ~8 s desde cerrada). Conviene medir en el
-  brazo real cuánto tarda `gripper open` desde cerrada para confirmarlo.
+  falta abrir (`gripper_open_timeout`, ~8 s desde cerrada). En el brazo real
+  tarda unos 5,6 s (medido a ojo el 5/11), así que alcanza.
 - **Una orden al límite podía trabar la etapa siguiente.** El experto llevó M4 a
   278° (su límite), el servo quedó unas décimas más allá con la carga y la etapa
   siguiente no se podía planificar («Pose inicial insegura: LIMITE»). En el brazo
@@ -88,6 +88,28 @@ Ningún resultado habilita movimientos del brazo real.
   grados. Ahora, si no llega a ±1,2°, el ejecutor acepta un motor que quedó quieto
   (variación ≤ 0,3° durante ~0,6 s) a menos de 3° de la orden, y lo anota como
   «Llegada con desvío». Decidido por el usuario el 5/11.
+- **La garra real no llega a 140° al abrir** (lo encontró el brazo real, no el
+  gemelo). En la primera ejecución supervisada del 5/11, Aproximación 2/3 se
+  trababa en «M6 no confirmó 140°»: la espera pedía ±1,5°, y en todas las
+  demostraciones y ejecuciones reales la garra abierta queda entre 135,6° y 139°
+  (casi siempre ~137,2°). Ahora `MotionExecutor` acepta la garra quieta a menos
+  de 6° de 140° (`GRIPPER_OPEN_TOLERANCE`) y lo anota como «Garra abierta a …».
+  El gemelo imita el servo real y se queda 2,8° antes
+  (`GRIPPER_OPEN_SHORTFALL_DEGREES`). Lotes del 5/11:
+  - semilla 11: 6 de 6 con 2,8° de faltante;
+  - semilla 12: 5 de 6 sin faltante, 4 de 6 con 2,8° y 4 de 6 con 4,4° (el peor
+    caso real).
+
+  Las dos escenas que fallan tienen el cubo a 33–34 cm de la base, y todas las
+  escenas hasta 30,7 cm salen bien. La escena 1 (33,7 cm) se traba en
+  Aproximación 3/3 con o sin faltante. En la escena 4 (33,0 cm), con faltante el
+  cubo se cae en el traslado (3 de 3 repeticiones) y sin faltante no (3 de 3).
+  El cierre por presión baja de a 1,5° desde donde quedó la garra abierta: si
+  arranca en 137,2° y no en 140°, se detiene en otro escalón y aprieta un poco
+  menos (corriente 137 contra 147). Con el brazo estirado, ese agarre ya está al
+  límite. Como el gemelo no tiene la elasticidad que sigue apretando en el brazo
+  real, no se sabe si allá pasa lo mismo. En la práctica: dejar el cubo a menos
+  de 30 cm de la base.
 
 Lotes de 10 escenas (semilla 11): 6/10 con el primer gemelo; 7/10 tras corregir
 la tolerancia de partida y el lanzador; **10/10** con el margen de la cinemática
