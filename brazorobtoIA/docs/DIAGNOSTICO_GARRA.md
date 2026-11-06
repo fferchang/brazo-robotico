@@ -113,6 +113,42 @@ Esta revisión no modifica el control de producción ni deja el sistema declarad
 listo para repetir el agarre con carga. La corrección y la verificación física
 siguen pendientes.
 
+## Cambios en el firmware del 6 de noviembre de 2026
+
+Escritos en `firmware/firmware_secuencias.ino` e imitados en el firmware virtual
+del gemelo (`brazoia/gemelo.py`). Compilan con arduino-cli (esp32 3.3.2), pero
+**no están cargados en el ESP32**: cargarlos necesita el brazo, la app cerrada y
+un OK explícito. Las pruebas están en `tests/test_garra_proteccion.py`.
+
+- **Vigilancia al abrir, al mover M6 por ángulo y al sostener** (fallo 1).
+  `processGripperWatch()` lee la corriente de M6 cada 100 ms fuera del cierre:
+  - 200 unidades (~1,3 A) dos lecturas seguidas: torque OFF en M6 y
+    `GRIPPER_STOP_DETAIL reason=hard_current state=…`, que la app trata como
+    falla (la tarea se frena). Al abrir o mover se ignoran los primeros 250 ms.
+  - Sosteniendo, 170 unidades (~1,1 A) durante 2 s: afloja 1,5° y avisa con
+    `GRIPPER_HOLD_RELIEF`, hasta 3 veces; si sigue alta, torque OFF. El gemelo
+    sostiene el cubo con ~140, así que no lo afloja. **El valor real sosteniendo
+    no se midió**: `gripper telem on` imprime `GRIPPER_TELEM` cada 100 ms para
+    medirlo y ajustar el umbral.
+  - Al abrir o mover, la vigilancia termina a los 9 s (`GRIPPER_WATCH_END`).
+- **Lectura fallida** (fallo 2): en el cierre, y tras 3 lecturas fallidas
+  seguidas al vigilar, se intenta quitar el torque de M6
+  (`GRIPPER_TORQUE_OFF reason=communication_error result=…`). Si el servo no lo
+  confirma, `GRIPPER_ERROR reason=torque_off_sin_confirmar`.
+- **Timeout** (fallo 3): la sobrecorriente se revisa antes que el tiempo máximo,
+  y después del timeout la garra queda vigilada al sostener.
+- **Parada por sobrecorriente** (fallo 4): corta el torque primero, sin escribir
+  antes otra posición, e informa el resultado; si no lo confirma, `GRIPPER_ERROR`.
+- **Pulsaciones repetidas** (fallo 7): una segunda orden de cierre se ignora
+  (`GRIPPER_CLOSE_IGNORED`) y no reinicia cronómetro, contador ni exclusión.
+- **Torque global OFF** (fallo 9): cancela el cierre y la vigilancia.
+- **Abrir revisa el piso**: `openGripper()` no abre si el dedo móvil barrería la
+  mesa (`GRIPPER_ERROR reason=floor`). Ver `REGLAS_GEOMETRIA.md`.
+
+Siguen pendientes los fallos 5 (demoras del bus), 6 (la consigna se adelanta al
+eje), 8 (estados ambiguos en la app) y 10 (confirmación de `holding` anterior a la
+orden), la protección interna del servo y la telemetría de tensión.
+
 ## Fuentes
 
 - Código: `app.py` (`build`, `send_robot`, `log`), `brazoia/robot.py`,

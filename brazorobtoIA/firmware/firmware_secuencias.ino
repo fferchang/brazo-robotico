@@ -27,6 +27,21 @@ static const float GRIPPER_CLOSED_TOLERANCE_DEGREES = 2.0f;
 static int gripperContactCurrentRaw = 92;
 static const int GRIPPER_HARD_CURRENT_RAW = 200;
 static const uint8_t GRIPPER_CONTACT_SAMPLES = 3;
+// Vigilancia de corriente fuera del cierre: al abrir, al mover M6 por angulo y al
+// sostener (docs/DIAGNOSTICO_GARRA.md). El cierre tiene la suya en
+// processGripperClosing(). Con la fuente de 12 V / 5 A compartida, una garra
+// apretando de mas puede cortar la fuente y dejar caer todo el brazo.
+static const unsigned long GRIPPER_WATCH_INTERVAL_MS = 100;
+static const unsigned long GRIPPER_MOVE_INRUSH_IGNORE_MS = 250;
+static const unsigned long GRIPPER_MOVE_WATCH_MS = 9000;      // abrir desde cerrada tarda ~5,6 s
+static const uint8_t GRIPPER_HARD_CURRENT_SAMPLES = 2;        // 200 ms seguidos sobre 200 (~1,3 A)
+static const int GRIPPER_HOLD_LIMIT_RAW = 170;                // ~1,1 A sostenido al sostener
+static const uint8_t GRIPPER_HOLD_LIMIT_SAMPLES = 20;         // 2 s seguidos
+static const float GRIPPER_HOLD_RELIEF_DEGREES = 1.5f;        // aflojar de a 1,5 grados
+static const uint8_t GRIPPER_HOLD_MAX_RELIEFS = 3;
+static const uint8_t GRIPPER_READ_FAILURE_LIMIT = 3;
+// Abrir agranda el contorno de la garra: se revisa el piso cada 4 grados de M6.
+static const float GRIPPER_SWEEP_STEP_DEGREES = 4.0f;
 
 // Cadena plana del modelo 3D calibrado (URDF + calibracion.json con los toques
 // de mesa del 30/10/2026), en mm y grados. Debe coincidir con brazoia/planner.py;
@@ -98,6 +113,15 @@ float gripperCommandDegrees = GRIPPER_OPEN_DEGREES;
 unsigned long gripperCloseStartedMs = 0;
 unsigned long gripperLastStepMs = 0;
 uint8_t gripperHighCurrentSamples = 0;
+enum GripperWatchMode { WATCH_NONE, WATCH_MOVING, WATCH_HOLDING };
+GripperWatchMode gripperWatch = WATCH_NONE;
+unsigned long gripperWatchStartedMs = 0;
+unsigned long gripperLastWatchMs = 0;
+uint8_t gripperWatchHardSamples = 0;
+uint8_t gripperWatchHighSamples = 0;
+uint8_t gripperWatchReadFailures = 0;
+uint8_t gripperReliefs = 0;
+bool gripperTelemetry = false;
 
 struct Point2 {
   float x;
@@ -293,6 +317,29 @@ bool floorBlocked(float clearance, float threshold, float escapeFrom) {
   return isnan(escapeFrom) || clearance < escapeFrom - FLOOR_ESCAPE_TOLERANCE;
 }
 
+// Abrir de m6 (NAN: sin lectura, se revisa toda la apertura) a GRIPPER_OPEN_DEGREES
+// en la pose actual. Igual que planner.gripper_sweep_problem(): cerrar no se revisa,
+// es el agarre mismo cerca de la mesa.
+bool gripperOpeningBlocked(float m2, float m3, float m4, float m6, float &worst, float &worstM6) {
+  float low = isnan(m6) ? 0.0f : m6;
+  float high = 140.0f;
+  worst = 1e9f;
+  worstM6 = low;
+  if (!isnan(m6) && high <= m6) return false;
+  int steps = max(1, (int)ceilf((high - low) / GRIPPER_SWEEP_STEP_DEGREES));
+  for (int i = 0; i <= steps; i++) {
+    float angle = low + (high - low) * (float)i / (float)steps;
+    float clearance = gripperFloorClearance(m2, m3, m4, angle);
+    if (clearance < worst) {
+      worst = clearance;
+      worstM6 = angle;
+    }
+  }
+  // Sin lectura de M6 no hay pose de partida conocida: no se da margen de escape.
+  float escapeFrom = isnan(m6) ? NAN : floorEscapeReference(m2, m3, m4, m6);
+  return floorBlocked(worst, FLOOR_TOUCH_THRESHOLD, escapeFrom);
+}
+
 // M6 actual, o NAN si no se puede leer (se usa el contorno mas desfavorable).
 float currentGripperDegreesOrNan() {
   float m6 = NAN;
@@ -403,6 +450,7 @@ void printHelp() {
   Serial.println(F("  gripper stop"));
   Serial.println(F("  gripper release  (torque OFF solamente en M6)"));
   Serial.println(F("  gripper current 92  (aprox. 600 mA)"));
+  Serial.println(F("  gripper telem on|off  (corriente de M6 cada 0.1 s al abrir y sostener)"));
   Serial.println(F("  motor2 90"));
   Serial.println(F("  pair 1 90 2 80"));
   Serial.println(F("  help"));
@@ -790,6 +838,7 @@ void moveServoToDegrees(
     }
     gripperClosing = false;
     gripperHighCurrentSamples = 0;
+    startGripperWatch(WATCH_MOVING);
   }
 
   if (now - lastMoveCommandMs < MOVE_COOLDOWN_MS) {
@@ -905,6 +954,9 @@ void moveTwoServos(
     gripperClosing = false;
     gripperHighCurrentSamples = 0;
   }
+  if (id1 == 6 || id2 == 6) {
+    startGripperWatch(WATCH_MOVING);
+  }
 
   float current1 = degrees1;
   float current2 = degrees2;
@@ -948,6 +1000,22 @@ void moveTwoServos(
   Serial.println(speeds[1]);
 }
 
+const __FlashStringHelper *gripperWatchName() {
+  if (gripperWatch == WATCH_MOVING) return F("moving");
+  if (gripperWatch == WATCH_HOLDING) return F("holding");
+  return F("none");
+}
+
+void startGripperWatch(GripperWatchMode mode) {
+  gripperWatch = mode;
+  gripperWatchStartedMs = millis();
+  gripperLastWatchMs = 0;
+  gripperWatchHardSamples = 0;
+  gripperWatchHighSamples = 0;
+  gripperWatchReadFailures = 0;
+  gripperReliefs = 0;
+}
+
 void freezeGripperAtCurrentPosition(const char *reason, int currentRaw) {
   int position = servoBus.ReadPos(6);
   if (position >= 0) {
@@ -966,9 +1034,26 @@ void freezeGripperAtCurrentPosition(const char *reason, int currentRaw) {
   Serial.print(position);
   Serial.print(F(" logical_deg="));
   Serial.println(gripperCommandDegrees, 1);
+  startGripperWatch(WATCH_HOLDING);
 }
 
 void openGripper() {
+  float m2 = 0.0f;
+  float m3 = 0.0f;
+  float m4 = 0.0f;
+  if (!getCurrentPoseDegrees(m2, m3, m4)) {
+    Serial.println(F("GRIPPER_ERROR reason=sin_pose detail=no_se_pudo_leer_M2_M4_para_revisar_el_piso"));
+    return;
+  }
+  float worst = 0.0f;
+  float worstM6 = 0.0f;
+  if (gripperOpeningBlocked(m2, m3, m4, currentGripperDegreesOrNan(), worst, worstM6)) {
+    Serial.print(F("GRIPPER_ERROR reason=floor detail=abrir_la_garra_barre_la_mesa clearance_mm="));
+    Serial.print(worst, 1);
+    Serial.print(F(" m6_deg="));
+    Serial.println(worstM6, 1);
+    return;
+  }
   if (gripperClosing) {
     Serial.println(F("GRIPPER_STOP reason=open_command detail=se_cancelo_el_cierre_para_abrir"));
   }
@@ -979,9 +1064,15 @@ void openGripper() {
   servoBus.WritePosEx(6, (int)degToPos(realDegrees), 300, 25);
   gripperCommandDegrees = GRIPPER_OPEN_DEGREES;
   Serial.println(F("GRIPPER_OPEN_OK target=140.0"));
+  startGripperWatch(WATCH_MOVING);
 }
 
 void startClosingGripper() {
+  if (gripperClosing) {
+    // Una segunda pulsacion no reinicia cronometro, contador ni exclusion inicial.
+    Serial.println(F("GRIPPER_CLOSE_IGNORED reason=ya_esta_cerrando"));
+    return;
+  }
   if (!servoPresent(6)) {
     Serial.println(F("ID 6: sin respuesta"));
     return;
@@ -993,6 +1084,7 @@ void startClosingGripper() {
   }
   servoBus.EnableTorque(6, 1);
   gripperCommandDegrees = constrain(posToDeg(position) - 10.0f, GRIPPER_CLOSED_DEGREES, GRIPPER_OPEN_DEGREES);
+  gripperWatch = WATCH_NONE;  // el cierre se vigila en processGripperClosing()
   gripperClosing = true;
   gripperCloseStartedMs = millis();
   gripperLastStepMs = 0;
@@ -1014,9 +1106,115 @@ void releaseGripperTorque() {
   }
   gripperClosing = false;
   gripperHighCurrentSamples = 0;
+  gripperWatch = WATCH_NONE;
   int result = servoBus.EnableTorque(6, 0);
   Serial.print(F("GRIPPER_TORQUE_OFF reason=manual_release result="));
   Serial.println(result);
+}
+
+// Sin lectura confiable no se puede vigilar: se intenta quitar el torque de M6 y se
+// informa si el servo no lo confirma.
+void releaseGripperAfterFailure(const char *reason) {
+  gripperWatch = WATCH_NONE;
+  int result = servoBus.EnableTorque(6, 0);
+  Serial.print(F("GRIPPER_TORQUE_OFF reason="));
+  Serial.print(reason);
+  Serial.print(F(" result="));
+  Serial.println(result);
+  if (result != 1) {
+    Serial.println(F("GRIPPER_ERROR reason=torque_off_sin_confirmar detail=desconecta_la_fuente_si_la_garra_sigue_apretando"));
+  }
+}
+
+// Primero el corte, sin otras operaciones de bus antes, y despues el aviso con el
+// resultado: si el servo no lo confirma, la app lo muestra como falla.
+void torqueOffForOvercurrent() {
+  gripperWatch = WATCH_NONE;
+  int result = servoBus.EnableTorque(6, 0);
+  Serial.print(F("GRIPPER_TORQUE_OFF proteccion de sobrecorriente result="));
+  Serial.println(result);
+  if (result != 1) {
+    Serial.println(F("GRIPPER_ERROR reason=torque_off_sin_confirmar detail=desconecta_la_fuente_si_la_garra_sigue_apretando"));
+  }
+}
+
+void stopWatchWithTorqueOff(int currentRaw, const __FlashStringHelper *detail) {
+  Serial.print(F("GRIPPER_STOP_DETAIL reason=hard_current state="));
+  Serial.print(gripperWatchName());
+  Serial.print(F(" detail="));
+  Serial.print(detail);
+  Serial.print(F(" current_raw="));
+  Serial.print(currentRaw);
+  Serial.print(F(" current_ma_aprox="));
+  Serial.println(currentRaw * 6.5f, 1);
+  torqueOffForOvercurrent();
+}
+
+void processGripperWatch() {
+  if (gripperWatch == WATCH_NONE || gripperClosing) return;
+  unsigned long now = millis();
+  if (now - gripperLastWatchMs < GRIPPER_WATCH_INTERVAL_MS) return;
+  gripperLastWatchMs = now;
+  unsigned long elapsed = now - gripperWatchStartedMs;
+
+  int signedCurrentRaw = servoBus.ReadCurrent(6);
+  if (signedCurrentRaw == -1 && servoBus.getErr() != 0) {
+    gripperWatchReadFailures++;
+    if (gripperWatchReadFailures >= GRIPPER_READ_FAILURE_LIMIT) {
+      Serial.print(F("GRIPPER_STOP reason=communication_error detail=ReadCurrent_sin_respuesta_al_vigilar state="));
+      Serial.println(gripperWatchName());
+      releaseGripperAfterFailure("communication_error");
+    }
+    return;
+  }
+  gripperWatchReadFailures = 0;
+  int currentRaw = abs(signedCurrentRaw);
+  if (gripperTelemetry) {
+    Serial.print(F("GRIPPER_TELEM state="));
+    Serial.print(gripperWatchName());
+    Serial.print(F(" current_raw="));
+    Serial.print(currentRaw);
+    Serial.print(F(" elapsed_ms="));
+    Serial.println(elapsed);
+  }
+
+  bool inrush = gripperWatch == WATCH_MOVING && elapsed < GRIPPER_MOVE_INRUSH_IGNORE_MS;
+  if (!inrush && currentRaw >= GRIPPER_HARD_CURRENT_RAW) {
+    gripperWatchHardSamples++;
+    if (gripperWatchHardSamples >= GRIPPER_HARD_CURRENT_SAMPLES) {
+      stopWatchWithTorqueOff(currentRaw, F("sobre_el_limite_duro"));
+      return;
+    }
+  } else {
+    gripperWatchHardSamples = 0;
+  }
+
+  if (gripperWatch == WATCH_HOLDING) {
+    gripperWatchHighSamples = currentRaw >= GRIPPER_HOLD_LIMIT_RAW ? gripperWatchHighSamples + 1 : 0;
+    if (gripperWatchHighSamples < GRIPPER_HOLD_LIMIT_SAMPLES) return;
+    gripperWatchHighSamples = 0;
+    if (gripperReliefs >= GRIPPER_HOLD_MAX_RELIEFS) {
+      stopWatchWithTorqueOff(currentRaw, F("sigue_alta_despues_de_aflojar"));
+      return;
+    }
+    gripperReliefs++;
+    gripperCommandDegrees = min(GRIPPER_OPEN_DEGREES, gripperCommandDegrees + GRIPPER_HOLD_RELIEF_DEGREES);
+    servoBus.WritePosEx(6, (int)degToPos(toRealServoDegrees(6, gripperCommandDegrees)), 120, 15);
+    Serial.print(F("GRIPPER_HOLD_RELIEF current_raw="));
+    Serial.print(currentRaw);
+    Serial.print(F(" current_ma_aprox="));
+    Serial.print(currentRaw * 6.5f, 1);
+    Serial.print(F(" logical_deg="));
+    Serial.print(gripperCommandDegrees, 1);
+    Serial.print(F(" relief="));
+    Serial.println(gripperReliefs);
+    return;
+  }
+
+  if (elapsed >= GRIPPER_MOVE_WATCH_MS) {
+    gripperWatch = WATCH_NONE;
+    Serial.println(F("GRIPPER_WATCH_END state=moving"));
+  }
 }
 
 void processGripperClosing() {
@@ -1035,25 +1233,27 @@ void processGripperClosing() {
     Serial.println(now - gripperCloseStartedMs);
     gripperClosing = false;
     gripperHighCurrentSamples = 0;
+    releaseGripperAfterFailure("communication_error");
     return;
   }
   int currentRaw = abs(signedCurrentRaw);
 
-  if (now - gripperCloseStartedMs >= GRIPPER_CLOSE_TIMEOUT_MS) {
-    Serial.print(F("GRIPPER_STOP_DETAIL reason=timeout elapsed_ms="));
-    Serial.println(now - gripperCloseStartedMs);
-    freezeGripperAtCurrentPosition("timeout", currentRaw);
-    return;
-  }
-
+  // La sobrecorriente va antes que el tiempo maximo: si coinciden, gana el corte.
   if (currentRaw >= GRIPPER_HARD_CURRENT_RAW) {
     Serial.print(F("GRIPPER_STOP_DETAIL reason=hard_current threshold_raw="));
     Serial.print(GRIPPER_HARD_CURRENT_RAW);
     Serial.print(F(" threshold_ma_aprox="));
     Serial.println(GRIPPER_HARD_CURRENT_RAW * 6.5f, 1);
-    freezeGripperAtCurrentPosition("hard_current", currentRaw);
-    servoBus.EnableTorque(6, 0);
-    Serial.println(F("GRIPPER_TORQUE_OFF proteccion de sobrecorriente"));
+    gripperClosing = false;
+    gripperHighCurrentSamples = 0;
+    torqueOffForOvercurrent();
+    return;
+  }
+
+  if (now - gripperCloseStartedMs >= GRIPPER_CLOSE_TIMEOUT_MS) {
+    Serial.print(F("GRIPPER_STOP_DETAIL reason=timeout elapsed_ms="));
+    Serial.println(now - gripperCloseStartedMs);
+    freezeGripperAtCurrentPosition("timeout", currentRaw);  // sigue vigilada al sostener
     return;
   }
 
@@ -1082,6 +1282,7 @@ void processGripperClosing() {
       Serial.println(F("GRIPPER_STOP reason=communication_error detail=ReadPos_sin_respuesta_en_limite"));
       gripperClosing = false;
       gripperHighCurrentSamples = 0;
+      releaseGripperAfterFailure("communication_error");
       return;
     }
 
@@ -1150,6 +1351,13 @@ void handleLine(String line) {
     return;
   }
 
+  if (line.equalsIgnoreCase("gripper telem on") || line.equalsIgnoreCase("gripper telem off")) {
+    gripperTelemetry = line.equalsIgnoreCase("gripper telem on");
+    Serial.print(F("GRIPPER_TELEMETRY="));
+    Serial.println(gripperTelemetry ? F("on") : F("off"));
+    return;
+  }
+
   if (line.startsWith("gripper current ")) {
     int requested = line.substring(16).toInt();
     if (requested < 20 || requested > 180) {
@@ -1186,6 +1394,15 @@ void handleLine(String line) {
 
   if (line.equalsIgnoreCase("torque off") || line.equalsIgnoreCase("torque on")) {
     bool enable = line.equalsIgnoreCase("torque on");
+    if (!enable) {
+      // Emergencia: que el cierre o la vigilancia no vuelvan a mover M6.
+      if (gripperClosing) {
+        Serial.println(F("GRIPPER_STOP reason=torque_off detail=se_cancelo_el_cierre"));
+      }
+      gripperClosing = false;
+      gripperHighCurrentSamples = 0;
+      gripperWatch = WATCH_NONE;
+    }
     Serial.println(enable ? F("Activando torque global M1..M6...") : F("Desactivando torque global M1..M6..."));
     for (uint8_t id = MIN_ID; id <= MAX_ID; id++) {
       if (!servoPresent(id)) {
@@ -1298,6 +1515,7 @@ void setup() {
 
 void loop() {
   processGripperClosing();
+  processGripperWatch();
   autoPrintPositionsIfNeeded();
   processPendingMoveReport();
 

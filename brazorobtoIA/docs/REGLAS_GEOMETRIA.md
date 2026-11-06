@@ -54,6 +54,12 @@ de las poses que planifica la simulación.
 - Las constantes dependen de `assets/calibracion.json` y de la altura del eje
   M2. Si se recalibra, hay que recalcularlas; `tests/test_planner.py` falla si
   dejan de coincidir con el modelo 3D.
-- Abrir o cerrar la garra no revisa el piso: el dedo móvil puede barrer hacia la
-  mesa si la garra está horizontal y baja. La simulación sí lo revisa.
+- Desde el 6/11/2026, **abrir** la garra revisa el piso cada 4° de M6 con el
+  contorno de cualquier giro de M5 (`planner.gripper_sweep_problem` y
+  `gripperOpeningBlocked()` en el firmware, este último todavía sin cargar en el
+  ESP32): la etapa no se propone y el firmware responde `GRIPPER_ERROR
+  reason=floor`. No rechaza ninguna apertura de las 15 demos ni de 360 de planes
+  del experto. **Cerrar** no se revisa: es el agarre mismo, y ese contorno
+  conservador deja 6 de los 15 agarres reales bajo el margen sin que hayan tocado
+  la mesa.
 - Las autocolisiones 2D siguen siendo aproximadas: no dependen de M5 ni de M6.

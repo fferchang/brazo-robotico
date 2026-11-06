@@ -54,6 +54,7 @@ from .planner import (
     dynamic_m4_max,
     floor_clearance,
     floor_escape,
+    gripper_sweep_problem,
 )
 from .vision import detect_scene, observation_features
 
@@ -87,6 +88,15 @@ GRIPPER_CLOSED_TOLERANCE_DEGREES = 2.0
 GRIPPER_CONTACT_CURRENT_RAW = 92
 GRIPPER_HARD_CURRENT_RAW = 200
 GRIPPER_CONTACT_SAMPLES = 3
+# Vigilancia fuera del cierre, igual que processGripperWatch() del firmware.
+GRIPPER_WATCH_INTERVAL_S = 0.100
+GRIPPER_MOVE_INRUSH_IGNORE_S = 0.250
+GRIPPER_MOVE_WATCH_S = 9.0
+GRIPPER_HARD_CURRENT_SAMPLES = 2
+GRIPPER_HOLD_LIMIT_RAW = 170
+GRIPPER_HOLD_LIMIT_SAMPLES = 20
+GRIPPER_HOLD_RELIEF_DEGREES = 1.5
+GRIPPER_HOLD_MAX_RELIEFS = 3
 USER_LIMITS = {1: (60.0, 300.0), 2: (90.0, 270.0), 3: (90.0, 276.0),
                4: (75.0, 278.0), 5: (0.0, 340.0), 6: (0.0, 140.0)}
 TICK_S = 0.010              # paso del bucle: firmware + física
@@ -304,6 +314,13 @@ class DigitalTwin:
         self.gripper_last_step = -math.inf
         self.gripper_samples = 0
         self.contact_threshold = GRIPPER_CONTACT_CURRENT_RAW
+        self.gripper_watch = "none"          # "moving", "holding" o "none"
+        self.gripper_watch_started = 0.0
+        self.gripper_last_watch = -math.inf
+        self.gripper_hard_samples = 0
+        self.gripper_high_samples = 0
+        self.gripper_reliefs = 0
+        self.gripper_telemetry = False
         self.arm.contacts.clear()
 
     @property
@@ -384,6 +401,7 @@ class DigitalTwin:
             else:
                 self._line += char
         self._process_gripper_closing()
+        self._process_gripper_watch()
         self._auto_print_positions()
         self._process_pending_report()
         for motor, profile in self.profiles.items():
@@ -496,7 +514,7 @@ class DigitalTwin:
                      "  posall", "  arm torque off  (solamente M1..M5)", "  arm torque on   (solamente M1..M5)",
                      "  torque off      (emergencia: M1..M6)", "  torque on       (todos: M1..M6)",
                      "  gripper open", "  gripper close", "  gripper stop",
-                     "  gripper release  (torque OFF solamente en M6)", "  gripper current 92  (aprox. 600 mA)",
+                     "  gripper release  (torque OFF solamente en M6)", "  gripper current 92  (aprox. 600 mA)", "  gripper telem on|off  (corriente de M6 cada 0.1 s al abrir y sostener)",
                      "  help"):
             self.println(text)
         self.println("Limites configurados:")
@@ -561,6 +579,7 @@ class DigitalTwin:
                 self.println("GRIPPER_STOP reason=manual_position_command detail=se_recibio_un_angulo_para_M6")
             self.gripper_closing = False
             self.gripper_samples = 0
+            self._start_watch("moving")
         if self.now - self.last_move < MOVE_COOLDOWN_S:
             wait_ms = int((MOVE_COOLDOWN_S - (self.now - self.last_move)) * 1000)
             self.println(f"Cooldown activo. Espera {wait_ms} ms antes del siguiente movimiento.")
@@ -604,6 +623,8 @@ class DigitalTwin:
             self.println("GRIPPER_STOP reason=manual_pair_command detail=se_recibio_un_angulo_para_M6")
             self.gripper_closing = False
             self.gripper_samples = 0
+        if 6 in (first, second):
+            self._start_watch("moving")
         deltas = [abs(first_deg - self._logical_from_encoder(first)),
                   abs(second_deg - self._logical_from_encoder(second))]
         largest = max(deltas)
@@ -632,8 +653,69 @@ class DigitalTwin:
         self.println(f"GRIPPER_HOLD reason={reason} current_raw={current_raw} "
                      f"current_ma_aprox={current_raw * 6.5:.1f} position_raw={position} "
                      f"logical_deg={self.gripper_command:.1f}")
+        self._start_watch("holding")
+
+    def _start_watch(self, mode: str) -> None:
+        self.gripper_watch = mode
+        self.gripper_watch_started = self.now
+        self.gripper_last_watch = -math.inf
+        self.gripper_hard_samples = 0
+        self.gripper_high_samples = 0
+        self.gripper_reliefs = 0
+
+    def _watch_torque_off(self, current_raw: int, detail: str) -> None:
+        self.println(f"GRIPPER_STOP_DETAIL reason=hard_current state={self.gripper_watch} detail={detail} "
+                     f"current_raw={current_raw} current_ma_aprox={current_raw * 6.5:.1f}")
+        self._torque_off_for_overcurrent()
+
+    def _torque_off_for_overcurrent(self) -> None:
+        self.gripper_watch = "none"
+        result = self._enable_torque(6, False)
+        self.println(f"GRIPPER_TORQUE_OFF proteccion de sobrecorriente result={result}")
+
+    def _process_gripper_watch(self) -> None:
+        if self.gripper_watch == "none" or self.gripper_closing:
+            return
+        if self.now - self.gripper_last_watch < GRIPPER_WATCH_INTERVAL_S - 1e-9:
+            return
+        self.gripper_last_watch = self.now
+        elapsed = self.now - self.gripper_watch_started
+        current_raw = self._gripper_current_raw()
+        if self.gripper_telemetry:
+            self.println(f"GRIPPER_TELEM state={self.gripper_watch} current_raw={current_raw} "
+                         f"elapsed_ms={int(elapsed * 1000)}")
+        inrush = self.gripper_watch == "moving" and elapsed < GRIPPER_MOVE_INRUSH_IGNORE_S
+        if not inrush and current_raw >= GRIPPER_HARD_CURRENT_RAW:
+            self.gripper_hard_samples += 1
+            if self.gripper_hard_samples >= GRIPPER_HARD_CURRENT_SAMPLES:
+                self._watch_torque_off(current_raw, "sobre_el_limite_duro")
+                return
+        else:
+            self.gripper_hard_samples = 0
+        if self.gripper_watch == "holding":
+            self.gripper_high_samples = self.gripper_high_samples + 1 if current_raw >= GRIPPER_HOLD_LIMIT_RAW else 0
+            if self.gripper_high_samples < GRIPPER_HOLD_LIMIT_SAMPLES:
+                return
+            self.gripper_high_samples = 0
+            if self.gripper_reliefs >= GRIPPER_HOLD_MAX_RELIEFS:
+                self._watch_torque_off(current_raw, "sigue_alta_despues_de_aflojar")
+                return
+            self.gripper_reliefs += 1
+            self.gripper_command = min(GRIPPER_OPEN_DEGREES, self.gripper_command + GRIPPER_HOLD_RELIEF_DEGREES)
+            self._write_pos(6, self.gripper_command, 120, 15)
+            self.println(f"GRIPPER_HOLD_RELIEF current_raw={current_raw} current_ma_aprox={current_raw * 6.5:.1f} "
+                         f"logical_deg={self.gripper_command:.1f} relief={self.gripper_reliefs}")
+            return
+        if elapsed >= GRIPPER_MOVE_WATCH_S:
+            self.gripper_watch = "none"
+            self.println("GRIPPER_WATCH_END state=moving")
 
     def _open_gripper(self) -> None:
+        # Igual que openGripper() del firmware: no abrir si el dedo móvil barre la mesa.
+        problem = gripper_sweep_problem(self._planar_now(), self._logical_from_encoder(6), GRIPPER_OPEN_DEGREES)
+        if problem:
+            self.println(f"GRIPPER_ERROR reason=floor detail={problem.replace(' ', '_')}")
+            return
         if self.gripper_closing:
             self.println("GRIPPER_STOP reason=open_command detail=se_cancelo_el_cierre_para_abrir")
         self.gripper_closing = False
@@ -642,10 +724,15 @@ class DigitalTwin:
         self._write_pos(6, GRIPPER_OPEN_DEGREES - GRIPPER_OPEN_SHORTFALL_DEGREES, 300, 25)
         self.gripper_command = GRIPPER_OPEN_DEGREES
         self.println("GRIPPER_OPEN_OK target=140.0")
+        self._start_watch("moving")
 
     def _start_closing(self) -> None:
+        if self.gripper_closing:
+            self.println("GRIPPER_CLOSE_IGNORED reason=ya_esta_cerrando")
+            return
         self._enable_torque(6, True)
         self.gripper_command = min(max(self._logical_from_encoder(6), GRIPPER_CLOSED_DEGREES), GRIPPER_OPEN_DEGREES)
+        self.gripper_watch = "none"  # el cierre se vigila en _process_gripper_closing()
         self.gripper_closing = True
         self.gripper_started = self.now
         self.gripper_last_step = -math.inf
@@ -660,16 +747,16 @@ class DigitalTwin:
         self.gripper_last_step = self.now
         current_raw = self._gripper_current_raw()
         elapsed = self.now - self.gripper_started
+        if current_raw >= GRIPPER_HARD_CURRENT_RAW:  # antes que el tiempo máximo, como el firmware
+            self.println(f"GRIPPER_STOP_DETAIL reason=hard_current threshold_raw={GRIPPER_HARD_CURRENT_RAW} "
+                         f"threshold_ma_aprox={GRIPPER_HARD_CURRENT_RAW * 6.5:.1f}")
+            self.gripper_closing = False
+            self.gripper_samples = 0
+            self._torque_off_for_overcurrent()
+            return
         if elapsed >= GRIPPER_CLOSE_TIMEOUT_S:
             self.println(f"GRIPPER_STOP_DETAIL reason=timeout elapsed_ms={int(elapsed * 1000)}")
             self._freeze_gripper("timeout", current_raw)
-            return
-        if current_raw >= GRIPPER_HARD_CURRENT_RAW:
-            self.println(f"GRIPPER_STOP_DETAIL reason=hard_current threshold_raw={GRIPPER_HARD_CURRENT_RAW} "
-                         f"threshold_ma_aprox={GRIPPER_HARD_CURRENT_RAW * 6.5:.1f}")
-            self._freeze_gripper("hard_current", current_raw)
-            self._enable_torque(6, False)
-            self.println("GRIPPER_TORQUE_OFF proteccion de sobrecorriente")
             return
         if elapsed >= GRIPPER_INRUSH_IGNORE_S and current_raw >= self.contact_threshold:
             self.gripper_samples += 1
@@ -717,8 +804,12 @@ class DigitalTwin:
                 self.println("GRIPPER_STOP reason=torque_release detail=se_cancelo_el_cierre")
             self.gripper_closing = False
             self.gripper_samples = 0
+            self.gripper_watch = "none"
             result = self._enable_torque(6, False)
             self.println(f"GRIPPER_TORQUE_OFF reason=manual_release result={result}")
+        elif lowered in ("gripper telem on", "gripper telem off"):
+            self.gripper_telemetry = lowered == "gripper telem on"
+            self.println(f"GRIPPER_TELEMETRY={'on' if self.gripper_telemetry else 'off'}")
         elif line.startswith("gripper current "):
             requested = _to_int(line[16:])
             if not 20 <= requested <= 180:
@@ -736,6 +827,12 @@ class DigitalTwin:
             self.println("ARM_TORQUE_ON_OK" if enable else "ARM_TORQUE_OFF_OK")
         elif lowered in ("torque on", "torque off"):
             enable = lowered == "torque on"
+            if not enable:
+                if self.gripper_closing:
+                    self.println("GRIPPER_STOP reason=torque_off detail=se_cancelo_el_cierre")
+                self.gripper_closing = False
+                self.gripper_samples = 0
+                self.gripper_watch = "none"
             self.println("Activando torque global M1..M6..." if enable else "Desactivando torque global M1..M6...")
             for motor in range(1, 7):
                 result = self._enable_torque(motor, enable)

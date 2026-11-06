@@ -150,6 +150,43 @@ def floor_escape(start, m6=None):
     return clearance if clearance <= FLOOR_TOUCH else None
 
 
+GRIPPER_OPEN_TARGET = 140.0
+GRIPPER_SWEEP_STEP = 4.0
+
+
+def gripper_sweep_problem(pose, m6_from, m6_to, step=GRIPPER_SWEEP_STEP):
+    """None si abrir o cerrar la garra de `m6_from` a `m6_to` en `pose` (M2–M4) no
+    acerca su contorno a la mesa; si no, el motivo.
+
+    Al abrirse, el dedo móvil sobresale hasta 104 mm del eje de M5: una garra
+    horizontal y baja que se abre puede barrer la mesa aunque la pose sea segura
+    con la garra cerrada. Se revisa cada `step` grados de M6. Sin lectura de M6 se
+    revisa toda la apertura. Si la garra ya estaba bajo el margen (cerrada sobre
+    el cubo), se acepta lo que no la acerque más a la mesa, como en los movimientos.
+
+    Cerrar no se revisa: es el agarre mismo, cerca de la mesa, y el contorno (que
+    vale para cualquier giro de M5) deja bajo el margen 6 de los 15 agarres reales
+    de octubre, que no tocaron la mesa. Abrir no rechaza ninguna de las 15 demos ni
+    de 360 aperturas de planes del experto.
+    """
+    known = m6_from is not None and math.isfinite(m6_from)
+    if known and m6_to <= m6_from:
+        return None
+    pose = tuple(float(value) for value in pose)
+    low, high = sorted((float(m6_from), float(m6_to))) if known else (0.0, max(GRIPPER_OPEN_TARGET, m6_to))
+    steps = max(1, math.ceil((high - low) / step))
+    worst, worst_m6 = min(
+        (floor_clearance(pose, low + (high - low) * index / steps), low + (high - low) * index / steps)
+        for index in range(steps + 1)
+    )
+    # Sin lectura de M6 no hay pose de partida conocida: no se da margen de escape.
+    escape = floor_escape(pose, m6_from) if known else None
+    if worst <= FLOOR_TOUCH and (escape is None or worst < escape - ESCAPE_TOLERANCE):
+        return (f"la garra quedaría a {worst:.0f} mm de la mesa con M6 en {worst_m6:.0f}° "
+                f"(mínimo {FLOOR_TOUCH:g} mm)")
+    return None
+
+
 def _collides_base(corners):
     x0, x1, y0, y1 = -W_BASE / 2.0, W_BASE / 2.0, 0.0, H_BASE
     if any(x0 <= x <= x1 and y0 <= y <= y1 for x, y in corners):

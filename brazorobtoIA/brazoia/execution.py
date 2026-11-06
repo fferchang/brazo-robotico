@@ -9,7 +9,7 @@ from typing import Callable
 import numpy as np
 
 from .config import KEYFRAME_STAGES, STAGE_LABELS
-from .planner import MotionGroup, build_motion_plan, planning_start
+from .planner import GRIPPER_OPEN_TARGET, MotionGroup, build_motion_plan, gripper_sweep_problem, planning_start
 from .policy import StagePolicy
 from .robot import RobotSerial
 from .vision import SceneObservation, observation_features
@@ -290,6 +290,14 @@ class SupervisedExecution:
             "soltado": "open",
             "guardado": "close",
         }.get(stage)
+        if gripper_action == "open":
+            # Los tramos se revisan con la garra como está; abrirla al final agranda su
+            # contorno y puede barrer la mesa si queda horizontal y baja.
+            problem = gripper_sweep_problem(
+                (target[2], target[3], target[4]), current.get(6), GRIPPER_OPEN_TARGET
+            )
+            if problem:
+                raise ValueError(f"{STAGE_LABELS[stage]}: no se puede abrir la garra ahí: {problem}.")
         self.proposal = MotionProposal(
             stage_index=stage_index,
             stage=stage,
