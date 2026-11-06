@@ -47,7 +47,18 @@ def _clean(mask: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def _candidates(mask: np.ndarray, kind: str, minimum_area_ratio: float) -> list[Detection]:
+def _red_mask(hsv: np.ndarray) -> np.ndarray:
+    red_low = cv2.inRange(hsv, np.array([0, 90, 55]), np.array([12, 255, 255]))
+    red_high = cv2.inRange(hsv, np.array([168, 90, 55]), np.array([180, 255, 255]))
+    return _clean(cv2.bitwise_or(red_low, red_high))
+
+
+def _candidates(
+    mask: np.ndarray,
+    kind: str,
+    minimum_area_ratio: float,
+    minimum_rectangularity: float = 0.45,
+) -> list[Detection]:
     height, width = mask.shape[:2]
     frame_area = float(height * width)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -63,7 +74,7 @@ def _candidates(mask: np.ndarray, kind: str, minimum_area_ratio: float) -> list[
         rectangle_area = float(max(1, box_width * box_height))
         rectangularity = min(1.0, area_px / rectangle_area)
         shape_ratio = min(box_width, box_height) / max(box_width, box_height)
-        if rectangularity < 0.45:
+        if rectangularity < minimum_rectangularity:
             continue
         if kind == "red_cube":
             shape_score = shape_ratio
@@ -104,9 +115,7 @@ def detect_scene(
     minimum_lime_confidence: float = 0.0,
 ) -> SceneObservation:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    red_low = cv2.inRange(hsv, np.array([0, 90, 55]), np.array([12, 255, 255]))
-    red_high = cv2.inRange(hsv, np.array([168, 90, 55]), np.array([180, 255, 255]))
-    red_mask = _clean(cv2.bitwise_or(red_low, red_high))
+    red_mask = _red_mask(hsv)
     # Verde lima: verde amarillento y saturado. El límite superior evita la
     # pared azulada y el inferior excluye la mesa marrón y objetos grises.
     lime_mask = _clean(
@@ -198,14 +207,78 @@ def observation_features(observations: list[SceneObservation]) -> np.ndarray:
     return np.asarray(values, dtype=np.float64)
 
 
-def cube_inside_container(observation: SceneObservation, margin: float = 0.12) -> bool:
-    cube, container = observation.red_cube, observation.lime_container
-    if cube is None or container is None:
-        return False
-    left = container.center_x - container.width * (0.5 + margin)
-    right = container.center_x + container.width * (0.5 + margin)
-    top = container.center_y - container.height * (0.5 + margin)
-    bottom = container.center_y + container.height * (0.5 + margin)
-    return left <= cube.center_x <= right and top <= cube.center_y <= bottom
+# Dentro del recipiente el cubo asoma solo por arriba de las paredes: en la cámara
+# lateral real queda en 0,08–0,36 % de la imagen y en la del gemelo en ~0,044 %,
+# menos que el mínimo para buscarlo en la mesa (0,1 %), y a veces recortado.
+INSIDE_MINIMUM_RED_AREA_RATIO = 0.0002
+INSIDE_MINIMUM_RECTANGULARITY = 0.3
+INSIDE_MARGIN = 0.12
+
+
+@dataclass(frozen=True)
+class ContainerCheck:
+    """Lo que ve una cámara al final: «dentro», «vacio» o «sin_recipiente»."""
+
+    state: str
+    container: Detection | None
+    cube: Detection | None
+
+    def to_dict(self) -> dict[str, object | None]:
+        return {
+            "estado": self.state,
+            "recipiente": None if self.container is None else self.container.to_dict(),
+            "rojo_dentro": None if self.cube is None else self.cube.to_dict(),
+        }
+
+
+def _inside(item: Detection, container: Detection, margin: float) -> bool:
+    return (
+        abs(item.center_x - container.center_x) <= container.width * (0.5 + margin)
+        and abs(item.center_y - container.center_y) <= container.height * (0.5 + margin)
+    )
+
+
+def check_container(
+    frame: np.ndarray, observation: SceneObservation, margin: float = INSIDE_MARGIN
+) -> ContainerCheck:
+    """Busca rojo dentro del recipiente detectado, no el rojo más grande de la imagen.
+
+    El «cubo» de `detect_scene` es el rojo con más confianza en toda la imagen; al
+    final suele ser otra cosa (algo rojo detrás de la mesa) y el cubo, ya dentro,
+    queda chico y tapado por las paredes.
+    """
+    container = observation.lime_container
+    if container is None:
+        return ContainerCheck("sin_recipiente", None, None)
+    red = _candidates(
+        _red_mask(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)),
+        "red_cube",
+        INSIDE_MINIMUM_RED_AREA_RATIO,
+        minimum_rectangularity=INSIDE_MINIMUM_RECTANGULARITY,
+    )
+    inside = sorted(
+        (item for item in red if _inside(item, container, margin)),
+        key=lambda item: item.area,
+        reverse=True,
+    )
+    if inside:
+        return ContainerCheck("dentro", container, inside[0])
+    return ContainerCheck("vacio", container, None)
+
+
+def verify_cube_in_container(
+    frames: list[np.ndarray], observations: list[SceneObservation]
+) -> tuple[bool, list[ContainerCheck]]:
+    """Verificación visual final: alguna cámara ve rojo dentro del recipiente y
+    ninguna lo ve vacío. Una cámara que no encuentra el recipiente no decide.
+
+    Con las 15 demos de octubre: 14 de 15 Guardado aprobados (antes 8) y ninguna de
+    las 90 fotos con el cubo todavía en la mesa (Inicio a Descenso abierto).
+    """
+    if len(frames) != 2 or len(observations) != 2:
+        return False, []
+    checks = [check_container(frame, item) for frame, item in zip(frames, observations)]
+    states = [check.state for check in checks]
+    return "dentro" in states and "vacio" not in states, checks
 
 

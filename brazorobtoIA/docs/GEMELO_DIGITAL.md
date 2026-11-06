@@ -114,3 +114,15 @@ Ningún resultado habilita movimientos del brazo real.
 Lotes de 10 escenas (semilla 11): 6/10 con el primer gemelo; 7/10 tras corregir
 la tolerancia de partida y el lanzador; **10/10** con el margen de la cinemática
 inversa y la llegada con carga (en 2 escenas, M2 llegó a 1,2–1,4°).
+
+**Verificación visual final (6/11).** La verificación visual nueva (ver «Ejecución
+automática» en el README) se probó en 24 escenas del gemelo con la física como
+referencia: 12 con el cubo en la mesa dan «no confirmado» y 12 con el cubo
+dentro del recipiente, «posible éxito» (la anterior confirmaba 9 de 12). Con el
+cubo en la mesa, la cámara lateral a veces lo ve encimado al recipiente (4 de
+12): por eso basta que una cámara vea el recipiente vacío para no confirmar. En
+un lote de 2 tareas completas (semilla 11) el cubo asomaba en la lateral apenas
+0,044 % de la imagen y con un mínimo de 0,04 % una quedaba «no confirmada»; con
+0,02 % se confirman las 2, sin cambios en las demás pruebas. El
+resumen de `gemelo_digital.py` guarda qué vio cada cámara en
+`verificacion_camaras`.

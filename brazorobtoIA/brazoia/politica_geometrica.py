@@ -108,6 +108,20 @@ class GeometricPolicy:
             text += " Avisos del plan: " + "; ".join(plan.warnings)
         return text
 
+    def summary(self, scene_features) -> dict[str, object]:
+        """Lo mismo que `describe`, para guardar en el registro de la ejecución."""
+        placement, plan = self.plan(scene_features)
+        cube, container = placement.cube_xy, placement.container_xy
+        return {
+            "tipo": "geometrico",
+            "calibracion": self.calibration.created,
+            "cubo_mm": [round(cube[0] * 1000, 1), round(cube[1] * 1000, 1)],
+            "recipiente_mm": [round(container[0] * 1000, 1), round(container[1] * 1000, 1)],
+            "cubo_a_la_base_cm": round(float(np.hypot(*cube)) * 100, 1),
+            "cubo_al_recipiente_cm": round(float(np.hypot(cube[0] - container[0], cube[1] - container[1])) * 100, 1),
+            "avisos_del_plan": list(plan.warnings),
+        }
+
     def _clip(self, pose: dict[int, float]) -> dict[int, float]:
         return {motor: float(np.clip(pose[motor], *self.limits[motor])) for motor in range(1, 6)}
 

@@ -36,7 +36,7 @@ from brazoia.gemelo import (
 )
 from brazoia.mujoco_sim import PickPlaceExpert, VirtualArm
 from brazoia.robot import RobotSerial
-from brazoia.vision import cube_inside_container, detect_scene
+from brazoia.vision import detect_scene, verify_cube_in_container
 
 
 ROOT = Path(__file__).resolve().parent
@@ -83,13 +83,17 @@ class TwinSession:
 
     def observations(self, timeout: float = 3.0):
         """Detecciones de un par de cuadros tomados después de esta llamada."""
+        return self.frames_and_observations(timeout)[1]
+
+    def frames_and_observations(self, timeout: float = 3.0):
         since = time.monotonic()
         deadline = since + timeout
         while time.monotonic() < deadline:
             snapshots = [camera.snapshot() for camera in self.cameras]
             if all(item.frame is not None and item.timestamp > since for item in snapshots):
-                return [detect_scene(item.frame, **detection_parameters(self.config.vision, index))
-                        for index, item in enumerate(snapshots)]
+                frames = [item.frame for item in snapshots]
+                return frames, [detect_scene(frame, **detection_parameters(self.config.vision, index))
+                                for index, frame in enumerate(frames)]
             time.sleep(0.03)
         raise RuntimeError("Las cámaras virtuales no entregaron imagen: " +
                            "; ".join(camera.snapshot().status for camera in self.cameras))
@@ -165,7 +169,9 @@ class TwinSession:
                          f"{time.monotonic() - stage_started:4.1f} s")
                 execution.mark_completed()
             time.sleep(1.0)
-            entry["verificacion_visual"] = all(cube_inside_container(item) for item in self.observations())
+            passed, checks = verify_cube_in_container(*self.frames_and_observations())
+            entry["verificacion_visual"] = passed
+            entry["verificacion_camaras"] = [check.state for check in checks]
             entry["exito"] = self.twin.cube_in_container()
             if not entry["exito"]:
                 entry["motivos"].append("El cubo no quedó dentro del recipiente.")

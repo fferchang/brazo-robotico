@@ -34,7 +34,12 @@ from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
 from brazoia.rerun_view import RerunArmView
 from brazoia.robot import RobotEvent, RobotSerial
 from brazoia.runlog import ExecutionLog
-from brazoia.vision import cube_inside_container, detect_scene, draw_observation, observation_features
+from brazoia.vision import detect_scene, draw_observation, observation_features, verify_cube_in_container
+
+# Avisos del ejecutor que se guardan en el registro de la ejecución (el resto es progreso).
+RUN_LOG_WARNINGS = ("Llegada con desvío", "Garra abierta a")
+# Del modelo aprendido solo lo que lo identifica; su metadata trae las predicciones de validación.
+POLICY_SUMMARY_KEYS = ("tipo", "calibracion", "demonstrations", "mean_absolute_error_degrees", "validation_passed")
 
 
 def build_reference_pose_plan(
@@ -111,6 +116,7 @@ class App:
         self.executor: MotionExecutor | None = None
         self.manual_executor: MotionExecutor | None = None
         self.execution_log: ExecutionLog | None = None
+        self.logged_scene = None                  # escena de Inicio ya guardada en el registro
         self.automatic_verification: bool | None = None
         self.execution_busy = False
         self.camera_settings_locked = True
@@ -777,6 +783,19 @@ class App:
             ),
         )
 
+    def camera_configuration(self) -> list[dict[str, object]]:
+        return [
+            {
+                "index": camera.index,
+                "rotation_degrees": camera.rotation_degrees,
+                "brightness_percent": camera.brightness_percent,
+                "contrast_percent": camera.contrast_percent,
+                "saturation_percent": camera.saturation_percent,
+                "zoom_factor": camera.zoom_factor,
+            }
+            for camera in self.cameras
+        ]
+
     def start_demonstration(self) -> None:
         if self.twin is not None:
             self.status.set("En el gemelo digital no se graban demostraciones: no se mezclan con las reales.")
@@ -790,22 +809,11 @@ class App:
         if len(self.cameras) != 2 or self.robot is None or not self.robot.connected:
             self.status.set("Abrí las dos cámaras y conectá el robot.")
             return
-        camera_configuration = [
-            {
-                "index": camera.index,
-                "rotation_degrees": camera.rotation_degrees,
-                "brightness_percent": camera.brightness_percent,
-                "contrast_percent": camera.contrast_percent,
-                "saturation_percent": camera.saturation_percent,
-                "zoom_factor": camera.zoom_factor,
-            }
-            for camera in self.cameras
-        ]
         self.demonstration = DemonstrationSession(
             self.config.demonstrations_dir,
             {
                 "port": self.robot.port,
-                "cameras": camera_configuration,
+                "cameras": self.camera_configuration(),
                 "limits": {str(key): list(value) for key, value in self.config.limits.items()},
                 "keyframes": list(KEYFRAME_STAGES),
             },
@@ -1091,12 +1099,30 @@ class App:
             self.status.set("Para iniciar la tarea automática: " + gripper_problem)
             return
         self.execution = SupervisedExecution(policy, self.config.limits)
-        self.executor = MotionExecutor(
-            self.robot, status=lambda text: self.worker_messages.put(("log", text))
+        run_log = ExecutionLog(
+            self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "ejecuciones",
+            {
+                "port": self.robot.port,
+                "gemelo": self.twin is not None,
+                "modo": self.automatic_mode.get(),
+                "politica": {
+                    key: value
+                    for key, value in (getattr(policy, "metadata", None) or {}).items()
+                    if key in POLICY_SUMMARY_KEYS
+                },
+                "cameras": self.camera_configuration(),
+                "limits": {str(key): list(value) for key, value in self.config.limits.items()},
+            },
         )
-        self.execution_log = ExecutionLog(
-            self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "ejecuciones"
-        )
+
+        def executor_status(text: str) -> None:
+            self.worker_messages.put(("log", text))
+            if text.startswith(RUN_LOG_WARNINGS):
+                run_log.note("aviso", text)
+
+        self.executor = MotionExecutor(self.robot, status=executor_status)
+        self.execution_log = run_log
+        self.logged_scene = None
         self.automatic_verification = None
         self.execution_busy = False
         self.set_camera_controls_enabled(False)
@@ -1151,6 +1177,8 @@ class App:
             return
         if proposal.stage_index == 1 and hasattr(self.execution.policy, "describe"):
             self.log(self.execution.policy.describe(self.execution.scene_features))
+        if proposal.stage_index == 1:
+            self._log_scene(self.execution, self.execution_log)
         target_text = " | ".join(f"M{i}={v:.1f}°" for i, v in proposal.target.items())
         self.auto_status.set(f"PROPUESTA: {proposal.label} · {target_text}")
         self.status.set("Revisá la propuesta y Rerun. Nada se moverá hasta confirmar.")
@@ -1188,17 +1216,21 @@ class App:
             if self.execution is None:
                 return
             if self.execution_log is not None:
-                self.execution_log.completed(proposal.stage)
+                self.execution_log.completed(proposal.stage, *self._robot_state())
             self.execution.mark_completed()
             if self.execution.finished:
                 self.verify_final_result()
             else:
+                self._run_capture(self.execution_log, proposal.stage)
                 self.auto_status.set("Etapa terminada. Prepará la siguiente.")
 
         def failure(exc):
             self.execution_busy = False
             self.auto_status.set(f"BLOQUEADO: {exc}")
             self.log(f"Etapa {proposal.stage} bloqueada: {exc}")
+            if self.execution_log is not None:
+                self.execution_log.note("bloqueo", str(exc), proposal.stage)
+                self._run_capture(self.execution_log, f"{proposal.stage}_bloqueo")
 
         self.run_async(
             lambda: self.executor.execute(proposal),
@@ -1213,14 +1245,54 @@ class App:
             self.executor.stop()
         self.auto_status.set("Detenido por el operador.")
 
+    def _robot_state(self) -> tuple[dict[int, float] | None, str | None]:
+        if self.robot is None:
+            return None, None
+        snapshot = self.robot.snapshot()
+        return dict(snapshot.positions), snapshot.gripper_state
+
+    def _run_capture(self, run_log: ExecutionLog | None, label: str) -> dict | None:
+        """Fotos y ángulos de este momento en el registro; un error acá nunca frena la tarea."""
+        if run_log is None:
+            return None
+        try:
+            return run_log.capture(label, list(self.snapshots), list(self.observations), *self._robot_state())
+        except Exception as exc:
+            self.worker_messages.put(("log", f"No se pudo guardar la foto de {label}: {exc}"))
+            return None
+
+    def _log_scene(self, execution: SupervisedExecution, run_log: ExecutionLog | None) -> None:
+        """Foto de Inicio y lo que la política sacó de ella, una vez por escena."""
+        features = execution.scene_features
+        if run_log is None or features is None or features is self.logged_scene:
+            return
+        self.logged_scene = features
+        summary: dict[str, object] = {"tipo": "aprendido"}
+        if hasattr(execution.policy, "summary"):
+            try:
+                summary = execution.policy.summary(features)
+            except Exception as exc:
+                summary = {"error": str(exc)}
+        run_log.scene(summary)
+        self._run_capture(run_log, "inicio")
+
     def verify_final_result(self) -> None:
-        self.automatic_verification = (
-            len(self.observations) == 2
-            and all(cube_inside_container(item) for item in self.observations)
-        )
-        text = "posible éxito" if self.automatic_verification else "no confirmado"
+        frames = [item.frame for item in self.snapshots]
+        observations = list(self.observations)
+        if len(observations) == 2 and len(frames) == 2 and all(frame is not None for frame in frames):
+            passed, checks = verify_cube_in_container(frames, observations)
+        else:
+            passed, checks = False, []
+        self.automatic_verification = passed
+        if self.execution_log is not None:
+            record = self._run_capture(self.execution_log, "verificacion_final")
+            self.execution_log.verification(passed, checks, None if record is None else record["index"])
+        text = "posible éxito" if passed else "no confirmado"
+        cameras = ", ".join(
+            f"{name} {check.state.replace('_', ' ')}" for name, check in zip(("frontal", "lateral"), checks)
+        ) or "faltan imágenes"
         self.auto_status.set(
-            f"Secuencia terminada · verificación visual: {text}. Marcá el resultado humano."
+            f"Secuencia terminada · verificación visual: {text} ({cameras}). Marcá el resultado humano."
         )
 
     def finish_execution(self, result: str) -> None:
@@ -1371,13 +1443,23 @@ class App:
                 self.worker_messages.put(("log", f"Gemelo · {proposal.label}: {len(proposal.groups)} tramos"))
                 if run_log is not None:
                     run_log.proposal(proposal)
+                if proposal.stage_index == 1:
+                    self._log_scene(execution, run_log)
                 stopped()
-                executor.execute(proposal)
+                try:
+                    executor.execute(proposal)
+                except Exception as exc:
+                    if run_log is not None:
+                        run_log.note("bloqueo", str(exc), proposal.stage)
+                        self._run_capture(run_log, f"{proposal.stage}_bloqueo")
+                    raise
                 stopped()
                 if run_log is not None:
-                    run_log.completed(proposal.stage)
+                    run_log.completed(proposal.stage, *self._robot_state())
                 execution.mark_completed()
                 time.sleep(0.3)  # cuadros nuevos para la etapa siguiente
+                if not execution.finished:
+                    self._run_capture(run_log, proposal.stage)
             time.sleep(1.0)  # que el cubo se asiente antes de mirar
             return self.twin.cube_in_container()
 

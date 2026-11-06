@@ -68,7 +68,13 @@ Cada prueba crea su propia carpeta en el momento de iniciarse:
 - `datos/demostraciones/prueba_AAAAMMDD_HHMMSS_microsegundos/` contiene las 24
   imágenes y su `metadata.json`.
 - `datos/ejecuciones/prueba_AAAAMMDD_HHMMSS_microsegundos/` contiene el
-  `metadata.json` de la ejecución automática.
+  `metadata.json` de la ejecución automática y, desde el 6/11/2026, sus fotos:
+  la de Inicio con la que se planificó (y dónde ubicó el cubo y el recipiente,
+  con la distancia del cubo a la base), una al terminar cada etapa con los
+  ángulos y el estado de la garra, una si una etapa se bloquea y la de la
+  verificación final. También anota los avisos del ejecutor («Llegada con
+  desvío», «Garra abierta a …»). Sirve para entender después, sin el brazo, por
+  qué una corrida falló.
 
 Así, los archivos de dos pruebas distintas nunca se mezclan.
 
@@ -164,6 +170,16 @@ La aplicación primero propone una pose. **No mueve el brazo** hasta pulsar
 pose inicial se desvió, la primera propuesta es una recuperación a la pose de
 inicio aprendida. Al terminar, se realiza una comprobación visual automática y
 el operador registra el resultado real.
+
+La comprobación visual busca rojo **dentro** del recipiente en cada cámara: da
+«posible éxito» si alguna lo ve adentro y ninguna ve el recipiente vacío (una
+cámara que no encuentra el recipiente no decide). Antes miraba si el rojo más
+grande de la imagen caía en el recipiente, y fallaba: el cubo ya dentro asoma
+poco por arriba de las paredes y, en la cámara lateral, quedaba por debajo del
+área mínima, o algo rojo detrás de la mesa pasaba por el cubo. Con las fotos de
+las 15 demostraciones de octubre aprueba 14 de 15 finales (antes 8) y ninguna de
+las 90 fotos con el cubo todavía en la mesa. En las ejecuciones reales del
+5/11 había dado «no confirmado» en 2 de los 4 éxitos.
 
 ## Simulación física en MuJoCo
 
