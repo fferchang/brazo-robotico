@@ -14,7 +14,7 @@ reales y no modifica demostraciones ni modelos entrenados.
 
 Se agregan al `.bat` o a `simulacion_mujoco.py`:
 
-- `--episodios N`: cantidad de episodios (3 por defecto).
+- `--episodios N`: cantidad de episodios (3 por defecto). `0` = sin fin, hasta cerrar la ventana.
 - `--semilla S`: repite las mismas posiciones.
 - `--ritmo X`: velocidad del visor respecto del tiempo real (2 = el doble).
 - `--sin-visor`: sin ventana, lo más rápido posible (~1 s por episodio).
@@ -24,6 +24,14 @@ Se agregan al `.bat` o a `simulacion_mujoco.py`:
 - `--cerrar-al-terminar`: cierra el visor al final en lugar de esperar.
 
 Ejemplo: `SIMULACION_MUJOCO.bat --sin-visor --episodios 100`.
+
+## Demo continua
+
+`DEMO_CONTINUA.bat` repite episodios con posiciones al azar sin fin, hasta
+cerrar la ventana del visor. Desactiva la suspensión y el apagado de pantalla
+con la PC enchufada (`powercfg`) y, si el programa termina por un error
+inesperado, lo vuelve a abrir a los 5 segundos. Cerrar la ventana termina la
+demo. Acepta las mismas opciones, por ejemplo `DEMO_CONTINUA.bat --ritmo 1.5`.
 
 ## Qué hace
 
