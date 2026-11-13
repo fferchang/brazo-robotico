@@ -9,7 +9,8 @@ import argparse
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
+from itertools import count
 from datetime import datetime
 from pathlib import Path
 
@@ -28,7 +29,8 @@ class ViewerClosed(Exception):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Pick & place virtual del SO-100 en MuJoCo. No usa el ESP32.")
-    parser.add_argument("--episodios", type=int, default=3, help="Cantidad de episodios (por defecto 3).")
+    parser.add_argument("--episodios", type=int, default=3,
+                        help="Cantidad de episodios (por defecto 3). 0 = sin fin, hasta cerrar la ventana.")
     parser.add_argument("--semilla", type=int, default=None, help="Semilla para repetir las mismas posiciones.")
     parser.add_argument("--sin-visor", action="store_true", help="Sin ventana: corre lo más rápido posible.")
     parser.add_argument("--ritmo", type=float, default=1.0, help="Velocidad del visor respecto del tiempo real.")
@@ -142,9 +144,12 @@ def main(argv=None):
     arm.observer = (lambda current: [observer(current) for observer in observers]) if observers else None
 
     session = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary, warnings, holding = Counter(), Counter(), []
+    continuous = args.episodios <= 0
+    # En modo continuo se acota la memoria: sólo los últimos valores de M6.
+    summary, warnings, holding = Counter(), Counter(), deque(maxlen=1000)
     try:
-        for episode in range(1, args.episodios + 1):
+        episodes = count(1) if continuous else range(1, args.episodios + 1)
+        for episode in episodes:
             placement = sample_placement(rng, arm.dimensions)
             try:
                 plan = expert.plan(placement)
@@ -152,6 +157,9 @@ def main(argv=None):
                 summary["sin plan"] += 1
                 print(f"[{episode}] Sin plan: {exc}")
                 continue
+            if continuous and episode % 20 == 0:
+                print(f"     Acumulado: {summary['exitoso']} exitosos, {summary['fallido']} fallidos, "
+                      f"{summary['sin plan']} sin plan.")
             photos = PhotoRecorder(arm, ROOT / "datos" / "simulacion" / f"sim_{session}_{episode:03d}") if args.fotos else None
             if viewer is not None:
                 observers[-1] = make_viewer_observer(viewer, max(0.05, args.ritmo))
@@ -199,6 +207,8 @@ def main(argv=None):
     if keyframes:
         print(f"Poses clave que las reglas actuales del brazo real rechazarían: "
               f"{warnings['con avisos']}/{keyframes} (límites de config.json o planificador 2D).")
+    if continuous:
+        return 0  # Fallas aisladas no son un error del programa: el .bat no debe reiniciarlo.
     return 0 if summary["fallido"] == 0 else 1
 
 
