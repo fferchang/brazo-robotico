@@ -34,6 +34,16 @@ Ningún resultado habilita movimientos del brazo real.
   `datos/gemelo/ejecuciones/`, separadas de las reales. Demostraciones,
   calibraciones y «Guardar ajustes» de cámara están deshabilitados.
 
+## Prueba de desarrollo del protocolo por punto
+
+El candidato se habilita con `app.py --gemelo --puntos-firmware` y usa
+`SIMULADO`. Aplica solo a Traslado 2 de la demo si el recorrido admite la
+orden. La PC envía un mensaje `waypoint` por punto y el gemelo ejecuta
+sus grupos de hasta dos motores, con quietud entre grupos. Se preservan
+los chequeos y la parada. La prueba separa la cantidad de mensajes de
+movimiento de la concurrencia real. El mapa de código, resultados y
+comandos de reproducción están en el [relevo interno](RELEVO_MOVIMIENTO_Y_CORRIENTE.md#punto-de-reanudación).
+
 ## Qué imita el firmware virtual
 
 - Comandos: `<id> <grados>`, `motorN`, `pair`, `bpair`, `bmove`, `read`, `scan`,

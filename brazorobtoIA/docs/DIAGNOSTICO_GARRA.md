@@ -1,5 +1,10 @@
 # Revisión del agarre por corriente — 8 de octubre de 2026
 
+Este informe describe el diagnóstico del 8/10. El estado vigente, las
+mediciones posteriores con umbral 60 y la distinción entre firmware
+instalado y candidato están en el
+[relevo interno](RELEVO_MOVIMIENTO_Y_CORRIENTE.md#punto-de-reanudación).
+
 ## Resultado y alcance
 
 El botón está conectado correctamente: su callback envía una sola línea

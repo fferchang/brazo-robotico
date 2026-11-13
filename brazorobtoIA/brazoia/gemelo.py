@@ -73,6 +73,10 @@ STEPS_PER_TURN = 4095.0
 MOVE_SPEED = 450            # pasos/s del servo
 MOVE_ACC = 45               # unidades de 100 pasos/s²
 MOVE_COOLDOWN_S = 0.050
+WAYPOINT_SPACING_S = 0.065
+WAYPOINT_POLL_S = 0.050
+WAYPOINT_HEARTBEAT_S = 0.750
+WAYPOINT_TIMEOUT_S = 5.0
 AUTO_POS_INTERVAL_S = 0.050
 POST_MOVE_REPORT_S = 0.200
 GRIPPER_OPEN_DEGREES = 140.0
@@ -93,6 +97,7 @@ GRIPPER_WATCH_INTERVAL_S = 0.100
 GRIPPER_MOVE_INRUSH_IGNORE_S = 0.250
 GRIPPER_MOVE_WATCH_S = 9.0
 GRIPPER_HARD_CURRENT_SAMPLES = 2
+POWER_TELEM_INTERVAL_S = 0.100
 GRIPPER_HOLD_LIMIT_RAW = 170
 GRIPPER_HOLD_LIMIT_SAMPLES = 20
 GRIPPER_HOLD_RELIEF_DEGREES = 1.5
@@ -251,6 +256,33 @@ class VirtualSerialPort:
         self.twin._detach(self)
 
 
+@dataclasses.dataclass
+class Waypoint:
+    identifier: int
+    pending: collections.deque[dict[int, float]]
+    last_contact: float
+    phase_started: float
+    last_reliefs: int
+    current: dict[int, float] = dataclasses.field(default_factory=dict)
+    next_poll: float = 0.0
+    stable: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class CubeLoss:
+    stage: str
+    displacement_mm: float
+
+
+@dataclasses.dataclass
+class CubeMonitor:
+    abort: threading.Event
+    stage: str | None = None
+    origin: np.ndarray | None = None
+    above_since: float | None = None
+    loss: CubeLoss | None = None
+
+
 class DigitalTwin:
     """Brazo virtual con el comportamiento del firmware, corriendo en tiempo real.
 
@@ -281,6 +313,9 @@ class DigitalTwin:
         self.log: collections.deque[tuple[int, str]] = collections.deque(maxlen=2000)
         self._log_count = 0
         self.placement = placement or self.random_placement()
+        # Como en el firmware, `power telem` sigue prendido aunque cambie la escena.
+        self.power_telemetry = False
+        self.last_power_telemetry = -math.inf
         self._reset_state(self.placement)
 
     # ----- escena -----
@@ -299,6 +334,7 @@ class DigitalTwin:
             return self.placement
 
     def _reset_state(self, placement: Placement) -> None:
+        self._cube_monitor: CubeMonitor | None = None
         for motor, aid in self.arm.actuator_ids.items():
             self._set_gain(motor, self._kp[motor])
         pose = {**INITIAL_POSE, 6: GRIPPER_CLOSED_DEGREES}
@@ -306,6 +342,8 @@ class DigitalTwin:
         self.torque = {motor: True for motor in range(1, 7)}
         self.profiles = {motor: ServoProfile(pose[motor], pose[motor]) for motor in range(1, 7)}
         self.last_move = -math.inf
+        self.waypoint: Waypoint | None = None
+        self._last_waypoint_id = 0
         self.last_telemetry = -math.inf
         self.pending_report: tuple[float, int] | None = None
         self.gripper_closing = False
@@ -338,6 +376,68 @@ class DigitalTwin:
     def cube_in_container(self) -> bool:
         with self.lock:
             return bool(cube_in_container(self.arm, self.placement))
+
+    def start_cube_monitor(self, abort: threading.Event) -> None:
+        with self.lock:
+            self._cube_monitor = CubeMonitor(abort)
+
+    def set_cube_monitor_stage(self, stage: str) -> bool:
+        with self.lock:
+            monitor = self._cube_monitor
+            if monitor is not None:
+                if stage == "soltado" and monitor.above_since is not None and monitor.loss is None:
+                    return False  # Resolver una separación ya observada antes de abrir.
+                monitor.stage = stage if stage in ("traslado_1", "traslado_2", "traslado_3") else None
+            return True
+
+    def finish_cube_monitor(self) -> CubeLoss | None:
+        with self.lock:
+            monitor, self._cube_monitor = self._cube_monitor, None
+            return monitor.loss if monitor is not None else None
+
+    def _monitor_carried_cube(self) -> None:
+        monitor = self._cube_monitor
+        if monitor is None or monitor.stage is None or monitor.loss is not None:
+            return
+        arm = self.arm
+        data = arm.data
+        cube = arm.model.geom("cubo").id
+        grip = data.site_xmat[arm.site_id].reshape(3, 3)
+        local = grip.T @ (data.geom_xpos[cube] - data.site_xpos[arm.site_id])
+        if monitor.origin is None:
+            monitor.origin = local
+        displacement = float(np.linalg.norm(local - monitor.origin)) * 1000
+        if displacement < 20.0:
+            monitor.above_since = None
+        elif monitor.above_since is None:
+            monitor.above_since = self.now
+        elif self.now - monitor.above_since >= 0.08 - 1e-9:
+            monitor.loss = CubeLoss(monitor.stage, displacement)
+            monitor.abort.set()
+            if self.waypoint is not None:
+                self._finish_waypoint("CANCELLED")
+
+    def carried_cube_check(self, planning_arm: VirtualArm):
+        """Captura la pose del cubo respecto de la pinza para revisar el salto virtual."""
+        with self.lock:
+            arm = self.arm
+            data = arm.data
+            cube = arm.model.geom("cubo").id
+            grip = data.site_xmat[arm.site_id].reshape(3, 3)
+            offset = grip.T @ (data.geom_xpos[cube] - data.site_xpos[arm.site_id])
+            rotation = grip.T @ data.geom_xmat[cube].reshape(3, 3)
+            half_size = arm.model.geom_size[cube].copy()
+
+        def clears_table() -> bool:
+            # pose_problems ya actualizó el modelo de revisión para esta muestra.
+            check = planning_arm._check_data
+            site = planning_arm.site_id
+            grip = check.site_xmat[site].reshape(3, 3)
+            center_z = check.site_xpos[site, 2] + (grip @ offset)[2]
+            extent = np.abs((grip @ rotation)[2]) @ half_size
+            return center_z - extent - planning_arm.floor_z >= 0.005
+
+        return clears_table
 
     def cube_position(self) -> np.ndarray:
         with self.lock:
@@ -402,7 +502,9 @@ class DigitalTwin:
                 self._line += char
         self._process_gripper_closing()
         self._process_gripper_watch()
+        self._process_waypoint()
         self._auto_print_positions()
+        self._process_power_telemetry()
         self._process_pending_report()
         for motor, profile in self.profiles.items():
             if self.torque[motor]:
@@ -413,6 +515,7 @@ class DigitalTwin:
                 self.arm.commanded[motor] = profile.setpoint
         self.arm._apply_commanded()
         self.arm.step(TICK_S)
+        self._monitor_carried_cube()
 
     # ----- puerto -----
     def open_port(self, port: str = VIRTUAL_PORT, baudrate: int = 115200, timeout: float | None = 0.1,
@@ -515,6 +618,7 @@ class DigitalTwin:
                      "  torque off      (emergencia: M1..M6)", "  torque on       (todos: M1..M6)",
                      "  gripper open", "  gripper close", "  gripper stop",
                      "  gripper release  (torque OFF solamente en M6)", "  gripper current 92  (aprox. 600 mA)", "  gripper telem on|off  (corriente de M6 cada 0.1 s al abrir y sostener)",
+                     "  power telem on|off    (corriente de M1..M6 y voltaje minimo cada 0.1 s)",
                      "  help"):
             self.println(text)
         self.println("Limites configurados:")
@@ -600,7 +704,8 @@ class DigitalTwin:
         self._write_pos(motor, degrees, MOVE_SPEED, MOVE_ACC)
         self.pending_report = (self.now + POST_MOVE_REPORT_S, motor)
 
-    def _move_pair(self, first: int, first_deg: float, second: int, second_deg: float) -> None:
+    def _move_pair(self, first: int, first_deg: float, second: int, second_deg: float, *,
+                   report: bool = True) -> None:
         if not (1 <= first <= 6 and 1 <= second <= 6):
             self.println("PAIR_REJECTED reason=ID_invalido usa_1_a_6")
             return
@@ -635,10 +740,152 @@ class DigitalTwin:
         self._write_pos(second, second_deg, speeds[1], MOVE_ACC)
         self.last_move = self.now
         self.pending_report = None
-        self.println(f"PAIR_MOVE_OK ID1={first} target1={first_deg:.2f} speed1={speeds[0]} "
-                     f"ID2={second} target2={second_deg:.2f} speed2={speeds[1]}")
+        if report:
+            self.println(f"PAIR_MOVE_OK ID1={first} target1={first_deg:.2f} speed1={speeds[0]} "
+                         f"ID2={second} target2={second_deg:.2f} speed2={speeds[1]}")
+
+    def _waypoint_result(self, status: str, identifier: int, reason: str = "") -> None:
+        detail = f" reason={reason}" if reason else ""
+        self.println(f"WAYPOINT_{status} id={identifier}{detail}")
+
+    def _finish_waypoint(self, status: str, reason: str = "") -> None:
+        point, self.waypoint = self.waypoint, None
+        if point is not None:
+            self._waypoint_result(status, point.identifier, reason)
+
+    def _waypoint_command(self, line: str) -> None:
+        parts = line.split()[1:]
+        if parts and parts[0] in ("cancel", "keepalive"):
+            point = self.waypoint
+            if point is not None and parts[1:] == [str(point.identifier)]:
+                if parts[0] == "cancel":
+                    self._finish_waypoint("CANCELLED")
+                else:
+                    point.last_contact = self.now
+            return
+
+        identifier = 0
+        pending = collections.deque()
+        seen = set()
+        try:
+            identifier = int(parts[0])
+            if not 1 <= identifier <= 2147483647:
+                identifier = 0
+                raise ValueError
+            index = 1
+            while index < len(parts):
+                size = int(parts[index])
+                if size not in (1, 2) or index + 2 * size >= len(parts):
+                    raise ValueError
+                group = {}
+                for offset in range(index + 1, index + 1 + 2 * size, 2):
+                    motor = int(parts[offset])
+                    target = float(parts[offset + 1])
+                    if not 1 <= motor <= 5 or motor in seen:
+                        self._waypoint_result("REJECTED", identifier, "motores")
+                        return
+                    low, high = USER_LIMITS[motor]
+                    if not math.isfinite(target):
+                        raise ValueError
+                    if not low <= target <= high:
+                        self._waypoint_result("REJECTED", identifier, "fuera_de_rango")
+                        return
+                    group[motor] = target
+                    seen.add(motor)
+                pending.append(group)
+                index += 1 + 2 * size
+            if not pending:
+                raise ValueError
+        except (ValueError, IndexError):
+            self._waypoint_result("REJECTED", identifier, "formato")
+            return
+        if self.waypoint is not None:
+            state = "BUSY" if identifier == self.waypoint.identifier else "REJECTED"
+            self._waypoint_result(state, identifier, "ocupado")
+        elif identifier == self._last_waypoint_id:
+            self._waypoint_result("REJECTED", identifier, "id_repetido")
+        elif self.gripper_closing or self.gripper_hard_samples or self.gripper_high_samples:
+            self._waypoint_result("REJECTED", identifier, "gripper_activa")
+        else:
+            self.waypoint = Waypoint(identifier, pending, self.now, self.now, self.gripper_reliefs)
+            self._last_waypoint_id = identifier
+            self._waypoint_result("ACCEPTED", identifier)
+
+    def _waypoint_quiet(self, motor: int) -> bool:
+        speed = math.degrees(float(self.arm.data.qvel[self.arm.dofadr[motor]]))
+        return abs(self.profiles[motor].velocity) < 0.01 and abs(speed) <= 2.0
+
+    def _process_waypoint(self) -> None:
+        point = self.waypoint
+        if point is None:
+            return
+        now = self.now
+        if now - point.last_contact >= WAYPOINT_HEARTBEAT_S:
+            self._finish_waypoint("REJECTED", "heartbeat")
+            return
+        if now - point.phase_started >= WAYPOINT_TIMEOUT_S:
+            self._finish_waypoint("REJECTED", "timeout")
+            return
+        if not all(self.torque.values()):
+            self._finish_waypoint("REJECTED", "torque")
+            return
+        if (self.gripper_closing or self.gripper_reliefs != point.last_reliefs
+                or self.gripper_hard_samples or self.gripper_high_samples):
+            self._finish_waypoint("REJECTED", "gripper_activa")
+            return
+        if self._line or now + 1e-9 < point.next_poll:
+            return
+        point.next_poll = now + WAYPOINT_POLL_S
+        if point.current and not self._waypoint_quiet(6):
+            self._finish_waypoint("REJECTED", "gripper_activa")
+            return
+        quiet = all(self._waypoint_quiet(motor) for motor in range(1, 7)) and all(
+            abs(self._logical_from_encoder(motor) - goal) <= 3.0
+            for motor, goal in point.current.items()
+        )
+        point.stable = point.stable + 1 if quiet else 0
+        if point.stable < 3 or now - self.last_move < WAYPOINT_SPACING_S:
+            return
+        if not point.pending:
+            self._finish_waypoint("DONE")
+            return
+
+        group = point.pending[0]
+        if self._validate_pair(group) != "OK":
+            self._finish_waypoint("REJECTED", "trayectoria_insegura")
+            return
+        last_move = self.last_move
+        if len(group) == 2:
+            (first, a), (second, b) = group.items()
+            self._move_pair(first, a, second, b, report=False)
+        else:
+            motor, target = next(iter(group.items()))
+            self._write_pos(motor, target, MOVE_SPEED, MOVE_ACC)
+            self.last_move = now
+            self.pending_report = None
+        if self.last_move == last_move or any(self.profiles[motor].target != target for motor, target in group.items()):
+            self._finish_waypoint("REJECTED", "escritura")
+            return
+        point.pending.popleft()
+        point.current = group
+        point.phase_started = now
+        point.stable = 0
 
     # ----- firmware: garra -----
+    def _process_power_telemetry(self) -> None:
+        """Como `power telem on` del firmware. Las corrientes salen del torque de cada
+        actuador con la escala de la garra y el voltaje de una fuente ideal de 12 V con
+        0,2 Ω de caída: sirven para probar el camino de la medición, no como medida."""
+        if not self.power_telemetry or self.now - self.last_power_telemetry < POWER_TELEM_INTERVAL_S:
+            return
+        self.last_power_telemetry = self.now
+        currents = [current_raw_from_torque(float(self.arm.data.actuator_force[self.arm.actuator_ids[motor]]))
+                    if self.torque[motor] else 0 for motor in range(1, 7)]
+        total_ma = sum(currents) * 6.5
+        voltage_dv = int(round(120 - total_ma / 1000.0 * 2.0))
+        self.println(f"POWER_TELEM ms={int(self.now * 1000)} I={','.join(str(value) for value in currents)} "
+                     f"total_ma={total_ma:.0f} v_min_dv={voltage_dv} v_id=1")
+
     def _gripper_current_raw(self) -> int:
         return current_raw_from_torque(float(self.arm.data.actuator_force[self.arm.actuator_ids[6]]))
 
@@ -785,6 +1032,16 @@ class DigitalTwin:
         if not line:
             return
         lowered = line.lower()
+        if lowered == "waypoint" or lowered.startswith("waypoint "):
+            self._waypoint_command(lowered)
+            return
+        if self.waypoint is not None:
+            if lowered in ("torque off", "arm torque off", "gripper stop", "parar garra", "gripper release", "garra libre"):
+                self._finish_waypoint("CANCELLED")
+            elif not (lowered in ("help", "scan", "posall", "power telem on", "power telem off",
+                                 "gripper telem on", "gripper telem off") or lowered.startswith("read ")):
+                self.println(f"WAYPOINT_BUSY id={self.waypoint.identifier}")
+                return
         if lowered == "help":
             self._help()
         elif lowered == "scan":
@@ -807,6 +1064,10 @@ class DigitalTwin:
             self.gripper_watch = "none"
             result = self._enable_torque(6, False)
             self.println(f"GRIPPER_TORQUE_OFF reason=manual_release result={result}")
+        elif lowered in ("power telem on", "power telem off"):
+            self.power_telemetry = lowered == "power telem on"
+            self.last_power_telemetry = -math.inf
+            self.println(f"POWER_TELEMETRY={'on' if self.power_telemetry else 'off'}")
         elif lowered in ("gripper telem on", "gripper telem off"):
             self.gripper_telemetry = lowered == "gripper telem on"
             self.println(f"GRIPPER_TELEMETRY={'on' if self.gripper_telemetry else 'off'}")

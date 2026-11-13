@@ -109,6 +109,37 @@ class GeometricPolicy:
         _, plan = self.plan(scene_features)
         return [self._clip(pose) for pose in plan.keyframes[stage_index].via]
 
+    def gripper_step(self, stage_index: int, scene_features) -> tuple[str | None, float | None, str]:
+        """(acción, grados, cuándo) de la garra en la etapa, como la planificó el experto."""
+        _, plan = self.plan(scene_features)
+        keyframe = plan.keyframes[stage_index]
+        degrees = keyframe.gripper_degrees
+        if degrees is not None:
+            degrees = float(np.clip(degrees, *self.limits[6]))
+        return keyframe.gripper_action, degrees, keyframe.gripper_timing
+
+    # Con el recipiente como obstáculo al revisar saltos (la demo no tiene recipiente).
+    container_obstacle = True
+
+    def motion_problems(self, start: dict[int, float], end: dict[int, float], m6_values) -> list[str]:
+        """Choques del modelo 3D en las esquinas de la caja de `start` a `end` (M1–M5), con
+        cada M6 de `m6_values`: lo que puede pasar si los motores van a la vez a su ritmo."""
+        changed = [motor for motor in range(1, 6) if abs(end[motor] - start[motor]) > 1e-9]
+        placement = self._placement if self.container_obstacle else None
+        if placement is not None:
+            self.arm.set_obstacles(placement)
+        try:
+            for mask in range(1 << len(changed)):
+                pose = {motor: end[motor] if motor in changed and mask & (1 << changed.index(motor)) else start[motor]
+                        for motor in range(1, 6)}
+                for m6 in m6_values:
+                    problems = self.arm.pose_problems({**pose, 6: float(m6)})
+                    if problems:
+                        return problems
+        finally:
+            self.arm.obstacles = False
+        return []
+
     def describe(self, scene_features) -> str:
         placement, plan = self.plan(scene_features)
         text = (

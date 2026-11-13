@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import csv
 import queue
 import re
+import secrets
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import serial
 
@@ -16,6 +20,9 @@ COMPACT_POSITION = re.compile(
 SINGLE_POSITION = re.compile(
     r"POS ID ([1-6]):\s*(-?\d+)\s*\(~([-+]?\d+(?:\.\d+)?) deg\)"
 )
+
+WAYPOINT_REPLY = re.compile(r"WAYPOINT_(ACCEPTED|DONE|CANCELLED|REJECTED) id=(\d+)(?: reason=(\w+))?")
+
 
 FAULT_MARKERS = (
     "pair_rejected",
@@ -48,6 +55,49 @@ class RobotSnapshot:
     torque_enabled: bool | None
     gripper_state: str
     fault: str
+    # Acuses de órdenes de movimiento («Moviendo ID…», «PAIR_MOVE_OK…») y GRIPPER_HOLD
+    # recibidos desde la conexión: sirven para esperar la respuesta a una orden nueva y no
+    # tomar la de una anterior.
+    move_acks: int = 0
+    gripper_holds: int = 0
+    gripper_hold_reason: str = ""
+
+
+POWER_TELEMETRY = re.compile(
+    r"POWER_TELEM ms=(\d+) I=(-?\d+(?:,-?\d+){5}) total_ma=(-?\d+) v_min_dv=(-?\d+) v_id=(\d+)"
+)
+CURRENT_MA_PER_UNIT = 6.5  # registro de corriente del STS3215, como en el firmware
+POWER_LOG_COLUMNS = (
+    ["hora", "t_s", "firmware_ms"] + [f"I{motor}_mA" for motor in range(1, 7)]
+    + ["total_mA", "v_min_V", "v_id"] + [f"M{motor}_deg" for motor in range(1, 7)] + ["etapa"]
+)
+
+
+@dataclass(frozen=True)
+class PowerSample:
+    """Una línea de `power telem on`: corriente de M1..M6 (mA; None sin lectura) y el
+    voltaje más bajo del bus (V; None sin lectura)."""
+
+    firmware_ms: int
+    currents_ma: tuple[float | None, ...]
+    total_ma: float
+    v_min: float | None
+    v_id: int
+
+
+def parse_power(line: str) -> PowerSample | None:
+    match = POWER_TELEMETRY.match(line.strip())
+    if match is None:
+        return None
+    raw = [int(value) for value in match.group(2).split(",")]
+    voltage = int(match.group(4))
+    return PowerSample(
+        firmware_ms=int(match.group(1)),
+        currents_ma=tuple(None if value < 0 else value * CURRENT_MA_PER_UNIT for value in raw),
+        total_ma=float(match.group(3)),
+        v_min=None if voltage < 0 else voltage / 10.0,
+        v_id=int(match.group(5)),
+    )
 
 
 def parse_positions(line: str) -> dict[int, float | None]:
@@ -122,6 +172,18 @@ class RobotSerial:
         self.torque_enabled: bool | None = None
         self.gripper_state = "idle"
         self.fault = ""
+        self.move_acks = 0
+        self._waypoint_id = secrets.randbelow(2147483647)
+        self._waypoint_reply: tuple[int, str, str] | None = None
+        self.gripper_holds = 0
+        self.gripper_hold_reason = ""
+        # Medición de la fuente: última muestra, CSV abierto y la etapa que la app anota.
+        self.power_last: PowerSample | None = None
+        self.power_last_at = 0.0
+        self.power_label = ""
+        self._power_file = None
+        self._power_writer = None
+        self._power_started = 0.0
 
     @property
     def connected(self) -> bool:
@@ -170,9 +232,44 @@ class RobotSerial:
             connection.flush()
         self.events.put(RobotEvent(time.monotonic(), "tx", clean))
 
+    def power_reading(self) -> tuple[PowerSample | None, float]:
+        """La última muestra de `power telem` y cuándo llegó (time.monotonic)."""
+        with self.state_lock:
+            return self.power_last, self.power_last_at
+
+    def start_power_log(self, path: Path) -> None:
+        """Graba cada muestra de `power telem on` en `path` (CSV), con los ángulos y la etapa."""
+        self.stop_power_log()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("w", newline="", encoding="utf-8")
+        writer = csv.writer(handle)
+        writer.writerow(POWER_LOG_COLUMNS)
+        with self.state_lock:
+            self._power_file, self._power_writer = handle, writer
+            self._power_started = time.monotonic()
+
+    def stop_power_log(self) -> None:
+        with self.state_lock:
+            handle, self._power_file, self._power_writer = self._power_file, None, None
+        if handle is not None:
+            handle.close()
+
     def clear_fault(self) -> None:
         with self.state_lock:
             self.fault = ""
+
+    def next_waypoint_id(self) -> int:
+        with self.state_lock:
+            self._waypoint_id = self._waypoint_id % 2147483647 + 1
+            self._waypoint_reply = None
+            return self._waypoint_id
+
+    def waypoint_reply(self, waypoint_id: int) -> tuple[str, str] | None:
+        with self.state_lock:
+            reply = self._waypoint_reply
+            if reply is not None and reply[0] == waypoint_id:
+                return reply[1:]
+            return None
 
     def snapshot(self) -> RobotSnapshot:
         with self.state_lock:
@@ -182,6 +279,9 @@ class RobotSerial:
                 torque_enabled=self.torque_enabled,
                 gripper_state=self.gripper_state,
                 fault=self.fault,
+                move_acks=self.move_acks,
+                gripper_holds=self.gripper_holds,
+                gripper_hold_reason=self.gripper_hold_reason,
             )
 
     def stable_pose(
@@ -229,6 +329,24 @@ class RobotSerial:
                 self.fault = f"Conexión serie: {exc}"
             self.events.put(RobotEvent(time.monotonic(), "error", str(exc)))
 
+    def _write_power(self, sample: PowerSample, stamp: float) -> None:
+        """Bajo `state_lock`. Un error de disco corta la grabación, no la conexión."""
+        def number(value, digits=0):
+            return "" if value is None else f"{value:.{digits}f}"
+
+        try:
+            self._power_writer.writerow(
+                [datetime.now().isoformat(timespec="milliseconds"), f"{stamp - self._power_started:.3f}",
+                 sample.firmware_ms]
+                + [number(value) for value in sample.currents_ma]
+                + [number(sample.total_ma), number(sample.v_min, 1), sample.v_id]
+                + [number(self.positions.get(motor), 1) for motor in range(1, 7)]
+                + [self.power_label]
+            )
+            self._power_file.flush()
+        except (OSError, ValueError):
+            self._power_file, self._power_writer = None, None
+
     def _consume_line(self, line: str, stamp: float) -> None:
         values = parse_positions(line)
         with self.state_lock:
@@ -253,9 +371,24 @@ class RobotSerial:
                 self.gripper_state = "opening"
             elif line.startswith("GRIPPER_HOLD"):
                 self.gripper_state = "holding"
+                self.gripper_holds += 1
+                reason = next((part[7:] for part in line.split() if part.startswith("reason=")), "")
+                self.gripper_hold_reason = reason
+            elif line.startswith("Moviendo ID") or line.startswith("PAIR_MOVE_OK"):
+                self.move_acks += 1
+            elif line.startswith("POWER_TELEM "):
+                sample = parse_power(line)
+                if sample is not None:
+                    self.power_last, self.power_last_at = sample, stamp
+                    if self._power_writer is not None:
+                        self._write_power(sample, stamp)
             elif line.startswith("GRIPPER_TORQUE_OFF"):
                 self.gripper_state = "released"
 
+            if reply := WAYPOINT_REPLY.fullmatch(line):
+                reply_id = int(reply[2])
+                if reply_id == self._waypoint_id:
+                    self._waypoint_reply = (reply_id, reply[1], reply[3] or "")
             if is_fault_line(line):
                 self.fault = line
         self.events.put(RobotEvent(stamp, "rx", line))

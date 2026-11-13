@@ -12,3 +12,6 @@ datos/prueba_hardware/
 modelos/**/*.npz
 *.log
 datos/gemelo/
+datos/videos/
+datos/demo/
+datos/corriente/

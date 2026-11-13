@@ -76,6 +76,24 @@ STAGE_GRIPPER_ACTION = {
     "guardado": "close",
 }
 
+# Garra del experto. Las doce etapas vienen de las demostraciones a mano, donde la garra
+# se abría del todo, se cerraba sobre el cubo y se volvía a abrir: ~25 s por tarea en el
+# gemelo. El experto la abre una sola vez, por ángulo y mientras el brazo va. Con M6 en
+# 90° el dedo móvil queda, en la pose de agarre, a 85 mm de la mesa sobre la zona del
+# cubo (35 mm por encima de su cara de arriba; con 137°, a 94 mm), y por ángulo M6 va a
+# ~40°/s en vez de los ~26°/s de «gripper open».
+GRIPPER_GRASP_OPEN = 90.0
+# (acción, grados, cuándo) por etapa; ver Keyframe. Las etapas que no están no mueven la garra.
+# Guardado cierra por presión (no por ángulo) mientras vuelve a Inicio: el firmware cargado no
+# vigila la corriente de «6 <grados>», y si algo quedara entre los dedos el cierre por presión
+# frena al tocarlo. Empieza después del retiro vertical; sin retiro, al llegar a Inicio.
+EXPERT_GRIPPER_STEPS = {
+    "aproximacion_2": ("angle", "open", "before"),
+    "agarre": ("close", None, "after"),
+    "soltado": ("angle", "open", "after"),
+    "guardado": ("close", None, "final"),
+}
+
 PART_NAMES = {"world": "base", "shoulder": "hombro", "upper_arm": "brazo", "lower_arm": "antebrazo",
               "wrist": "muñeca", "gripper": "garra", "jaw": "dedo móvil"}
 
@@ -185,8 +203,14 @@ class IkSolution:
 class Keyframe:
     stage: str
     pose: dict[int, float]      # M1–M5; M6 la decide la acción de garra.
+    # "open" (abrir del todo), "close" (cerrar por presión) o "angle" (M6 a `gripper_degrees`).
     gripper_action: str | None
     via: tuple[dict[int, float], ...] = ()  # Puntos previos: descenso y retiro verticales.
+    gripper_degrees: float | None = None
+    # Cuándo empieza a moverse la garra: "after" (con el brazo ya en la pose), "before"
+    # (al empezar la etapa, mientras el brazo va) o "final" (al empezar el último tramo,
+    # después de los puntos previos).
+    gripper_timing: str = "after"
 
 
 @dataclass(frozen=True)
@@ -536,15 +560,20 @@ class VirtualArm:
             self.step(0.02)
             waited += 0.02
 
-    def open_gripper(self, speed_deg_s=150.0):
+    def open_gripper(self, speed_deg_s=150.0, degrees=GRIPPER_OPEN):
+        self.move_gripper(degrees, speed_deg_s)
+        return "open"
+
+    def move_gripper(self, degrees, speed_deg_s=40.0):
+        """M6 por ángulo, sin cierre por presión."""
         start = self.commanded[6]
-        ticks = max(1, math.ceil(abs(GRIPPER_OPEN - start) / speed_deg_s / 0.02))
+        ticks = max(1, math.ceil(abs(degrees - start) / speed_deg_s / 0.02))
         for tick in range(1, ticks + 1):
-            self.commanded[6] = start + (GRIPPER_OPEN - start) * tick / ticks
+            self.commanded[6] = start + (degrees - start) * tick / ticks
             self._apply_commanded()
             self.step(0.02)
         self.step(0.3)
-        return "open"
+        return "angle"
 
     def close_gripper(self):
         """Cierre por presión como el firmware: pasos de 1,5° cada 40 ms."""
@@ -667,8 +696,10 @@ class PickPlaceExpert:
                              {1: 180.0, 2: 212.0, 3: 90.0, 4: 224.0, 5: 263.0})
 
     def __init__(self, arm: VirtualArm, *, grasp_height=0.028, side_gap=0.003, release_margin=0.03,
-                 push_clearance=0.018, push_extra=0.015, push_step=0.004):
+                 push_clearance=0.010, push_extra=0.006, push_step=0.004, open_degrees=GRIPPER_GRASP_OPEN):
         self.arm = arm
+        # Apertura de la garra para bajar al costado del cubo y para soltarlo (ver GRIPPER_GRASP_OPEN).
+        self.open_degrees = float(open_degrees)
         # El dedo móvil cierra en arco y toca primero cerca de la arista superior
         # del cubo. Con la punta ~22 mm sobre la mesa y 3 mm de holgura contra el
         # dedo fijo, toca el costado ~2 mm por debajo de la arista; con 6 mm de
@@ -682,7 +713,10 @@ class PickPlaceExpert:
         # arrastra). Así el cubo queda apoyado contra el dedo fijo al cerrar, aunque
         # la ubicación erre unos `push_clearance` hacia un lado o `push_extra` hacia
         # el otro. Con push_clearance=None baja directo a `side_gap`, sin empujar.
-        # 18/15 mm: en la simulación aguanta 20 mm de error en cualquier dirección.
+        # 10/6 mm desde el 6/11 (antes 18/15): el usuario vio que la garra arrastraba el cubo
+        # en vez de agarrarlo donde estaba. En la física, 18/15 lo movía ~14 mm y aguantaba
+        # 15 mm de error de ubicación (24/24); 10/6 lo mueve ~5 mm y aguanta 10 mm (24/24)
+        # y 15 mm casi siempre (20/24). Las cámaras reales erran ~7–12 mm.
         self.push_clearance = push_clearance
         self.push_extra = push_extra
         self.push_step = push_step
@@ -777,9 +811,9 @@ class PickPlaceExpert:
         # M6 con que se revisa cada pose: incluye el barrido de abrir o cerrar ahí. El dedo
         # móvil cierra en arco; con solo tres valores se escapaba un choque con la pared del
         # recipiente que pasaba entre 57° y 73°, así que se revisa cada GRIPPER_SWEEP_STEP.
-        opening = _sweep(GRIPPER_CLOSED, GRIPPER_OPEN)
-        gripping = _sweep(GRIPPER_OPEN, GRIPPER_HOLD_ESTIMATE)
-        releasing = tuple(reversed(gripping))
+        opened = self.open_degrees
+        opening = _sweep(GRIPPER_CLOSED, opened)
+        gripping = _sweep(opened, GRIPPER_HOLD_ESTIMATE)
         # Al subir, la base del cubo queda ~grasp_height por debajo del punto pinza.
         holding = (GRIPPER_HOLD_ESTIMATE,)
         clear = dims.container_wall_height + self.grasp_height + self.release_margin
@@ -796,11 +830,11 @@ class PickPlaceExpert:
                                                tilts=TRANSIT_TILTS_DEGREES, grippers=opening)
                 _, approach_1, _ = self._solve("aproximacion_1", at_start, [0.20, 0.17, 0.14], [yaw], approach_2,
                                                tilts=TRANSIT_TILTS_DEGREES)
-                descent = self._vertical(at_start, yaw, hover_height, self.grasp_height, hover, (GRIPPER_OPEN,))
+                descent = self._vertical(at_start, yaw, hover_height, self.grasp_height, hover, (opened,))
                 if pushing:
                     # Abajo, al costado del cubo; después, a la misma altura, hacia el dedo móvil.
                     descent += self._horizontal(at_start, at_cube, yaw, self.grasp_height,
-                                                descent[-1] if descent else hover, (GRIPPER_OPEN,))
+                                                descent[-1] if descent else hover, (opened,))
                 _, lift, lift_height = self._solve("traslado_1", at_cube, [0.15, 0.13, 0.11, clear], [yaw], grasp,
                                                    tilts=TRANSIT_TILTS_DEGREES, grippers=holding)
                 lift_via = self._vertical(at_cube, yaw, self.grasp_height, min(lift_height, hover_height), grasp,
@@ -810,13 +844,55 @@ class PickPlaceExpert:
                 remaining.remove(yaw)
                 if not remaining:
                     raise
-        # Sostenido, el cubo queda apoyado contra el dedo fijo.
-        at_container = beside(placement.container_xy, dims.cube_size / 2)
+        place, warnings = self._place(placement, at_cube(yaw), yaw, lift, clear)
+        start = dict(INITIAL_POSE)
+        stages = {
+            "inicio": (start, ()), "aproximacion_1": (approach_1, ()), "aproximacion_2": (approach_2, ()),
+            "aproximacion_3": (hover, ()), "apertura_sobre_cubo": (hover, ()),
+            "descenso_abierto": (grasp, descent), "agarre": (grasp, ()), "traslado_1": (lift, lift_via),
+            **place, "guardado": (start, place["guardado"]),
+        }
+        keyframes = [self._keyframe(stage, *stages[stage]) for stage in KEYFRAME_STAGES]
+        return Plan(keyframes, warnings + self._check_path(keyframes))
+
+    def _keyframe(self, stage, pose, via) -> Keyframe:
+        action, degrees, timing = EXPERT_GRIPPER_STEPS.get(stage, (None, None, "after"))
+        if degrees == "open":
+            degrees = self.open_degrees
+        if timing == "final" and not via:
+            timing = "after"  # sin retiro vertical, el último tramo sale de la pose de soltado
+        return Keyframe(stage, pose, action, via, degrees, timing)
+
+    def _gripper_after(self, keyframe: Keyframe, gripper: float) -> float:
+        """M6 con que queda la garra después de la acción de `keyframe`."""
+        if keyframe.gripper_action == "open":
+            return GRIPPER_OPEN
+        if keyframe.gripper_action == "close":
+            return GRIPPER_HOLD_ESTIMATE if keyframe.stage == "agarre" else GRIPPER_CLOSED
+        if keyframe.gripper_action == "angle":
+            return float(keyframe.gripper_degrees)
+        return gripper
+
+    def _place(self, placement: Placement, lift_xy, yaw, lift, clear):
+        """Traslado 2 y 3, Soltado y los puntos previos de Guardado: (etapas, avisos).
+
+        `lift_xy` y `yaw`: dónde y con qué rumbo quedó la garra al levantar el cubo;
+        `lift`: la pose de Traslado 1; `clear`: altura del punto pinza que deja la base
+        del cubo sobre el borde del recipiente. Guardado trae solo sus puntos previos."""
+        dims = self.arm.dimensions
+        holding = (GRIPPER_HOLD_ESTIMATE,)
+        releasing = _sweep(GRIPPER_HOLD_ESTIMATE, self.open_degrees)
+
+        def at_container(release_yaw):
+            # Sostenido, el cubo queda apoyado contra el dedo fijo.
+            return (placement.container_xy[0] + dims.cube_size / 2 * math.cos(release_yaw),
+                    placement.container_xy[1] + dims.cube_size / 2 * math.sin(release_yaw))
+
         container_yaws = [placement.container_yaw + k * math.pi / 2 for k in range(4)]
         release_yaw, release, release_height = self._solve(
             "traslado_3", at_container, [clear, clear + 0.015, clear + 0.03], container_yaws, lift,
             grippers=releasing)
-        lift_xy, release_xy = at_cube(yaw), at_container(release_yaw)
+        release_xy = at_container(release_yaw)
         middle = ((lift_xy[0] + release_xy[0]) / 2, (lift_xy[1] + release_xy[1]) / 2)
         _, carry, _ = self._solve("traslado_2", lambda _: middle, [0.17, 0.15, 0.13, clear + 0.01],
                                   [yaw, release_yaw], lift, tilts=TRANSIT_TILTS_DEGREES, grippers=holding)
@@ -825,36 +901,33 @@ class PickPlaceExpert:
             _, retreat, _ = self._solve("retiro", at_container,
                                         [release_height + h for h in (0.08, 0.05, 0.03, 0.015)],
                                         [release_yaw], release, tilts=TRANSIT_TILTS_DEGREES,
-                                        grippers=(GRIPPER_OPEN,))
+                                        grippers=(self.open_degrees,))
             guard_via = (retreat,)
         except PlanningError:
             guard_via = ()  # Sin retiro vertical: el tramo directo se revisa abajo.
             warnings.append("Sin retiro vertical sobre el recipiente; vuelve directo al inicio.")
-
-        start = dict(INITIAL_POSE)
-        stages = {
-            "inicio": (start, ()), "aproximacion_1": (approach_1, ()), "aproximacion_2": (approach_2, ()),
-            "aproximacion_3": (hover, ()), "apertura_sobre_cubo": (hover, ()),
-            "descenso_abierto": (grasp, descent), "agarre": (grasp, ()), "traslado_1": (lift, lift_via),
-            "traslado_2": (carry, ()), "traslado_3": (release, ()), "soltado": (release, ()),
-            "guardado": (start, guard_via),
-        }
-        keyframes = [Keyframe(stage, stages[stage][0], STAGE_GRIPPER_ACTION.get(stage), stages[stage][1])
-                     for stage in KEYFRAME_STAGES]
-        return Plan(keyframes, warnings + self._check_path(keyframes))
+        stages = {"traslado_2": (carry, ()), "traslado_3": (release, ()), "soltado": (release, ()),
+                  "guardado": guard_via}
+        return stages, warnings
 
     def _check_path(self, keyframes):
         """Revisa cada tramo con el M6 que tendrá la garra durante el movimiento."""
         warnings, current, gripper = [], {**INITIAL_POSE, 6: GRIPPER_CLOSED}, GRIPPER_CLOSED
         for keyframe in keyframes:
-            for target in (*keyframe.via, keyframe.pose):
-                pose = {**target, 6: gripper}
-                problems = self.arm.segment_problems(current, pose)
-                if problems:
-                    warnings.append(f"Tramo hacia {keyframe.stage}: " + ", ".join(problems))
-                current = pose
-            gripper = {"open": GRIPPER_OPEN, "close": GRIPPER_HOLD_ESTIMATE if keyframe.stage == "agarre"
-                       else GRIPPER_CLOSED}.get(keyframe.gripper_action, gripper)
+            after = self._gripper_after(keyframe, gripper)
+            targets = (*keyframe.via, keyframe.pose)
+            # Si la garra se mueve mientras va el brazo, esos tramos se revisan con cada M6 del
+            # barrido: cualquier combinación de pose y apertura del recorrido queda revisada.
+            moving_from = {"before": 0, "final": len(targets) - 1}.get(keyframe.gripper_timing, len(targets))
+            for index, target in enumerate(targets):
+                values = _sweep(gripper, after) if index >= moving_from and after != gripper else (gripper,)
+                for m6 in values:
+                    problems = self.arm.segment_problems({**current, 6: m6}, {**target, 6: m6})
+                    if problems:
+                        warnings.append(f"Tramo hacia {keyframe.stage}: " + ", ".join(problems))
+                        break
+                current = {**target, 6: values[-1]}
+            gripper = after
             if gripper != current[6]:
                 problems = self.arm.segment_problems(current, {**current, 6: gripper})
                 if problems:
@@ -897,13 +970,24 @@ def run_episode(arm: VirtualArm, expert: PickPlaceExpert, placement: Placement, 
     start_cube = arm.cube_position()
     gripper_state = "closed_limit"
     for keyframe in plan.keyframes:
-        for waypoint in keyframe.via:
+        # Acá la garra se mueve antes o después del brazo, no a la vez: la física del agarre
+        # es la misma y la revisión de tramos (_check_path) ya cubre el movimiento simultáneo.
+        targets = (*keyframe.via, keyframe.pose)
+        moving_from = {"before": 0, "final": len(targets) - 1}.get(keyframe.gripper_timing, len(targets))
+        for index, waypoint in enumerate(targets):
+            if index == moving_from and keyframe.gripper_action == "angle":
+                gripper_state = arm.move_gripper(keyframe.gripper_degrees)
+            elif index == moving_from and keyframe.gripper_action == "close":
+                gripper_state = arm.close_gripper()
             arm.move_arm(waypoint, speed_deg_s)
-        arm.move_arm(keyframe.pose, speed_deg_s)
-        if keyframe.gripper_action == "open":
+        if moving_from < len(targets):
+            pass  # la garra ya se movió antes del tramo
+        elif keyframe.gripper_action == "open":
             gripper_state = arm.open_gripper()
         elif keyframe.gripper_action == "close":
             gripper_state = arm.close_gripper()
+        elif keyframe.gripper_action == "angle":
+            gripper_state = arm.move_gripper(keyframe.gripper_degrees)
         if keyframe.stage == "agarre" and gripper_state == "holding":
             result.holding_m6 = arm.logical_pose()[6]
         pose = {**keyframe.pose, 6: arm.commanded[6]}

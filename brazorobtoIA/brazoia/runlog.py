@@ -37,6 +37,7 @@ class ExecutionLog:
         self.path.mkdir(exist_ok=False)
         self.metadata_path = self.path / "metadata.json"
         self.started = time.monotonic()
+        self._attempt_started_at: float | None = None
         # Los avisos del ejecutor llegan desde su hilo; la app escribe desde el suyo.
         self._lock = threading.Lock()
         self.data = {
@@ -63,6 +64,9 @@ class ExecutionLog:
                 "target": {str(key): target for key, target in value.target.items()},
                 "groups": [list(group.targets) for group in value.groups],
                 "gripper_action": value.gripper_action,
+                "gripper_degrees": value.gripper_degrees,
+                "gripper_at_group": value.gripper_at_group,
+                "segments": [[item.start, item.end, item.together, item.final] for item in value.segments],
                 "recovery": value.recovery,
             }
         )
@@ -72,16 +76,19 @@ class ExecutionLog:
         stage: str,
         positions: dict[int, float] | None = None,
         gripper_state: str | None = None,
+        *,
+        timings: dict[str, float] | None = None,
     ) -> None:
-        """Etapa terminada, con los ángulos y el estado de la garra al llegar."""
-        self._event(
-            {
-                "kind": "completed",
-                "stage": stage,
-                "joints": _joints(positions),
-                "gripper_state": gripper_state,
-            }
-        )
+        """Etapa terminada, con los ángulos, la garra y los tiempos del ejecutor."""
+        event = {
+            "kind": "completed",
+            "stage": stage,
+            "joints": _joints(positions),
+            "gripper_state": gripper_state,
+        }
+        if timings is not None:
+            event["timings_s"] = {phase: round(seconds, 4) for phase, seconds in timings.items()}
+        self._event(event)
 
     def note(self, kind: str, text: str, stage: str | None = None) -> None:
         """«aviso» del ejecutor o «bloqueo» de una etapa."""
@@ -146,6 +153,54 @@ class ExecutionLog:
             }
             self._write()
 
+    def begin_attempt(self) -> None:
+        with self._lock:
+            self._attempt_started_at = time.monotonic()
+
+    def record_metrics(self, result: str) -> dict:
+        """Guarda un intento. Si se reanuda la tarea, conserva el intento anterior."""
+        with self._lock:
+            if self.data["status"] == "finished":
+                return self.data["attempt_metrics"][-1]
+            metrics = self._metrics(result, self._attempt_started_at)
+            self._attempt_started_at = None
+            self.data.setdefault("attempt_metrics", []).append(metrics)
+            self._write()
+            return metrics
+
+    def _metrics(self, result: str, started_at: float | None = None) -> dict:
+        start = max(0.0, started_at - self.started) if started_at is not None else 0.0
+        end = self._now()
+        stages = []
+        pending = None
+        grasp = release = None
+        for event in self.data["events"]:
+            if event["t"] < start:
+                continue
+            kind, stage = event["kind"], event.get("stage")
+            if kind == "proposal":
+                pending = (stage, event["t"])
+            elif kind in ("completed", "bloqueo", "rechazo") and pending and pending[0] == stage:
+                stages.append({
+                    "stage": stage,
+                    "status": kind,
+                    "seconds": round(event["t"] - pending[1], 4),
+                })
+                pending = None
+                if kind == "completed" and stage == "agarre":
+                    grasp = event["t"] - event.get("timings_s", {}).get("after_grasp", 0.0)
+                if kind == "completed" and stage == "soltado":
+                    release = event["t"]
+        if pending:
+            stages.append({"stage": pending[0], "status": "interrupted",
+                           "seconds": round(end - pending[1], 4)})
+        return {
+            "result": result,
+            "duration_seconds": round(end - start, 4),
+            "transfer_seconds": round(release - grasp, 4) if grasp is not None and release is not None else None,
+            "stages": stages,
+        }
+
     def finish(
         self,
         result: str,
@@ -153,6 +208,11 @@ class ExecutionLog:
         notes: str = "",
     ) -> None:
         with self._lock:
+            if self.data["status"] == "finished":
+                return
+            if self._attempt_started_at is not None or "attempt_metrics" not in self.data:
+                self.data.setdefault("attempt_metrics", []).append(self._metrics(result, self._attempt_started_at))
+                self._attempt_started_at = None
             self.data.update(
                 status="finished",
                 result=result,

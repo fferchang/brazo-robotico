@@ -7,6 +7,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import cv2
@@ -97,7 +98,7 @@ class ExecutionLogTests(unittest.TestCase):
             log.proposal(MotionProposal(1, "aproximacion_1", "Aproximación 1/3", {1: 150.0},
                                         (MotionGroup(((1, 150.0),)),), None))
             log.note("aviso", "Llegada con desvío (motor quieto): M2 a 1,3°")
-            log.completed("aproximacion_1", {1: 150.04}, "open")
+            log.completed("aproximacion_1", {1: 150.04}, "open", timings={"arrival": 0.123456, "total": 0.6})
             passed, checks = verify_cube_in_container(frames, observe(frames))
             log.verification(passed, checks, record["index"])
             log.finish("success", passed)
@@ -110,9 +111,34 @@ class ExecutionLogTests(unittest.TestCase):
             self.assertEqual([event["kind"] for event in data["events"]], ["proposal", "aviso", "completed"])
             self.assertEqual(data["events"][2]["joints"], {"1": 150.04})
             self.assertEqual(data["events"][2]["gripper_state"], "open")
+            self.assertEqual(data["events"][2]["timings_s"], {"arrival": 0.1235, "total": 0.6})
             self.assertTrue(data["verification"]["passed"])
             self.assertEqual(data["verification"]["cameras"]["lateral"]["estado"], "dentro")
             self.assertTrue(data["automatic_verification"])
+
+    def test_metrics_preserve_interrupted_attempt_and_measure_completed_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = ExecutionLog(Path(temporary))
+            log._event({"kind": "proposal", "stage": "agarre", "t": 1.0})
+            log._event({"kind": "bloqueo", "stage": "agarre", "t": 2.0})
+            first = log.record_metrics("interrupted")
+            self.assertIsNone(first["transfer_seconds"])
+            self.assertEqual(first["stages"], [{"stage": "agarre", "status": "bloqueo", "seconds": 1.0}])
+            log._event({"kind": "proposal", "stage": "agarre", "t": 3.0})
+            log._event({"kind": "completed", "stage": "agarre", "t": 5.0,
+                        "timings_s": {"after_grasp": 1.0}})
+            log._event({"kind": "proposal", "stage": "soltado", "t": 6.0})
+            log._event({"kind": "completed", "stage": "soltado", "t": 8.0})
+            with patch("brazoia.runlog.time.monotonic", return_value=log.started + 2.5):
+                log.begin_attempt()
+            with patch.object(log, "_now", return_value=9.0):
+                second = log.record_metrics("success")
+                log.finish("success", True)
+            self.assertEqual(second["duration_seconds"], 6.5)
+            self.assertEqual(second["transfer_seconds"], 4.0)
+            self.assertEqual([stage["seconds"] for stage in second["stages"]], [2.0, 2.0])
+            saved = json.loads(log.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["attempt_metrics"], [first, second])
 
     def test_a_missing_frame_is_noted_and_does_not_stop_the_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

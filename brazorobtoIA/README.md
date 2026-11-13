@@ -204,6 +204,55 @@ las 15 demostraciones de octubre aprueba 14 de 15 finales (antes 8) y ninguna de
 las 90 fotos con el cubo todavía en la mesa. En las ejecuciones reales del
 5/11 había dado «no confirmado» en 2 de los 4 éxitos.
 
+### Movimiento más rápido en el modo geométrico (etapa 1)
+
+En el modo geométrico (la tarea y la demo) la garra ya no copia los gestos de las
+demostraciones a mano. Abre **una sola vez**, a 90° por ángulo, mientras el brazo va
+hacia Aproximación 2: ya no cierra y reabre sobre el cubo. Suelta abriendo a 90° y en
+Guardado cierra por presión mientras vuelve a Inicio, después del retiro vertical.
+Con 90°, en el agarre el dedo móvil queda 35 mm por encima del cubo (con 137°, 43 mm).
+El modelo aprendido y el modo paso a paso sin modo geométrico siguen como antes.
+
+Menos paradas:
+- Los tramos chicos de un mismo punto de paso (hasta 10° por motor) salen seguidos y
+  los motores se mueven a la vez. Solo pasa si todas las combinaciones intermedias
+  pasan las reglas 2D del firmware y los choques del modelo 3D.
+- En los puntos de paso no se espera a que el brazo quede quieto: alcanza con pasar
+  a 1,5°.
+- Cada orden espera el acuse del firmware (`Moviendo ID…` / `PAIR_MOVE_OK`) antes de
+  la siguiente: un rechazo o un AJUSTE SEGURO corta en el acto, y el enfriamiento de
+  50 ms se cuenta desde ese acuse.
+
+Abrir mientras el brazo se mueve se revisa contra la mesa en la pose de partida; si
+no pasa, la garra abre recién al llegar. En Agarre, una garra que cierra hasta el tope
+sin tocar el cubo (`closed_limit`) frena la tarea. En «Mover a mano», abrir M6 por
+ángulo también se revisa contra la mesa (el firmware no lo hace).
+
+En el gemelo, cada vuelta de la demo bajó de ~88 s a ~38 s. Lo que queda lento son
+los movimientos grandes, como salir de Inicio y volver, que todavía van de a dos
+motores: es la etapa 2 (los 5 motores a la vez desde el firmware).
+
+### Demo: el cubo de un lado a otro, sin recipiente
+
+**🔁 DEMO: llevar el cubo de un lado a otro** (pestaña **Tarea automática**)
+saca el recipiente de la tarea y deja el brazo en un loop: pose inicial → agarra
+el cubo → lo lleva al otro punto de la mesa → lo baja hasta casi apoyarlo y lo
+suelta → vuelve a Inicio → repite. Los dos puntos son (−60, −210) y (130, −210) mm
+del marco del modelo (`DEMO_SPOTS` en `brazoia/demo.py`), a 22 y 25 cm de la base y
+dentro de la zona calibrada de las cámaras. En cada vuelta las cámaras buscan el
+cubo y lo llevan al punto más lejano: si alguien lo mueve, la vuelta siguiente lo
+agarra donde esté.
+
+Cada vuelta usa lo mismo que **HACER LA TAREA SOLA** (la calibración de cámaras,
+el planificador, el ejecutor y las reglas del firmware), sin confirmar cada
+etapa. **Vueltas: 0** sigue hasta **Detener** o **EMERGENCIA**. Entre vueltas
+espera 2 s en Inicio y mira dónde quedó el cubo: si quedó a más de 40 mm del
+destino lo anota y sigue, y si no lo ve, se frena. Si una etapa se bloquea, la
+demo se frena y el brazo queda donde estaba. Cada vuelta se registra en
+`datos/demo/` (en el gemelo, `datos/gemelo/demo/`) con la foto de Inicio, la final
+y las de los bloqueos. En el gemelo, la demo saca el recipiente de la mesa: para
+volver a la tarea normal, **Nueva escena**.
+
 ## Simulación física en MuJoCo
 
 `lanzadores/SIMULACION_MUJOCO.bat` ejecuta la tarea completa en un entorno virtual con
@@ -211,6 +260,10 @@ física: el brazo, la mesa, el cubo y el recipiente. Un experto por cinemática
 inversa calcula las doce poses a partir de la posición del cubo y del recipiente,
 sin demostraciones. No abre puertos serie ni usa las cámaras reales. Ver
 `docs/SIMULACION_MUJOCO.md`.
+
+`lanzadores/VIDEO_DEMO.bat` graba un video para exponer: la misma simulación hace la
+tarea seis veces con el cubo y el recipiente en lugares distintos, con la etapa en
+pantalla y un contador. Ver `docs/VIDEO_DEMO.md`.
 
 ## Calibración modelo-brazo
 
@@ -278,3 +331,9 @@ firmware. El botón **Torque brazo OFF** usa `arm torque off` y libera únicamen
 M1–M5; M6 conserva su estado para no soltar el cubo durante la enseñanza. La
 emergencia y el cierre usan `torque off` global y sí desenergizan M1–M6.
 
+
+## Ideas para una v2
+
+`docs/IDEAS_V2.md` junta lo que se podría agregar o mejorar en una próxima versión
+(cámaras, motores y alimentación, garra, montaje, seguridad y aprendizaje), con el
+motivo y el esfuerzo de cada idea.

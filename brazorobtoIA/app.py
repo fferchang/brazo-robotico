@@ -28,8 +28,15 @@ from brazoia.config import (
     validate_stage_gripper,
 )
 from brazoia.dataset import DemonstrationSession, load_successful_demonstrations
-from brazoia.execution import MotionExecutor, MotionProposal, SupervisedExecution
-from brazoia.planner import MotionGroup, build_motion_plan, edge_safe, floor_escape, planning_start
+from brazoia.execution import GRIPPER_CONTACT_RAW, MotionExecutor, MotionProposal, SupervisedExecution
+from brazoia.planner import (
+    MotionGroup,
+    build_motion_plan,
+    edge_safe,
+    floor_escape,
+    gripper_sweep_problem,
+    planning_start,
+)
 from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
 from brazoia.rerun_view import RerunArmView
 from brazoia.robot import RobotEvent, RobotSerial
@@ -37,11 +44,13 @@ from brazoia.runlog import ExecutionLog
 from brazoia.vision import detect_scene, draw_observation, observation_features, verify_cube_in_container
 
 # Avisos del ejecutor que se guardan en el registro de la ejecución (el resto es progreso).
-RUN_LOG_WARNINGS = ("Llegada con desvío", "Garra abierta a")
+RUN_LOG_WARNINGS = ("Llegada con desvío", "Garra abierta a", "La garra sigue consumiendo")
 # Del modelo aprendido solo lo que lo identifica; su metadata trae las predicciones de validación.
 # Vista previa de cada cámara: las dos lado a lado y las pestañas debajo, sin desplazar.
 PREVIEW_SIZE = (480, 272)
 POLICY_SUMMARY_KEYS = ("tipo", "calibracion", "demonstrations", "mean_absolute_error_degrees", "validation_passed")
+# Pausa de la demo en la pose de Inicio entre una vuelta y la siguiente.
+DEMO_PAUSE_SECONDS = 2.0
 
 
 def build_reference_pose_plan(
@@ -75,12 +84,19 @@ def manual_motor_proposal(snapshot, motor_id, target, limits, maximum_age, now):
         raise ValueError("Activá Torque ON antes de mover manualmente.")
     if snapshot.gripper_state == "closing":
         raise ValueError("Esperá a que termine el cierre por presión de la garra.")
-    required = {motor_id} | ({2, 3, 4} if motor_id in (2, 3, 4) else set())
+    required = {motor_id} | ({2, 3, 4} if motor_id in (2, 3, 4, 6) else set())
     for motor in required:
         value = snapshot.positions.get(motor)
         age = now - snapshot.received_at.get(motor, -math.inf)
         if value is None or not math.isfinite(value) or age < 0 or age > maximum_age:
             raise ValueError(f"Falta telemetría reciente de M{motor}.")
+    if motor_id == 6:
+        # El firmware no revisa la mesa al mover M6 por ángulo: abrir una garra horizontal y
+        # baja puede barrerla. Cerrar no se revisa (como en gripper_sweep_problem).
+        problem = gripper_sweep_problem(tuple(snapshot.positions[motor] for motor in (2, 3, 4)),
+                                        snapshot.positions[6], target)
+        if problem:
+            raise ValueError(f"Abrir la garra ahí no pasa la revisión de mesa: {problem}.")
     if motor_id in (2, 3, 4):
         start = tuple(snapshot.positions[motor] for motor in (2, 3, 4))
         end = tuple(target if motor == motor_id else snapshot.positions[motor] for motor in (2, 3, 4))
@@ -95,8 +111,15 @@ class _Rejected(RuntimeError):
     """La tarea autónoma no arranca o no sigue: no se movió nada."""
 
 
+class _CubeLost(RuntimeError):
+    """La física del gemelo detectó que el cubo se separó de la pinza."""
+
+
 class App:
-    def __init__(self, root: tk.Tk, *, gemelo: bool = False):
+    def __init__(self, root: tk.Tk, *, gemelo: bool = False, firmware_waypoints: bool = False):
+        if firmware_waypoints and not gemelo:
+            raise ValueError("Los puntos de firmware solo se prueban con --gemelo.")
+        self.firmware_waypoints = firmware_waypoints
         self.root = root
         self.config = load_config()
         # Gemelo digital: el brazo y las cámaras de MuJoCo detrás del mismo puerto serie
@@ -140,10 +163,20 @@ class App:
         self.demo_status = tk.StringVar(value="Sin demostración activa")
         self.training_status = tk.StringVar(value="Modelo no cargado")
         self.auto_status = tk.StringVar(value="Modo automático detenido")
+        self.demo_run_log: ExecutionLog | None = None
+        self.last_attempt = tk.StringVar(value="Último intento: pendiente")
         # "aprendido": modelo entrenado con demostraciones; "geometrico": cámaras calibradas
         # y cinemática inversa del modelo 3D (brazoia/politica_geometrica.py).
         self.automatic_mode = tk.StringVar(value="geometrico" if self.twin is not None else "aprendido")
         self.geometric_model = None  # (VirtualArm, PickPlaceExpert): armarlo tarda ~1 s
+        self.demo_arm = None         # VirtualArm de la demo (brazoia/demo.py)
+        self.demo_cycles = tk.StringVar(value="0")
+        self.demo_direct = tk.BooleanVar(value=False)
+        # Medición de la fuente (firmware con «power telem»): corriente de M1..M6 y voltaje mínimo.
+        self.power_measure = tk.BooleanVar(value=False)
+        self.power_status = tk.StringVar(value="")
+        self.power_requested_at = 0.0
+        self.power_path: Path | None = None
         self.notes = tk.StringVar()
         self.port = tk.StringVar(value=self.config.port)
         self.rotation_vars = [
@@ -277,6 +310,9 @@ class App:
             ttk.Label(cell, textvariable=self.angle_vars[motor_id], width=7, anchor="e",
                       font=("Segoe UI", 14, "bold")).pack(side="left", padx=(4, 2))
             ttk.Label(cell, text=f"{low:.0f}..{high:.0f}°", foreground="#666").pack(side="left")
+        ttk.Label(readings, textvariable=self.power_status, foreground="#1d4ed8").pack(side="right", padx=(4, 0))
+        ttk.Checkbutton(readings, text="Medir corriente", variable=self.power_measure,
+                        command=self.toggle_power_measurement).pack(side="right", padx=(12, 0))
         ttk.Label(readings, textvariable=self.gripper_status).pack(side="right")
         ttk.Label(readings, textvariable=self.torque_status).pack(side="right", padx=14)
 
@@ -324,8 +360,29 @@ class App:
             foreground="#555",
         ).pack(side="left", padx=8)
 
+        demo = ttk.Frame(tab)
+        demo.pack(fill="x", pady=(8, 0))
+        tk.Button(
+            demo, text="🔁  DEMO: llevar el cubo de un lado a otro", command=self.run_demo_loop,
+            bg="#1d4ed8", fg="white", activebackground="#1e40af", activeforeground="white",
+            font=("Segoe UI", 11, "bold"), padx=14, pady=6,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Label(demo, text="Vueltas:").pack(side="left")
+        ttk.Spinbox(demo, from_=0, to=999, increment=1, width=5,
+                    textvariable=self.demo_cycles).pack(side="left", padx=(3, 8))
+        ttk.Label(
+            demo,
+            text="Sin recipiente: agarra el cubo, lo deja en el otro punto de la mesa y vuelve a Inicio.\n"
+                 "0 vueltas = sigue hasta Detener. Puntos: (−60, −210) y (130, −210) mm del modelo.",
+            foreground="#555",
+        ).pack(side="left")
+
+        if self.twin is not None:
+            ttk.Checkbutton(tab, text="Poses directas (experimental)", variable=self.demo_direct).pack(anchor="w")
+
         ttk.Label(tab, textvariable=self.auto_status, wraplength=1250,
                   font=("Segoe UI", 10, "bold")).pack(fill="x", pady=(8, 6))
+        ttk.Label(tab, textvariable=self.last_attempt, wraplength=1250).pack(fill="x", pady=(0, 6))
 
         lower = ttk.Frame(tab)
         lower.pack(fill="x")
@@ -653,6 +710,11 @@ class App:
         def connected(_result):
             if self.robot is robot:
                 self.connection_status.set(f"Conectado · {robot.port}")
+                try:
+                    # También para «Cerrar garra por presión» de «Mover a mano» (ver GRIPPER_CONTACT_RAW).
+                    robot.send(f"gripper current {GRIPPER_CONTACT_RAW}")
+                except Exception as exc:
+                    self.log(f"No se pudo fijar el umbral de contacto de la garra: {exc}")
 
         def connection_failed(exc):
             if self.robot is robot:
@@ -664,12 +726,62 @@ class App:
             failure=connection_failed,
         )
 
+    def toggle_power_measurement(self) -> None:
+        """Prende o apaga `power telem` y graba las muestras en datos/corriente/*.csv."""
+        robot = self.robot
+        if self.power_measure.get():
+            if robot is None or not robot.connected:
+                self.power_measure.set(False)
+                self.status.set("Conectá el robot para medir la corriente.")
+                return
+            folder = self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "corriente"
+            self.power_path = folder / time.strftime("medicion_%Y%m%d_%H%M%S.csv")
+            try:
+                robot.start_power_log(self.power_path)
+                robot.send("power telem on")
+            except Exception as exc:
+                robot.stop_power_log()
+                self.power_measure.set(False)
+                self.status.set(f"No se pudo empezar a medir: {exc}")
+                return
+            self.power_requested_at = time.monotonic()
+            self.power_status.set("Fuente: esperando datos...")
+            self.log(f"Midiendo la corriente de la fuente en {self.power_path}.")
+            return
+        self._stop_power_measurement(robot)
+
+    def _stop_power_measurement(self, robot: RobotSerial | None) -> None:
+        if robot is not None:
+            try:
+                if robot.connected:
+                    robot.send("power telem off")
+            except Exception:
+                pass
+            robot.stop_power_log()
+        if self.power_path is not None:
+            self.log(f"Medición de corriente guardada en {self.power_path}.")
+        self.power_measure.set(False)
+        self.power_status.set("")
+        self.power_path = None
+
+    def _show_power(self, robot: RobotSerial, now: float) -> None:
+        if not self.power_measure.get():
+            return
+        sample = robot.power_last
+        if sample is None or robot.power_last_at < self.power_requested_at:
+            if now - self.power_requested_at > 1.5:
+                self.power_status.set("Fuente: sin datos (¿firmware sin «power telem»?)")
+            return
+        voltage = "—" if sample.v_min is None else f"{sample.v_min:.1f} V"
+        self.power_status.set(f"Fuente: {sample.total_ma / 1000:.2f} A · mín {voltage}")
+
     def disconnect_robot(self) -> None:
         if self.execution_busy:
             self.status.set("Usá Emergencia y esperá la parada antes de desconectar.")
             return
         robot, self.robot = self.robot, None
         if robot is not None:
+            self._stop_power_measurement(robot)
             self.run_async(robot.disconnect)
         self.connection_status.set("Robot desconectado")
 
@@ -1269,6 +1381,11 @@ class App:
             "close": "\nDespués cerrará la garra por presión.",
             "open": "\nDespués abrirá la garra.",
         }.get(proposal.gripper_action, "")
+        when = "después" if proposal.gripper_at_group is None else "mientras se mueve el brazo"
+        if proposal.gripper_action == "angle":
+            gripper_text = f"\nMoverá la garra (M6) a {proposal.gripper_degrees:.0f}° por ángulo, {when}."
+        elif proposal.gripper_action == "close" and proposal.gripper_at_group is not None:
+            gripper_text = f"\nCerrará la garra por presión {when}."
         if not messagebox.askyesno(
             "Confirmar movimiento",
             f"Etapa: {proposal.label}\n\n{target_text}{gripper_text}\n\n¿Confirmás avanzar?",
@@ -1281,12 +1398,12 @@ class App:
         self.emergency_active = False
         self.auto_status.set(f"Ejecutando: {proposal.label}")
 
-        def success(_result):
+        def success(timings):
             self.execution_busy = False
             if self.execution is None:
                 return
             if self.execution_log is not None:
-                self.execution_log.completed(proposal.stage, *self._robot_state())
+                self.execution_log.completed(proposal.stage, *self._robot_state(), timings=timings)
             self.execution.mark_completed()
             if self.execution.finished:
                 self.verify_final_result()
@@ -1412,10 +1529,13 @@ class App:
 
     def describe_twin_scene(self) -> None:
         placement = self.twin.placement
+        container = (
+            "sin recipiente (demo)" if math.hypot(*placement.container_xy) > 1.0 else
+            f"recipiente en ({placement.container_xy[0] * 1000:.0f}, {placement.container_xy[1] * 1000:.0f}) mm"
+        )
         self.twin_status.set(
             f"Escena: cubo en ({placement.cube_xy[0] * 1000:.0f}, {placement.cube_xy[1] * 1000:.0f}) mm, "
-            f"recipiente en ({placement.container_xy[0] * 1000:.0f}, {placement.container_xy[1] * 1000:.0f}) mm. "
-            "Nada de esto mueve el brazo real."
+            f"{container}. Nada de esto mueve el brazo real."
         )
 
     def new_twin_scene(self) -> None:
@@ -1522,6 +1642,20 @@ class App:
             time.sleep(0.05)
         raise RuntimeError(f"El brazo no se quedó quieto: {reason}")
 
+    def _fresh_pose(self, robot: RobotSerial, timeout: float = 2.0) -> dict[int, float]:
+        """Los seis motores con lecturas de menos de `maximum_telemetry_age_seconds`."""
+        maximum_age = self.config.capture.maximum_telemetry_age_seconds
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._stopped()
+            snapshot = robot.snapshot()
+            now = time.monotonic()
+            if all(motor in snapshot.positions and now - snapshot.received_at.get(motor, -math.inf) <= maximum_age
+                   for motor in range(1, 7)):
+                return dict(snapshot.positions)
+            time.sleep(0.05)
+        raise RuntimeError("Falta telemetría reciente de los seis motores.")
+
     def _scene_problem(self, execution: SupervisedExecution) -> str | None:
         """Lo que impide hacer la tarea sola con esta escena (hoy: el cubo demasiado lejos)."""
         if not hasattr(execution.policy, "summary") or execution.scene_features is None:
@@ -1554,18 +1688,22 @@ class App:
     def _set_auto_status_from_worker(self, text: str) -> None:
         self.worker_messages.put(("ui", (self.auto_status.set, text)))
 
+    def _show_attempt_metrics(self, label: str, metrics: dict) -> None:
+        total = metrics["duration_seconds"]
+        transfer = metrics["transfer_seconds"]
+        text = f"Último intento · {label} · {total:.2f} s total · {metrics['result']}"
+        if transfer is not None:
+            text += f" · {transfer:.2f} s de agarre a soltado"
+        self.worker_messages.put(("ui", (self.last_attempt.set, text)))
+
     def _run_autonomous_stages(self) -> None:
         execution, executor, run_log = self.execution, self.executor, self.execution_log
-        robot = self.robot
         twin = self.twin is not None
         who = "Gemelo" if twin else "Brazo"
+        if run_log is not None:
+            run_log.begin_attempt()
         self.execution_busy = True
         self.auto_status.set(f"{who}: haciendo la tarea solo, sin pedir confirmación. Detener lo corta.")
-
-        def stopped():
-            # execute() limpia el stop_event del ejecutor: la tarea usa su propia señal.
-            if self.auto_stop.is_set():
-                raise RuntimeError("Detenido por el operador.")
 
         def operation():
             # Lo que quedó preparado en el modo paso a paso se planificó desde otra pose.
@@ -1575,66 +1713,19 @@ class App:
                 problem = self._scene_problem(execution)
                 if problem:
                     raise _Rejected("No sigue: " + problem)
-            recoveries = 0
-            while not execution.finished:
-                stopped()
-                snapshot = robot.snapshot()
-                if snapshot.fault:
-                    raise RuntimeError(snapshot.fault)
-                current = self._wait_stable_pose(robot)
-                time.sleep(0.15)  # cuadros tomados con el brazo ya quieto
-                snapshots, observations = self.latest_scene
-                taken_at = time.monotonic()  # planificar la etapa 1 tarda más de 1 s
-                stage = KEYFRAME_STAGES[execution.next_stage_index]
-                try:
-                    if execution.next_stage_index == 1:
-                        # Antes de planificar: con el cubo en el recipiente la ubicación ya falla.
-                        problem = self._inicio_problem(snapshots, observations, taken_at)
-                        if problem:
-                            raise _Rejected("No arranca: " + problem)
-                    proposal = execution.prepare(current, observations)
-                    stage = proposal.stage
-                    if proposal.recovery:
-                        recoveries += 1
-                        if recoveries > 2:
-                            raise _Rejected("el brazo no queda en la pose de Inicio después de dos "
-                                            "recuperaciones (algún motor a más de 2°). Revisalo en «Mover a mano».")
-                    elif proposal.stage_index == 1:
-                        if hasattr(execution.policy, "describe"):
-                            self.worker_messages.put(("log", execution.policy.describe(execution.scene_features)))
-                        self._log_scene(execution, run_log)
-                        problem = self._scene_problem(execution)
-                        if problem:
-                            raise _Rejected("No arranca: " + problem)
-                    step = f"{who} · {proposal.label}: {len(proposal.groups)} tramos"
-                    self.worker_messages.put(("log", step))
-                    self._set_auto_status_from_worker(f"{step} · sin pedir confirmación. Detener lo corta.")
-                    if run_log is not None:
-                        run_log.proposal(proposal)
-                    stopped()
-                    executor.execute(proposal)
-                except Exception as exc:
-                    # Si se vuelve a intentar, se replanifica desde donde quedó el brazo.
-                    execution.cancel_proposal()
-                    if run_log is not None:
-                        if isinstance(exc, _Rejected):
-                            run_log.note("rechazo", str(exc), stage)
-                        else:
-                            run_log.note("bloqueo", str(exc), stage)
-                            self._run_capture(run_log, f"{stage}_bloqueo")
-                    raise
-                if run_log is not None:
-                    run_log.completed(proposal.stage, *self._robot_state())
-                execution.mark_completed()
-                time.sleep(0.3)  # cuadros nuevos para la etapa siguiente
-                if not execution.finished:
-                    self._run_capture(run_log, proposal.stage)
+            self._drive_stages(execution, executor, run_log, who, self._inicio_problem)
             time.sleep(1.0)  # que el cubo se asiente antes de mirar
             return self.twin.cube_in_container() if twin else None
 
         def finished(inside):
             self.execution_busy = False
             self.verify_final_result()
+            if twin:
+                result = "success" if inside else "failed_place"
+            else:
+                result = "posible_exito" if self.automatic_verification else "no_confirmado"
+            if run_log is not None:
+                self._show_attempt_metrics("Recipiente", run_log.record_metrics(result))
             if not twin:
                 return  # verify_final_result pide marcar el resultado humano
             self.twin_scene_used = True
@@ -1645,7 +1736,309 @@ class App:
             self.auto_status.set(f"Gemelo: tarea terminada; el cubo {verdict} en el recipiente. "
                                  "Nueva escena para repetir.")
 
-        self.run_async(operation, success=finished, failure=self._autonomous_failed)
+        def failed(exc):
+            result = "interrupted" if self.auto_stop.is_set() else (
+                "rechazada" if isinstance(exc, _Rejected) else "bloqueada"
+            )
+            if run_log is not None:
+                self._show_attempt_metrics("Recipiente", run_log.record_metrics(result))
+            self._autonomous_failed(exc)
+
+        self.run_async(operation, success=finished, failure=failed)
+
+    def _stopped(self) -> None:
+        # execute() limpia el stop_event del ejecutor: la tarea usa su propia señal.
+        if self.auto_stop.is_set():
+            raise RuntimeError("Detenido por el operador.")
+
+    def _drive_stages(self, execution: SupervisedExecution, executor: MotionExecutor,
+                      run_log: ExecutionLog | None, who: str, inicio_problem, *,
+                      stage_photos: bool = True, prefix: str = "", monitor_cube: bool = False) -> None:
+        """Las etapas que faltan, seguidas y sin confirmación; en un hilo de trabajo.
+
+        `inicio_problem(snapshots, observations, taken_at)`: lo que impide planificar
+        con la foto de Inicio. `stage_photos`: foto al terminar cada etapa (la demo
+        guarda solo la de Inicio y las de los bloqueos). `prefix`: para el estado."""
+        robot = self.robot
+        recoveries = 0
+        settled = False  # la etapa anterior se ejecutó acá y el ejecutor confirmó la llegada
+        while not execution.finished:
+            self._stopped()
+            snapshot = robot.snapshot()
+            if snapshot.fault:
+                raise RuntimeError(snapshot.fault)
+            if settled and execution.next_stage_index > 1:
+                # El ejecutor ya esperó a que el brazo quedara quieto: alcanza con lecturas actuales.
+                current = self._fresh_pose(robot)
+            else:
+                current = self._wait_stable_pose(robot)
+                time.sleep(0.15)  # cuadros tomados con el brazo ya quieto
+            snapshots, observations = self.latest_scene
+            taken_at = time.monotonic()  # planificar la etapa 1 tarda más de 1 s
+            stage = KEYFRAME_STAGES[execution.next_stage_index]
+            try:
+                if execution.next_stage_index == 1:
+                    # Antes de planificar: con el cubo en el recipiente la ubicación ya falla.
+                    problem = inicio_problem(snapshots, observations, taken_at)
+                    if problem:
+                        raise _Rejected("No arranca: " + problem)
+                proposal = execution.prepare(current, observations)
+                stage = proposal.stage
+                if proposal.recovery:
+                    recoveries += 1
+                    if recoveries > 2:
+                        raise _Rejected("el brazo no queda en la pose de Inicio después de dos "
+                                        "recuperaciones (algún motor a más de 2°). Revisalo en «Mover a mano».")
+                elif proposal.stage_index == 1:
+                    if hasattr(execution.policy, "describe"):
+                        self.worker_messages.put(("log", execution.policy.describe(execution.scene_features)))
+                    self._log_scene(execution, run_log)
+                    problem = self._scene_problem(execution)
+                    if problem:
+                        raise _Rejected("No arranca: " + problem)
+                step = f"{prefix}{who} · {proposal.label}: {len(proposal.groups)} tramos"
+                self.worker_messages.put(("log", step))
+                self._set_auto_status_from_worker(f"{step} · sin pedir confirmación. Detener lo corta.")
+                if monitor_cube:
+                    deadline = time.monotonic() + 1.0
+                    while not self.twin.set_cube_monitor_stage(proposal.stage):
+                        self._stopped()
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("No se pudo confirmar el agarre antes de Soltado.")
+                        time.sleep(0.01)
+                    self._stopped()
+                if run_log is not None:
+                    run_log.proposal(proposal)
+                robot.power_label = f"{prefix}{proposal.stage}"  # columna «etapa» de la medición
+                self._stopped()
+                timings = executor.execute(proposal)
+            except Exception as exc:
+                # Si se vuelve a intentar, se replanifica desde donde quedó el brazo.
+                execution.cancel_proposal()
+                if run_log is not None:
+                    if isinstance(exc, _Rejected):
+                        run_log.note("rechazo", str(exc), stage)
+                    else:
+                        run_log.note("bloqueo", str(exc), stage)
+                        self._run_capture(run_log, f"{stage}_bloqueo")
+                raise
+            if run_log is not None:
+                run_log.completed(proposal.stage, *self._robot_state(), timings=timings)
+            execution.mark_completed()
+            settled = not proposal.recovery
+            if stage_photos and not execution.finished:
+                time.sleep(0.3)  # cuadros nuevos, con el brazo ya en la pose
+                self._run_capture(run_log, proposal.stage)
+
+    # ----- demo: el cubo de un punto de la mesa al otro, en loop -----
+    def run_demo_loop(self) -> None:
+        """Lleva el cubo de un punto de la mesa al otro y vuelve, sin recipiente.
+
+        Cada vuelta son las doce etapas de la tarea, sin confirmación, con el destino en
+        la mesa (brazoia/demo.py). Sigue hasta Detener, EMERGENCIA, un bloqueo o las
+        vueltas pedidas. El brazo real necesita la calibración de cámaras de siempre.
+        """
+        if self.execution_busy:
+            self.status.set("Ya hay un movimiento en curso.")
+            return
+        if self.demonstration is not None:
+            self.status.set("Terminá primero la demostración activa.")
+            return
+        if self.execution is not None:
+            if not self.execution.finished:
+                self.status.set("Hay una tarea a medias: terminala o marcá su resultado antes de la demo.")
+                return
+            self.finish_execution("sin_marcar")
+        robot = self.robot
+        if robot is None or not robot.connected or len(self.cameras) != 2:
+            self.status.set("Abrí las dos cámaras y conectá el robot.")
+            return
+        try:
+            cycles = int(self.demo_cycles.get())
+        except (tk.TclError, ValueError):
+            cycles = -1
+        if cycles < 0:
+            self.status.set("Vueltas: un número entero; 0 sigue hasta Detener.")
+            return
+        snapshot = robot.snapshot()
+        m6 = snapshot.positions.get(6)
+        problem = "Leé las posiciones antes de empezar; falta M6." if m6 is None else \
+            validate_stage_gripper("inicio", m6, snapshot.gripper_state)
+        if problem:
+            self.status.set("Para la demo: " + problem)
+            return
+        from brazoia.demo import load_demo_policy
+
+        try:
+            if self.twin is not None and not self.twin_calibration_ready.is_set():
+                raise ValueError("todavía se están calibrando las cámaras virtuales; probá en unos segundos")
+            if self.demo_arm is None:
+                from brazoia.mujoco_sim import VirtualArm
+
+                self.demo_arm = VirtualArm(limits=self.config.limits)
+            policy = load_demo_policy(self.config, arm=self.demo_arm, twin=self.twin is not None)
+        except (OSError, ValueError) as exc:
+            self.status.set(f"Demo: {exc}")
+            return
+        if self.twin is not None:
+            # El recipiente fuera de la mesa y el cubo cerca de uno de los dos puntos.
+            from brazoia.demo import twin_demo_placement
+
+            self.twin.new_scene(twin_demo_placement(self.twin.rng))
+            robot.clear_fault()
+            self.twin_scene_used = True  # la tarea normal necesita «Nueva escena»
+            self.describe_twin_scene()
+        self.auto_stop.clear()
+        self.emergency_active = False
+        self.execution_busy = True
+        self.set_camera_controls_enabled(False)
+        self.executor = MotionExecutor(
+            robot, status=lambda text: self.worker_messages.put(("log", text)), abort=self.auto_stop,
+            firmware_waypoints=self.firmware_waypoints)
+        who = "Gemelo" if self.twin is not None else "Brazo"
+        limit = f"{cycles} vueltas" if cycles else "hasta Detener"
+        self.auto_status.set(f"Demo ({limit}): preparando...")
+        self.log(f"Demo con la calibración de cámaras del {policy.metadata['calibracion']}, {limit}.")
+        done: list[int] = [0]
+        direct = self.twin is not None and self.demo_direct.get()
+
+        def operation():
+            if robot.snapshot().torque_enabled is not True:
+                robot.send("arm torque on")
+                deadline = time.monotonic() + 3.0
+                while robot.snapshot().torque_enabled is not True:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("M1–M5 no confirmaron torque ON.")
+                    time.sleep(0.05)
+            # Telemetría y cuadros nuevos (en el gemelo, de la escena nueva) antes de mirar.
+            time.sleep(self.config.capture.stable_window_seconds + 0.5)
+            self._demo_cycles(policy, who, cycles, done, direct=direct)
+            return done[0]
+
+        def finished(count):
+            self.execution_busy = False
+            self.executor = None
+            self.set_camera_controls_enabled(True)
+            self.auto_status.set(f"Demo terminada: {count} vueltas completas.")
+            self.log(f"Demo terminada: {count} vueltas completas.")
+
+        def failed(exc):
+            self.execution_busy = False
+            self.executor = None
+            self.set_camera_controls_enabled(True)
+            if self.emergency_active:
+                text = "EMERGENCIA: torque OFF solicitado. Sostené el brazo."
+            elif isinstance(exc, _CubeLost):
+                text = f"Demo detenida en la vuelta {done[0] + 1}: {exc}"
+            elif self.auto_stop.is_set():
+                text = f"Demo detenida por el operador después de {done[0]} vueltas completas."
+            elif isinstance(exc, _Rejected):
+                text = f"Demo: {exc} No se movió nada en esa vuelta ({done[0]} vueltas completas)."
+            else:
+                text = (f"Demo BLOQUEADA en la vuelta {done[0] + 1}: {exc}. El brazo quedó donde estaba: "
+                        "revisalo y llevalo a la pose inicial desde «Mover a mano».")
+            self.auto_status.set(text)
+            self.log(text)
+
+        self.run_async(operation, success=finished, failure=failed)
+
+    def _demo_cycles(self, policy, who: str, cycles: int, done: list[int], *, direct: bool = False) -> None:
+        """Las vueltas de la demo, en el hilo de trabajo. `done[0]`: vueltas completas."""
+        from brazoia.demo import ARRIVAL_RADIUS_MM, arrival_error_mm
+
+        root = self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "demo"
+        direct = direct and self.twin is not None
+
+        def carried_cube_check():
+            if self.robot.snapshot().gripper_state == "holding":
+                return self.twin.carried_cube_check(policy.arm)
+            return None
+
+        cycle = 0
+        while not cycles or cycle < cycles:
+            cycle += 1
+            self._stopped()
+            execution = SupervisedExecution(
+                policy, self.config.limits, direct_demo=direct,
+                carried_cube_check=carried_cube_check if direct else None,
+            )
+            run_log = ExecutionLog(root, {
+                "port": self.robot.port, "gemelo": self.twin is not None, "modo": "demo", "vuelta": cycle,
+                "poses_directas": execution.direct_demo,
+                "politica": dict(policy.metadata), "cameras": self.camera_configuration(),
+                "limits": {str(key): list(value) for key, value in self.config.limits.items()},
+            })
+            run_log.data["task"] = "demo_cubo_entre_dos_puntos_de_la_mesa"
+            self.demo_run_log = run_log
+            prefix = f"Demo · vuelta {cycle}{f'/{cycles}' if cycles else ''} · "
+            twin = self.twin
+            if twin is not None:
+                twin.start_cube_monitor(self.auto_stop)
+            try:
+                try:
+                    self._stopped()
+                    self._drive_stages(execution, self.executor, run_log, who, self._demo_inicio_problem,
+                                       stage_photos=False, prefix=prefix, monitor_cube=twin is not None)
+                finally:
+                    loss = twin.finish_cube_monitor() if twin is not None else None
+            except Exception as exc:
+                if loss is not None:
+                    message = (f"El cubo se separó {loss.displacement_mm:.1f} mm de la pinza "
+                               f"en {STAGE_LABELS[loss.stage]}.")
+                    run_log.note("cubo_perdido", message, loss.stage)
+                    run_log.finish("cubo_perdido", False, message)
+                    self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+                    raise _CubeLost(message) from exc
+                result = "interrupted" if self.auto_stop.is_set() else \
+                    "rechazada" if isinstance(exc, _Rejected) else "bloqueada"
+                run_log.finish(result, None, str(exc))
+                self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+                raise
+            # De vuelta en Inicio: ¿dónde quedó el cubo? Si no se lo ve, no hay vuelta siguiente.
+            target = policy.plan(execution.scene_features)[0].container_xy
+            time.sleep(1.0)  # que el cubo se asiente y haya cuadros nuevos
+            snapshots, observations = self.latest_scene
+            record = self._run_capture(run_log, "final")
+            try:
+                error = arrival_error_mm(policy, observation_features(observations), target)
+            except ValueError as exc:
+                run_log.finish("cubo_perdido", False, str(exc))
+                self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+                raise RuntimeError(f"terminó la vuelta pero no encuentro el cubo ({exc})") from exc
+            arrived = error <= ARRIVAL_RADIUS_MM
+            run_log.note("llegada", f"cubo a {error:.0f} mm del destino", "guardado")
+            run_log.finish("success" if arrived else "fuera_de_lugar", arrived,
+                           "" if record is not None else "sin foto final")
+            self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+            done[0] = cycle
+            text = (f"{prefix}el cubo quedó a {error:.0f} mm del destino"
+                    + ("." if arrived else f" (más de {ARRIVAL_RADIUS_MM:.0f} mm: la próxima vuelta lo busca ahí)."))
+            if self.twin is not None:
+                cube = self.twin.cube_position()
+                text += f" Física: a {math.hypot(cube[0] - target[0], cube[1] - target[1]) * 1000:.0f} mm."
+            self.worker_messages.put(("log", text))
+            self._set_auto_status_from_worker(text)
+            self.robot.power_label = f"{prefix}pausa"
+            if not cycles or cycle < cycles:
+                if self.auto_stop.wait(DEMO_PAUSE_SECONDS):
+                    raise RuntimeError("Detenido por el operador.")
+
+    def _demo_inicio_problem(self, snapshots, observations, now: float | None = None) -> str | None:
+        """Para la demo: cuadros actuales y el cubo visto por las dos cámaras."""
+        stale = validate_frame_pair(
+            snapshots,
+            time.monotonic() if now is None else now,
+            maximum_age=self.config.capture.maximum_camera_age_seconds + 0.3,
+            maximum_skew=1.0,
+        )
+        if stale:
+            return f"las cámaras no tienen imagen actual ({stale})"
+        if len(observations) != 2:
+            return "falta la detección de una cámara"
+        missing = [name for name, item in zip(("frontal", "lateral"), observations) if item.red_cube is None]
+        if missing:
+            return f"la cámara {' y '.join(missing)} no ve el cubo rojo."
+        return None
 
     def _autonomous_failed(self, exc) -> None:
         self.execution_busy = False
@@ -1715,6 +2108,7 @@ class App:
             value = snapshot.positions.get(motor_id)
             age = now - snapshot.received_at.get(motor_id, 0.0)
             self.angle_vars[motor_id].set("—" if value is None or age > 0.5 else f"{value:.1f}°")
+        self._show_power(robot, now)
         torque = "ON" if snapshot.torque_enabled is True else "OFF" if snapshot.torque_enabled is False else "desconocido"
         self.torque_status.set(f"Torque: {torque}")
         self.gripper_status.set(f"Garra: {snapshot.gripper_state}")
@@ -1726,8 +2120,11 @@ class App:
                 event: RobotEvent = robot.events.get_nowait()
             except queue.Empty:
                 break
-            if event.kind != "rx" or not event.payload.startswith("POS ID"):
-                self.log(f"[{event.kind}] {event.payload}")
+            if event.kind == "rx" and event.payload.startswith(("POS ID", "POWER_TELEM ")):
+                continue
+            if event.kind == "tx" and event.payload.startswith("power telem"):
+                continue
+            self.log(f"[{event.kind}] {event.payload}")
 
     def _drain_workers(self) -> None:
         for _ in range(100):
@@ -1766,6 +2163,8 @@ class App:
             self.execution_log.finish(
                 "interrupted", self.automatic_verification, "Ventana cerrada"
             )
+        if self.demo_run_log is not None:
+            self.demo_run_log.finish("interrupted", None, "Ventana cerrada")
         for camera in self.cameras:
             camera.close()
         if self.robot is not None:
@@ -1774,6 +2173,7 @@ class App:
                 self.robot.send("torque off")
             except Exception:
                 pass
+            self.robot.stop_power_log()
             self.robot.disconnect()
         if self.twin is not None:
             self.twin.stop()
@@ -1784,7 +2184,8 @@ class App:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    application = App(root, gemelo="--gemelo" in sys.argv)
+    application = App(root, gemelo="--gemelo" in sys.argv,
+                      firmware_waypoints="--puntos-firmware" in sys.argv)
     if "--trayecto-simulado" in sys.argv:
         root.after(200, application.open_trajectory_simulator)
     if "--calibracion" in sys.argv:

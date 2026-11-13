@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <SCServo.h>
 
 static const long DEBUG_BAUD = 115200;
@@ -13,6 +14,17 @@ static const int MAX_ID = 6;
 static const unsigned long AUTO_POS_INTERVAL_MS = 50;
 static const unsigned long MOVE_COOLDOWN_MS = 50;
 static const unsigned long POST_MOVE_REPORT_MS = 200;
+
+// Una sola orden USB por punto. La secuencia se ejecuta de a un grupo
+// verificado, sin superponer dos grupos en el bus de los servos.
+static const uint8_t WAYPOINT_ARM_MOTORS = 5;
+static const unsigned long WAYPOINT_SPACING_MS = 65;
+static const unsigned long WAYPOINT_POLL_MS = 50;
+static const unsigned long WAYPOINT_HEARTBEAT_MS = 750;
+static const unsigned long WAYPOINT_GROUP_TIMEOUT_MS = 5000;
+static const uint8_t WAYPOINT_QUIET_SAMPLES = 3;
+static const float WAYPOINT_POSITION_TOLERANCE = 3.0f;
+static const int WAYPOINT_QUIET_SPEED_RAW = 22; // ~2 grados/s
 
 // Garra M6: 0 grados logicos = cerrada, 140 = abierta.
 // ReadCurrent devuelve unidades crudas del registro del STS3215.
@@ -108,6 +120,27 @@ unsigned long lastMoveCommandMs = 0;
 bool pendingMoveReport = false;
 uint8_t pendingMoveReportId = 0;
 unsigned long pendingMoveReportAtMs = 0;
+struct WaypointGroup {
+  uint8_t size;
+  uint8_t ids[2];
+  float degrees[2];
+};
+
+struct Waypoint {
+  uint32_t id;
+  WaypointGroup groups[WAYPOINT_ARM_MOTORS];
+  uint8_t size;
+  uint8_t nextGroup;
+  uint8_t quietSamples;
+  uint8_t gripperReliefsAtStart;
+  unsigned long heartbeatAtMs;
+  unsigned long groupStartedAtMs;
+  unsigned long lastPollAtMs;
+};
+
+Waypoint waypoint = {};
+uint32_t lastWaypointId = 0;
+bool discardInputLine = false;
 bool gripperClosing = false;
 float gripperCommandDegrees = GRIPPER_OPEN_DEGREES;
 unsigned long gripperCloseStartedMs = 0;
@@ -122,6 +155,11 @@ uint8_t gripperWatchHighSamples = 0;
 uint8_t gripperWatchReadFailures = 0;
 uint8_t gripperReliefs = 0;
 bool gripperTelemetry = false;
+// Medicion de la fuente (12 V / 5 A compartida, que no da para mover todo a la vez):
+// corriente de los seis servos y el voltaje mas bajo, cada POWER_TELEM_INTERVAL_MS.
+bool powerTelemetry = false;
+unsigned long lastPowerTelemMs = 0;
+static const unsigned long POWER_TELEM_INTERVAL_MS = 100;
 
 struct Point2 {
   float x;
@@ -447,10 +485,13 @@ void printHelp() {
   Serial.println(F("  torque on       (todos: M1..M6)"));
   Serial.println(F("  gripper open"));
   Serial.println(F("  gripper close"));
+  Serial.println(F("  waypoint ID N MOTOR GRADOS ... [N MOTOR GRADOS ...]"));
+  Serial.println(F("  waypoint keepalive ID | waypoint cancel ID"));
   Serial.println(F("  gripper stop"));
   Serial.println(F("  gripper release  (torque OFF solamente en M6)"));
   Serial.println(F("  gripper current 92  (aprox. 600 mA)"));
   Serial.println(F("  gripper telem on|off  (corriente de M6 cada 0.1 s al abrir y sostener)"));
+  Serial.println(F("  power telem on|off    (corriente de M1..M6 y voltaje minimo cada 0.1 s)"));
   Serial.println(F("  motor2 90"));
   Serial.println(F("  pair 1 90 2 80"));
   Serial.println(F("  help"));
@@ -674,7 +715,8 @@ bool validatePairTrajectory(
   uint8_t id2,
   float degrees2,
   String &reason,
-  bool allowFloorRisk = false
+  bool allowFloorRisk = false,
+  bool requireKnownGripper = false
 ) {
   float currentM2 = 0.0f;
   float currentM3 = 0.0f;
@@ -688,6 +730,10 @@ bool validatePairTrajectory(
   float targetM3 = currentM3;
   float targetM4 = currentM4;
   float currentM6 = currentGripperDegreesOrNan();
+  if (requireKnownGripper && isnan(currentM6)) {
+    reason = "LECTURA_M6";
+    return false;
+  }
   float targetM6 = currentM6;
   if (id1 == 2) targetM2 = degrees1;
   if (id1 == 3) targetM3 = degrees1;
@@ -901,6 +947,30 @@ void moveServoToDegrees(
   pendingMoveReportAtMs = now + POST_MOVE_REPORT_MS;
 }
 
+void writeSynchronizedPair(
+  uint8_t id1, float degrees1, float current1,
+  uint8_t id2, float degrees2, float current2, u16 speeds[2]
+) {
+  float delta1 = fabsf(degrees1 - current1);
+  float delta2 = fabsf(degrees2 - current2);
+  float maxDelta = max(delta1, delta2);
+
+  u8 ids[2] = {id1, id2};
+  s16 positions[2] = {
+    (s16)degToPos(toRealServoDegrees(id1, degrees1)),
+    (s16)degToPos(toRealServoDegrees(id2, degrees2))
+  };
+  speeds[0] = MOVE_SPEED;
+  speeds[1] = MOVE_SPEED;
+  if (maxDelta > 0.1f) {
+    speeds[0] = (u16)max(80.0f, MOVE_SPEED * delta1 / maxDelta);
+    speeds[1] = (u16)max(80.0f, MOVE_SPEED * delta2 / maxDelta);
+  }
+  u8 accelerations[2] = {MOVE_ACC, MOVE_ACC};
+
+  servoBus.SyncWritePosEx(ids, 2, positions, speeds, accelerations);
+}
+
 void moveTwoServos(
   uint8_t id1,
   float degrees1,
@@ -962,23 +1032,8 @@ void moveTwoServos(
   float current2 = degrees2;
   getCurrentLogicalDegrees(id1, current1);
   getCurrentLogicalDegrees(id2, current2);
-  float delta1 = fabsf(degrees1 - current1);
-  float delta2 = fabsf(degrees2 - current2);
-  float maxDelta = max(delta1, delta2);
-
-  u8 ids[2] = {id1, id2};
-  s16 positions[2] = {
-    (s16)degToPos(toRealServoDegrees(id1, degrees1)),
-    (s16)degToPos(toRealServoDegrees(id2, degrees2))
-  };
-  u16 speeds[2] = {MOVE_SPEED, MOVE_SPEED};
-  if (maxDelta > 0.1f) {
-    speeds[0] = (u16)max(80.0f, MOVE_SPEED * delta1 / maxDelta);
-    speeds[1] = (u16)max(80.0f, MOVE_SPEED * delta2 / maxDelta);
-  }
-  u8 accelerations[2] = {MOVE_ACC, MOVE_ACC};
-
-  servoBus.SyncWritePosEx(ids, 2, positions, speeds, accelerations);
+  u16 speeds[2];
+  writeSynchronizedPair(id1, degrees1, current1, id2, degrees2, current2, speeds);
   lastMoveCommandMs = now;
   pendingMoveReport = false;
 
@@ -1310,10 +1365,278 @@ void processGripperClosing() {
   servoBus.WritePosEx(6, (int)degToPos(realDegrees), 220, 18);
 }
 
+void reportWaypoint(
+  const __FlashStringHelper *event, uint32_t id, const __FlashStringHelper *reason
+) {
+  Serial.print(event);
+  Serial.print(F(" id="));
+  Serial.print(id);
+  if (reason != nullptr) {
+    Serial.print(F(" reason="));
+    Serial.print(reason);
+  }
+  Serial.println();
+}
+
+void finishWaypoint(const __FlashStringHelper *event, const __FlashStringHelper *reason) {
+  const uint32_t id = waypoint.id;
+  waypoint.id = 0;
+  reportWaypoint(event, id, reason);
+}
+
+void skipWaypointSpaces(const char *&cursor) {
+  while (isspace((unsigned char)*cursor)) cursor++;
+}
+
+bool readWaypointInt(const char *&cursor, long minimum, long maximum, long &value) {
+  skipWaypointSpaces(cursor);
+  char *end;
+  errno = 0;
+  value = strtol(cursor, &end, 10);
+  if (end == cursor || errno == ERANGE || (*end && !isspace((unsigned char)*end)) ||
+      value < minimum || value > maximum) {
+    return false;
+  }
+  cursor = end;
+  return true;
+}
+
+bool readWaypointDegrees(const char *&cursor, float &value) {
+  skipWaypointSpaces(cursor);
+  char *end;
+  errno = 0;
+  value = strtof(cursor, &end);
+  if (end == cursor || errno == ERANGE || (*end && !isspace((unsigned char)*end)) ||
+      !isfinite(value)) {
+    return false;
+  }
+  cursor = end;
+  return true;
+}
+
+void handleWaypointLine(const String &line) {
+  bool cancel = line.startsWith("waypoint cancel ");
+  bool keepalive = line.startsWith("waypoint keepalive ");
+  const char *cursor = line.c_str() + (cancel ? 16 : keepalive ? 19 : 9);
+  long id;
+  if (!readWaypointInt(cursor, 1, 2147483647L, id)) {
+    reportWaypoint(F("WAYPOINT_REJECTED"), 0, F("formato"));
+    return;
+  }
+  skipWaypointSpaces(cursor);
+  if (cancel || keepalive) {
+    if (*cursor) {
+      reportWaypoint(F("WAYPOINT_REJECTED"), id, F("formato"));
+    } else if (waypoint.id == (uint32_t)id) {
+      if (cancel) {
+        finishWaypoint(F("WAYPOINT_CANCELLED"), nullptr);
+      } else {
+        waypoint.heartbeatAtMs = millis();
+      }
+    }
+    return;
+  }
+  if (waypoint.id != 0) {
+    reportWaypoint(waypoint.id == (uint32_t)id ? F("WAYPOINT_BUSY") : F("WAYPOINT_REJECTED"),
+                   id, F("ocupado"));
+    return;
+  }
+  if (lastWaypointId == (uint32_t)id) {
+    reportWaypoint(F("WAYPOINT_REJECTED"), id, F("id_repetido"));
+    return;
+  }
+  if (gripperClosing || gripperWatchReadFailures || gripperWatchHardSamples || gripperWatchHighSamples) {
+    reportWaypoint(F("WAYPOINT_REJECTED"), id, F("gripper_activa"));
+    return;
+  }
+
+  Waypoint candidate = {};
+  uint8_t usedMotors = 0;
+  while (*cursor && candidate.size < WAYPOINT_ARM_MOTORS) {
+    long count;
+    if (!readWaypointInt(cursor, 1, 2, count)) {
+      reportWaypoint(F("WAYPOINT_REJECTED"), id, F("formato"));
+      return;
+    }
+    WaypointGroup &group = candidate.groups[candidate.size++];
+    group.size = count;
+    for (uint8_t i = 0; i < group.size; i++) {
+      long motor;
+      float degrees;
+      if (!readWaypointInt(cursor, 1, WAYPOINT_ARM_MOTORS, motor)) {
+        reportWaypoint(F("WAYPOINT_REJECTED"), id, F("motores"));
+        return;
+      }
+      uint8_t mask = 1 << motor;
+      if (usedMotors & mask) {
+        reportWaypoint(F("WAYPOINT_REJECTED"), id, F("motores"));
+        return;
+      }
+      if (!readWaypointDegrees(cursor, degrees)) {
+        reportWaypoint(F("WAYPOINT_REJECTED"), id, F("formato"));
+        return;
+      }
+      float minimum, maximum;
+      if (!getUserAngleLimits(motor, minimum, maximum) || degrees < minimum || degrees > maximum) {
+        reportWaypoint(F("WAYPOINT_REJECTED"), id, F("fuera_de_rango"));
+        return;
+      }
+      usedMotors |= mask;
+      group.ids[i] = motor;
+      group.degrees[i] = degrees;
+    }
+    skipWaypointSpaces(cursor);
+  }
+  if (*cursor || candidate.size == 0) {
+    reportWaypoint(F("WAYPOINT_REJECTED"), id, F("formato"));
+    return;
+  }
+  const unsigned long now = millis();
+  candidate.id = id;
+  candidate.heartbeatAtMs = now;
+  candidate.groupStartedAtMs = now;
+  candidate.lastPollAtMs = now - WAYPOINT_POLL_MS;
+  candidate.gripperReliefsAtStart = gripperReliefs;
+  waypoint = candidate;
+  lastWaypointId = id;
+  reportWaypoint(F("WAYPOINT_ACCEPTED"), id, nullptr);
+}
+
+void processWaypoint() {
+  if (waypoint.id == 0) return;
+
+  unsigned long now = millis();
+  if (now - waypoint.heartbeatAtMs >= WAYPOINT_HEARTBEAT_MS) {
+    finishWaypoint(F("WAYPOINT_REJECTED"), F("heartbeat"));
+    return;
+  }
+  if (now - waypoint.groupStartedAtMs >= WAYPOINT_GROUP_TIMEOUT_MS) {
+    finishWaypoint(F("WAYPOINT_REJECTED"), F("timeout"));
+    return;
+  }
+  if (gripperClosing || gripperReliefs != waypoint.gripperReliefsAtStart ||
+      gripperWatchReadFailures || gripperWatchHardSamples || gripperWatchHighSamples) {
+    finishWaypoint(F("WAYPOINT_REJECTED"), F("gripper_activa"));
+    return;
+  }
+  if (Serial.available() > 0 || inputLine.length() > 0 || discardInputLine ||
+      now - waypoint.lastPollAtMs < WAYPOINT_POLL_MS) {
+    return;
+  }
+  waypoint.lastPollAtMs = now;
+
+  float pose[MAX_ID + 1];
+  bool quiet = true;
+  for (uint8_t id = MIN_ID; id <= MAX_ID; id++) {
+    if (servoBus.FeedBack(id) < 0) {
+      finishWaypoint(F("WAYPOINT_REJECTED"), F("telemetria"));
+      return;
+    }
+    int position = servoBus.ReadPos(-1);
+    int speed = servoBus.ReadSpeed(-1);
+    int moving = servoBus.ReadMove(-1);
+    if (position < 0 || position > 4095 || (moving != 0 && moving != 1)) {
+      finishWaypoint(F("WAYPOINT_REJECTED"), F("telemetria"));
+      return;
+    }
+    int torque = servoBus.readByte(id, SMS_STS_TORQUE_ENABLE);
+    if (torque != 1) {
+      finishWaypoint(F("WAYPOINT_REJECTED"), torque < 0 ? F("telemetria") : F("torque"));
+      return;
+    }
+    if (id == 6 && waypoint.nextGroup > 0 && (moving != 0 || abs(speed) > WAYPOINT_QUIET_SPEED_RAW)) {
+      finishWaypoint(F("WAYPOINT_REJECTED"), F("gripper_activa"));
+      return;
+    }
+    pose[id] = posToDeg(position);
+    quiet = quiet && moving == 0 && abs(speed) <= WAYPOINT_QUIET_SPEED_RAW;
+  }
+
+  if (waypoint.nextGroup > 0) {
+    const WaypointGroup &previous = waypoint.groups[waypoint.nextGroup - 1];
+    for (uint8_t i = 0; i < previous.size; i++) {
+      quiet = quiet && fabsf(pose[previous.ids[i]] - previous.degrees[i]) <= WAYPOINT_POSITION_TOLERANCE;
+    }
+  }
+  if (!quiet) {
+    waypoint.quietSamples = 0;
+    return;
+  }
+  if (waypoint.quietSamples < WAYPOINT_QUIET_SAMPLES) waypoint.quietSamples++;
+  if (waypoint.quietSamples < WAYPOINT_QUIET_SAMPLES) return;
+  if (waypoint.nextGroup == waypoint.size) {
+    finishWaypoint(F("WAYPOINT_DONE"), nullptr);
+    return;
+  }
+
+  const WaypointGroup &group = waypoint.groups[waypoint.nextGroup];
+  const uint8_t last = group.size - 1;
+  String reason;
+  // Para un solo motor, repetir su destino en esta validacion revisa el
+  // recorrido sin aplicar el ajuste automatico de una orden manual.
+  if (!validatePairTrajectory(
+        group.ids[0], group.degrees[0], group.ids[last], group.degrees[last], reason, false, true
+      )) {
+    finishWaypoint(F("WAYPOINT_REJECTED"), F("trayectoria_insegura"));
+    return;
+  }
+  now = millis();
+  if (now - waypoint.heartbeatAtMs >= WAYPOINT_HEARTBEAT_MS) {
+    finishWaypoint(F("WAYPOINT_REJECTED"), F("heartbeat"));
+    return;
+  }
+  if (Serial.available() > 0 || now - lastMoveCommandMs < WAYPOINT_SPACING_MS) return;
+
+  // SyncWrite no devuelve confirmacion individual. Leer ambos destinos
+  // despues evita seguir la secuencia si un servo no recibio la orden.
+  lastMoveCommandMs = now;
+  if (group.size == 2) {
+    u16 speeds[2];
+    writeSynchronizedPair(group.ids[0], group.degrees[0], pose[group.ids[0]],
+                          group.ids[1], group.degrees[1], pose[group.ids[1]], speeds);
+  } else if (servoBus.WritePosEx(group.ids[0], degToPos(group.degrees[0]), MOVE_SPEED, MOVE_ACC) != 1) {
+    finishWaypoint(F("WAYPOINT_REJECTED"), F("escritura"));
+    return;
+  }
+  for (uint8_t i = 0; i < group.size; i++) {
+    if (servoBus.readWord(group.ids[i], SMS_STS_GOAL_POSITION_L) != degToPos(group.degrees[i])) {
+      finishWaypoint(F("WAYPOINT_REJECTED"), F("escritura"));
+      return;
+    }
+  }
+  waypoint.nextGroup++;
+  waypoint.quietSamples = 0;
+  waypoint.groupStartedAtMs = millis();
+  waypoint.lastPollAtMs = waypoint.groupStartedAtMs;
+}
+
 void handleLine(String line) {
   line.trim();
   if (line.length() == 0) {
     return;
+  }
+
+  if (line == "waypoint") {
+    reportWaypoint(F("WAYPOINT_REJECTED"), 0, F("formato"));
+    return;
+  }
+  if (line.startsWith("waypoint ")) {
+    handleWaypointLine(line);
+    return;
+  }
+
+  if (waypoint.id != 0) {
+    if (line.equalsIgnoreCase("arm torque off") || line.equalsIgnoreCase("torque off") ||
+        line.equalsIgnoreCase("gripper stop") || line.equalsIgnoreCase("parar garra") ||
+        line.equalsIgnoreCase("gripper release") || line.equalsIgnoreCase("garra libre")) {
+      finishWaypoint(F("WAYPOINT_CANCELLED"), nullptr);
+    } else if (!line.equalsIgnoreCase("help") && !line.equalsIgnoreCase("scan") &&
+               !line.equalsIgnoreCase("posall") && !line.startsWith("read ") &&
+               !line.equalsIgnoreCase("power telem on") && !line.equalsIgnoreCase("power telem off") &&
+               !line.equalsIgnoreCase("gripper telem on") && !line.equalsIgnoreCase("gripper telem off")) {
+      reportWaypoint(F("WAYPOINT_BUSY"), waypoint.id, F("ocupado"));
+      return;
+    }
   }
 
   if (line.equalsIgnoreCase("help")) {
@@ -1348,6 +1671,14 @@ void handleLine(String line) {
 
   if (line.equalsIgnoreCase("gripper release") || line.equalsIgnoreCase("garra libre")) {
     releaseGripperTorque();
+    return;
+  }
+
+  if (line.equalsIgnoreCase("power telem on") || line.equalsIgnoreCase("power telem off")) {
+    powerTelemetry = line.equalsIgnoreCase("power telem on");
+    lastPowerTelemMs = 0;
+    Serial.print(F("POWER_TELEMETRY="));
+    Serial.println(powerTelemetry ? F("on") : F("off"));
     return;
   }
 
@@ -1513,21 +1844,64 @@ void setup() {
   printHelp();
 }
 
+void processPowerTelemetry() {
+  if (!powerTelemetry) return;
+  unsigned long now = millis();
+  if (now - lastPowerTelemMs < POWER_TELEM_INTERVAL_MS) return;
+  lastPowerTelemMs = now;
+  // Una linea por muestra: corrientes crudas (6,5 mA por unidad, -1 sin lectura),
+  // total en mA y el voltaje mas bajo del bus en decimas de voltio, con su ID.
+  long totalRaw = 0;
+  int minVoltage = 1000;
+  int minVoltageId = 0;
+  Serial.print(F("POWER_TELEM ms="));
+  Serial.print(now);
+  Serial.print(F(" I="));
+  for (uint8_t id = MIN_ID; id <= MAX_ID; id++) {
+    int currentRaw = servoBus.ReadCurrent(id);
+    if (currentRaw == -1 && servoBus.getErr() != 0) {
+      currentRaw = -1;
+    } else {
+      currentRaw = abs(currentRaw);
+      totalRaw += currentRaw;
+    }
+    if (id > MIN_ID) Serial.print(',');
+    Serial.print(currentRaw);
+    int voltage = servoBus.ReadVoltage(id);
+    if (voltage > 0 && voltage < minVoltage) {
+      minVoltage = voltage;
+      minVoltageId = id;
+    }
+  }
+  Serial.print(F(" total_ma="));
+  Serial.print(totalRaw * 6.5f, 0);
+  Serial.print(F(" v_min_dv="));
+  Serial.print(minVoltageId == 0 ? -1 : minVoltage);
+  Serial.print(F(" v_id="));
+  Serial.println(minVoltageId);
+}
+
 void loop() {
   processGripperClosing();
   processGripperWatch();
   autoPrintPositionsIfNeeded();
+  processPowerTelemetry();
   processPendingMoveReport();
 
-  while (Serial.available() > 0) {
+  for (uint8_t count = 0; count < 128 && Serial.available() > 0; count++) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
-      if (inputLine.length() > 0) {
-        handleLine(inputLine);
+      if (!discardInputLine && inputLine.length() > 0) handleLine(inputLine);
+      inputLine = "";
+      discardInputLine = false;
+    } else if (!discardInputLine) {
+      if (inputLine.length() < 128) {
+        inputLine += c;
+      } else {
         inputLine = "";
+        discardInputLine = true;
       }
-    } else {
-      inputLine += c;
     }
   }
+  processWaypoint();
 }

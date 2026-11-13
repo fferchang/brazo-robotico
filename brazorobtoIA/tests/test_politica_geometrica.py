@@ -73,7 +73,8 @@ class GeometricPolicyTests(unittest.TestCase):
         sites = np.array(sites)
         # Los últimos puntos están a la altura del agarre y avanzan en línea recta hacia el dedo móvil.
         level = [index for index, site in enumerate(sites) if abs(site[2] - sites[-1][2]) < 0.001]
-        self.assertGreaterEqual(len(level), 6)
+        push = self.expert.push_clearance + self.expert.push_extra
+        self.assertGreaterEqual(len(level), int(np.ceil(push / self.expert.push_step)) + 1)
         start, end = sites[level[0]][:2], sites[-1][:2]
         travel = float(np.linalg.norm(end - start))
         self.assertAlmostEqual(travel, self.expert.push_clearance + self.expert.push_extra, delta=0.002)
