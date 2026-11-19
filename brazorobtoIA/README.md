@@ -253,6 +253,34 @@ velocidad sigue en 450 (~40°/s). M6 no va por `sync`.
 - `firmware/prueba_pc/` compila el `.ino` en la PC con stubs de Arduino y del bus y
   prueba `sync`; `tests/test_orden_sync.py` lo corre si hay `g++`.
 
+### Guardado preparado de antemano
+
+Preparar Guardado (la vuelta larga a Inicio, con la garra cerrándose en camino) tardaba
+3–7 s después de soltar, con el brazo quieto. Ahora se prepara en segundo plano apenas
+se conoce la escena, desde el destino de Soltado y para cualquier M6 entre 84° y 96°
+(la apertura de Soltado ± la tolerancia con que se acepta). Al terminar Soltado se usa
+solo si M1–M5 quedaron a 1,2° o menos de ese destino y M6 dentro de la banda; si no,
+se replanifica como siempre. El hilo usa su propia copia del modelo 3D.
+`--sin-anticipar` vuelve a prepararlo al final. En el gemelo la espera pasó a 0 s.
+
+### Supervisor de la fuente y velocidad máxima
+
+Con el firmware nuevo, la app manda al conectar la sección `movimiento` de
+`config.json`:
+
+- `velocidad_max` (pasos/s, 100–1000; 450 ≈ 40°/s) y `aceleracion` (10–150) de M1–M5.
+- `guardia_fuente`: cada 100 ms el firmware lee la corriente y el voltaje de los seis
+  servos. Con el voltaje más bajo bajo `lento_v` o la corriente total sobre `lento_ma`,
+  M1–M5 van a la mitad de velocidad, todos por igual y con los mismos destinos (la ruta
+  no cambia), hasta 25%; vuelven de a 25% tras 1 s normal. Bajo `corte_v` o sobre
+  `corte_ma` durante 200 ms el brazo se frena donde está (sin cortar el torque) y la
+  tarea se detiene con `POWER_GUARD_HOLD`. La garra no se frena: tiene su protección.
+- Valores iniciales: 9,5 V / 3000 mA para ir más lento y 8,0 V / 4500 mA para frenar.
+  Son puntos de partida: hay que ajustarlos con «Medir corriente» en el brazo real.
+- En el gemelo, subir `velocidad_max` casi no acelera la vuelta (450: 29,0 s; 1000 con
+  aceleración 90: 26,4 s) y aumenta las frenadas, porque cada paso de 6° termina antes
+  de que llegue la orden siguiente. Por eso queda en 450.
+
 ### Demo: el cubo de un lado a otro, sin recipiente
 
 **🔁 DEMO: llevar el cubo de un lado a otro** (pestaña **Tarea automática**)

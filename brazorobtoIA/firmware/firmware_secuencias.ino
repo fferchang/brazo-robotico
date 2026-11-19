@@ -9,13 +9,56 @@ static const int TX_PIN = 17;
 static const uint16_t MOVE_SPEED = 450;
 static const uint8_t MOVE_ACC = 45;
 // Orden `sync`: hasta cinco motores del brazo (M1..M5) en un solo SyncWritePosEx,
-// con velocidades proporcionales para que lleguen juntos. El techo de velocidad es
-// el mismo de siempre: subirlo es otra prueba, midiendo con `power telem`.
-static const uint16_t SYNC_MAX_SPEED = MOVE_SPEED;
+// con velocidades proporcionales para que lleguen juntos.
 // Nunca 0: en el STS3215 una velocidad 0 significa "maxima".
 static const uint16_t SYNC_MIN_SPEED = 20;
 static const uint8_t SYNC_MAX_MOTORS = 5;
 static const long SYNC_MAX_DURATION_MS = 10000;
+// Velocidad de M1..M5 (`speed max <pasos/s> [acc]`): al arrancar, la de siempre. La PC
+// la cambia al conectar segun config.json. ARM_SPEED_HARD_MAX es el techo absoluto.
+static const uint16_t ARM_SPEED_MIN_SETTING = 100;
+static const uint16_t ARM_SPEED_HARD_MAX = 1000;
+static const uint8_t ARM_ACC_MIN_SETTING = 10;
+static const uint8_t ARM_ACC_MAX_SETTING = 150;
+uint16_t armMaxSpeed = MOVE_SPEED;
+uint8_t armAcc = MOVE_ACC;
+// Supervisor de la fuente (`power guard`): cada POWER_SAMPLE_INTERVAL_MS lee la
+// corriente y el voltaje de los seis servos. Con el voltaje mas bajo bajo el umbral
+// lento o la corriente total sobre el suyo, M1..M5 van a la mitad de velocidad
+// (todos por igual: la ruta no cambia) hasta GUARD_SCALE_MIN_PCT; con el umbral de
+// corte durante GUARD_HOLD_SAMPLES lecturas seguidas, el brazo se frena donde esta.
+// Vuelve de a GUARD_SCALE_STEP_UP_PCT tras GUARD_RECOVER_SAMPLES lecturas normales.
+// Apagado al arrancar: lo prende la app al conectar.
+static const unsigned long POWER_SAMPLE_INTERVAL_MS = 100;
+static const uint8_t GUARD_HOLD_SAMPLES = 2;
+static const uint8_t GUARD_RECOVER_SAMPLES = 10;
+static const uint8_t GUARD_SCALE_MIN_PCT = 25;
+static const uint8_t GUARD_SCALE_STEP_UP_PCT = 25;
+static const float CURRENT_MA_PER_UNIT = 6.5f;
+bool powerGuard = false;
+int guardSlowDv = 95;
+int guardHoldDv = 80;
+long guardSlowMa = 3000;
+long guardHoldMa = 4500;
+uint8_t speedScalePct = 100;
+uint8_t guardHardSamples = 0;
+uint8_t guardGoodSamples = 0;
+// Ultimo destino ordenado a cada motor del brazo y su velocidad sin escalar, para
+// reenviarlos con otra velocidad si el supervisor la cambia en pleno movimiento.
+int armGoal[6] = {0};
+uint16_t armBaseSpeed[6] = {0};
+bool armGoalValid[6] = {false};
+unsigned long armGoalAtMs[6] = {0};
+// Una lectura de la fuente (va antes de las funciones: Arduino declara sus prototipos ahi).
+struct PowerReading {
+  int raw[7];             // por ID 1..6: corriente cruda (6,5 mA por unidad), -1 sin lectura
+  long totalRaw;
+  int minDv;             // decimas de voltio, -1 sin lectura
+  uint8_t minId;
+};
+
+// Solo se reenvia un destino ordenado hace menos de esto: nunca uno viejo.
+static const unsigned long ARM_GOAL_REISSUE_MS = 5000;
 
 static const int MIN_ID = 1;
 static const int MAX_ID = 6;
@@ -164,10 +207,9 @@ uint8_t gripperWatchReadFailures = 0;
 uint8_t gripperReliefs = 0;
 bool gripperTelemetry = false;
 // Medicion de la fuente (12 V / 5 A compartida, que no da para mover todo a la vez):
-// corriente de los seis servos y el voltaje mas bajo, cada POWER_TELEM_INTERVAL_MS.
+// corriente de los seis servos y el voltaje mas bajo, cada POWER_SAMPLE_INTERVAL_MS.
 bool powerTelemetry = false;
 unsigned long lastPowerTelemMs = 0;
-static const unsigned long POWER_TELEM_INTERVAL_MS = 100;
 
 struct Point2 {
   float x;
@@ -486,6 +528,9 @@ void printHelp() {
   Serial.println(F("  pair <id1> <grados1> <id2> <grados2>"));
   Serial.println(F("  sync <ms> <id> <grados> [<id> <grados> ...]  (M1..M5 juntos, ms=0: maxima)"));
   Serial.println(F("  caps"));
+  Serial.println(F("  speed max 450 [45]   (pasos/s y aceleracion de M1..M5; techo 1000)"));
+  Serial.println(F("  power guard on|off"));
+  Serial.println(F("  power guard 95 80 3000 4500  (lento/corte en decimas de V y en mA)"));
   Serial.println(F("  read <id>"));
   Serial.println(F("  scan"));
   Serial.println(F("  posall"));
@@ -586,6 +631,25 @@ bool getCurrentLogicalDegrees(uint8_t id, float &degreesOut) {
   }
   degreesOut = deg;
   return true;
+}
+
+// Velocidad de un motor del brazo con la escala del supervisor de la fuente.
+u16 scaledArmSpeed(float base) {
+  float value = base * speedScalePct / 100.0f;
+  return (u16)max((float)SYNC_MIN_SPEED, value);
+}
+
+void rememberArmGoal(uint8_t id, int position, float baseSpeed) {
+  if (id < 1 || id > 5) return;
+  armGoal[id] = position;
+  armBaseSpeed[id] = (u16)baseSpeed;
+  armGoalValid[id] = true;
+  armGoalAtMs[id] = millis();
+}
+
+// Con el torque cambiado (o el brazo movido a mano) un destino viejo ya no vale.
+void forgetArmGoals() {
+  for (uint8_t id = 1; id <= 5; id++) armGoalValid[id] = false;
 }
 
 bool getCurrentPoseDegrees(float &m2, float &m3, float &m4) {
@@ -951,7 +1015,12 @@ void moveServoToDegrees(
   Serial.println(targetPos);
 
   lastMoveCommandMs = now;
-  servoBus.WritePosEx(id, (int)targetPos, MOVE_SPEED, MOVE_ACC);
+  if (id <= 5) {
+    servoBus.WritePosEx(id, (int)targetPos, scaledArmSpeed(armMaxSpeed), armAcc);
+    rememberArmGoal(id, targetPos, armMaxSpeed);
+  } else {
+    servoBus.WritePosEx(id, (int)targetPos, MOVE_SPEED, MOVE_ACC);
+  }
   pendingMoveReport = true;
   pendingMoveReportId = id;
   pendingMoveReportAtMs = now + POST_MOVE_REPORT_MS;
@@ -970,15 +1039,22 @@ void writeSynchronizedPair(
     (s16)degToPos(toRealServoDegrees(id1, degrees1)),
     (s16)degToPos(toRealServoDegrees(id2, degrees2))
   };
-  speeds[0] = MOVE_SPEED;
-  speeds[1] = MOVE_SPEED;
+  // Un par del brazo usa `speed max`; con M6, la velocidad de siempre. La escala del
+  // supervisor se aplica a los dos por igual para que sigan llegando juntos.
+  bool arm = id1 <= 5 && id2 <= 5;
+  float cruise = arm ? armMaxSpeed : MOVE_SPEED;
+  float base[2] = {cruise, cruise};
   if (maxDelta > 0.1f) {
-    speeds[0] = (u16)max(80.0f, MOVE_SPEED * delta1 / maxDelta);
-    speeds[1] = (u16)max(80.0f, MOVE_SPEED * delta2 / maxDelta);
+    base[0] = max(80.0f, cruise * delta1 / maxDelta);
+    base[1] = max(80.0f, cruise * delta2 / maxDelta);
   }
-  u8 accelerations[2] = {MOVE_ACC, MOVE_ACC};
+  speeds[0] = scaledArmSpeed(base[0]);
+  speeds[1] = scaledArmSpeed(base[1]);
+  u8 accelerations[2] = {arm ? armAcc : MOVE_ACC, arm ? armAcc : MOVE_ACC};
 
   servoBus.SyncWritePosEx(ids, 2, positions, speeds, accelerations);
+  rememberArmGoal(id1, positions[0], base[0]);
+  rememberArmGoal(id2, positions[1], base[1]);
 }
 
 void moveTwoServos(
@@ -1604,9 +1680,12 @@ void processWaypoint() {
     u16 speeds[2];
     writeSynchronizedPair(group.ids[0], group.degrees[0], pose[group.ids[0]],
                           group.ids[1], group.degrees[1], pose[group.ids[1]], speeds);
-  } else if (servoBus.WritePosEx(group.ids[0], degToPos(group.degrees[0]), MOVE_SPEED, MOVE_ACC) != 1) {
+  } else if (servoBus.WritePosEx(group.ids[0], degToPos(group.degrees[0]),
+                                 scaledArmSpeed(armMaxSpeed), armAcc) != 1) {
     finishWaypoint(F("WAYPOINT_REJECTED"), F("escritura"));
     return;
+  } else {
+    rememberArmGoal(group.ids[0], degToPos(group.degrees[0]), armMaxSpeed);
   }
   for (uint8_t i = 0; i < group.size; i++) {
     if (servoBus.readWord(group.ids[i], SMS_STS_GOAL_POSITION_L) != degToPos(group.degrees[i])) {
@@ -1671,8 +1750,8 @@ void rejectSync(const __FlashStringHelper *reason, const char *detail = nullptr)
 
 // sync <dur_ms> <id> <grados> [<id> <grados> ...]
 // Hasta cinco motores de M1..M5, cada uno una vez. dur_ms = 0: el motor que mas
-// recorre va a SYNC_MAX_SPEED y los demas proporcionales; dur_ms > 0: se intenta
-// llegar en ese tiempo, sin pasar SYNC_MAX_SPEED. Fuera de rango o trayectoria
+// recorre va a `speed max` y los demas proporcionales; dur_ms > 0: se intenta
+// llegar en ese tiempo, sin pasar `speed max`. Fuera de rango o trayectoria
 // insegura se rechaza entera: no hay ajustes automaticos.
 void handleSyncLine(const String &line) {
   const char *cursor = line.c_str() + 5;
@@ -1744,11 +1823,12 @@ void handleSyncLine(const String &line) {
   for (uint8_t i = 0; i < count; i++) {
     maxDelta = max(maxDelta, fabsf(degrees[i] - current[i]));
   }
-  float cruise = SYNC_MAX_SPEED;
+  float cruise = armMaxSpeed;
   if (durationMs > 0 && maxDelta > 0.1f) {
     float wanted = (maxDelta / 360.0f * 4095.0f) / (durationMs / 1000.0f);
-    cruise = constrain(wanted, (float)SYNC_MIN_SPEED, (float)SYNC_MAX_SPEED);
+    cruise = constrain(wanted, (float)SYNC_MIN_SPEED, (float)armMaxSpeed);
   }
+  float base[SYNC_MAX_MOTORS];
   u8 syncIds[SYNC_MAX_MOTORS];
   s16 positions[SYNC_MAX_MOTORS];
   u16 speeds[SYNC_MAX_MOTORS];
@@ -1757,10 +1837,14 @@ void handleSyncLine(const String &line) {
     float share = maxDelta > 0.1f ? fabsf(degrees[i] - current[i]) / maxDelta : 1.0f;
     syncIds[i] = ids[i];
     positions[i] = (s16)degToPos(toRealServoDegrees(ids[i], degrees[i]));
-    speeds[i] = (u16)max((float)SYNC_MIN_SPEED, cruise * share);
-    accelerations[i] = MOVE_ACC;
+    base[i] = max((float)SYNC_MIN_SPEED, cruise * share);
+    speeds[i] = scaledArmSpeed(base[i]);
+    accelerations[i] = armAcc;
   }
   servoBus.SyncWritePosEx(syncIds, count, positions, speeds, accelerations);
+  for (uint8_t i = 0; i < count; i++) {
+    rememberArmGoal(ids[i], positions[i], base[i]);
+  }
   lastMoveCommandMs = now;
   pendingMoveReport = false;
 
@@ -1785,7 +1869,9 @@ void printCapabilities() {
   Serial.print(F("FIRMWARE_CAPS sync=1 sync_max_motors="));
   Serial.print(SYNC_MAX_MOTORS);
   Serial.print(F(" sync_max_speed="));
-  Serial.println(SYNC_MAX_SPEED);
+  Serial.print(armMaxSpeed);
+  Serial.print(F(" guard=1 speed_hard_max="));
+  Serial.println(ARM_SPEED_HARD_MAX);
 }
 
 void handleLine(String line) {
@@ -1857,6 +1943,59 @@ void handleLine(String line) {
     return;
   }
 
+  if (line.equalsIgnoreCase("power guard on") || line.equalsIgnoreCase("power guard off")) {
+    powerGuard = line.equalsIgnoreCase("power guard on");
+    guardHardSamples = 0;
+    guardGoodSamples = 0;
+    speedScalePct = 100;
+    Serial.print(F("POWER_GUARD="));
+    Serial.println(powerGuard ? F("on") : F("off"));
+    return;
+  }
+
+  if (line.startsWith("power guard ")) {
+    int slowDv = 0, holdDv = 0;
+    long slowMa = 0, holdMa = 0;
+    char extra = 0;
+    int parsed = sscanf(line.c_str(), "power guard %d %d %ld %ld %c", &slowDv, &holdDv, &slowMa, &holdMa, &extra);
+    if (parsed != 4 || holdDv < 50 || slowDv <= holdDv || slowDv > 130 ||
+        slowMa < 100 || holdMa <= slowMa || holdMa > 10000) {
+      Serial.println(F("POWER_GUARD_REJECTED reason=fuera_de_rango"));
+      return;
+    }
+    guardSlowDv = slowDv;
+    guardHoldDv = holdDv;
+    guardSlowMa = slowMa;
+    guardHoldMa = holdMa;
+    Serial.print(F("POWER_GUARD_LIMITS slow_dv="));
+    Serial.print(guardSlowDv);
+    Serial.print(F(" hold_dv="));
+    Serial.print(guardHoldDv);
+    Serial.print(F(" slow_ma="));
+    Serial.print(guardSlowMa);
+    Serial.print(F(" hold_ma="));
+    Serial.println(guardHoldMa);
+    return;
+  }
+
+  if (line.startsWith("speed max ")) {
+    int speed = 0, acc = MOVE_ACC;
+    char extra = 0;
+    int parsed = sscanf(line.c_str(), "speed max %d %d %c", &speed, &acc, &extra);
+    if ((parsed != 1 && parsed != 2) || speed < ARM_SPEED_MIN_SETTING || speed > ARM_SPEED_HARD_MAX ||
+        acc < ARM_ACC_MIN_SETTING || acc > ARM_ACC_MAX_SETTING) {
+      Serial.println(F("ARM_SPEED_REJECTED reason=fuera_de_rango"));
+      return;
+    }
+    armMaxSpeed = speed;
+    armAcc = acc;
+    Serial.print(F("ARM_SPEED max="));
+    Serial.print(armMaxSpeed);
+    Serial.print(F(" acc="));
+    Serial.println(armAcc);
+    return;
+  }
+
   if (line.equalsIgnoreCase("power telem on") || line.equalsIgnoreCase("power telem off")) {
     powerTelemetry = line.equalsIgnoreCase("power telem on");
     lastPowerTelemMs = 0;
@@ -1886,6 +2025,7 @@ void handleLine(String line) {
 
   if (line.equalsIgnoreCase("arm torque off") || line.equalsIgnoreCase("arm torque on")) {
     bool enable = line.equalsIgnoreCase("arm torque on");
+    forgetArmGoals();
     Serial.println(enable ? F("Activando torque del brazo M1..M5...") : F("Desactivando torque del brazo M1..M5... M6 no cambia."));
     for (uint8_t id = MIN_ID; id <= 5; id++) {
       if (!servoPresent(id)) {
@@ -1908,6 +2048,7 @@ void handleLine(String line) {
 
   if (line.equalsIgnoreCase("torque off") || line.equalsIgnoreCase("torque on")) {
     bool enable = line.equalsIgnoreCase("torque on");
+    forgetArmGoals();
     if (!enable) {
       // Emergencia: que el cierre o la vigilancia no vuelvan a mover M6.
       if (gripperClosing) {
@@ -2036,48 +2177,150 @@ void setup() {
   printHelp();
 }
 
-void processPowerTelemetry() {
-  if (!powerTelemetry) return;
-  unsigned long now = millis();
-  if (now - lastPowerTelemMs < POWER_TELEM_INTERVAL_MS) return;
-  lastPowerTelemMs = now;
-  // Una linea por muestra: corrientes crudas (6,5 mA por unidad, -1 sin lectura),
-  // total en mA y el voltaje mas bajo del bus en decimas de voltio, con su ID.
-  long totalRaw = 0;
-  int minVoltage = 1000;
-  int minVoltageId = 0;
-  Serial.print(F("POWER_TELEM ms="));
-  Serial.print(now);
-  Serial.print(F(" I="));
+void readPower(PowerReading &reading) {
+  reading.totalRaw = 0;
+  reading.minDv = 1000;
+  reading.minId = 0;
   for (uint8_t id = MIN_ID; id <= MAX_ID; id++) {
     int currentRaw = servoBus.ReadCurrent(id);
     if (currentRaw == -1 && servoBus.getErr() != 0) {
       currentRaw = -1;
     } else {
       currentRaw = abs(currentRaw);
-      totalRaw += currentRaw;
+      reading.totalRaw += currentRaw;
     }
-    if (id > MIN_ID) Serial.print(',');
-    Serial.print(currentRaw);
+    reading.raw[id] = currentRaw;
     int voltage = servoBus.ReadVoltage(id);
-    if (voltage > 0 && voltage < minVoltage) {
-      minVoltage = voltage;
-      minVoltageId = id;
+    if (voltage > 0 && voltage < reading.minDv) {
+      reading.minDv = voltage;
+      reading.minId = id;
     }
   }
+  if (reading.minId == 0) reading.minDv = -1;
+}
+
+void printPowerTelemetry(unsigned long now, const PowerReading &reading) {
+  // Una linea por muestra: corrientes crudas (6,5 mA por unidad, -1 sin lectura),
+  // total en mA y el voltaje mas bajo del bus en decimas de voltio, con su ID.
+  Serial.print(F("POWER_TELEM ms="));
+  Serial.print(now);
+  Serial.print(F(" I="));
+  for (uint8_t id = MIN_ID; id <= MAX_ID; id++) {
+    if (id > MIN_ID) Serial.print(',');
+    Serial.print(reading.raw[id]);
+  }
   Serial.print(F(" total_ma="));
-  Serial.print(totalRaw * 6.5f, 0);
+  Serial.print(reading.totalRaw * CURRENT_MA_PER_UNIT, 0);
   Serial.print(F(" v_min_dv="));
-  Serial.print(minVoltageId == 0 ? -1 : minVoltage);
+  Serial.print(reading.minDv);
   Serial.print(F(" v_id="));
-  Serial.println(minVoltageId);
+  Serial.println(reading.minId);
+}
+
+void printGuardState(const char *prefix, const __FlashStringHelper *reason, const PowerReading &reading) {
+  Serial.print(prefix);
+  Serial.print(F(" reason="));
+  Serial.print(reason);
+  Serial.print(F(" v_min_dv="));
+  Serial.print(reading.minDv);
+  Serial.print(F(" total_ma="));
+  Serial.println(reading.totalRaw * CURRENT_MA_PER_UNIT, 0);
+}
+
+// Reenvia los destinos recientes de M1..M5 que todavia no se alcanzaron, con la
+// velocidad escalada: mismos destinos, mismas proporciones entre motores.
+void reissueArmGoals() {
+  u8 ids[5];
+  s16 positions[5];
+  u16 speeds[5];
+  u8 accelerations[5];
+  uint8_t count = 0;
+  unsigned long now = millis();
+  for (uint8_t id = 1; id <= 5; id++) {
+    if (!armGoalValid[id] || now - armGoalAtMs[id] > ARM_GOAL_REISSUE_MS) continue;
+    int position = servoBus.ReadPos(id);
+    if (position < 0 || abs(position - armGoal[id]) <= 8) continue;
+    ids[count] = id;
+    positions[count] = armGoal[id];
+    speeds[count] = scaledArmSpeed(armBaseSpeed[id]);
+    accelerations[count] = armAcc;
+    count++;
+  }
+  if (count > 0) servoBus.SyncWritePosEx(ids, count, positions, speeds, accelerations);
+}
+
+void setSpeedScale(uint8_t pct, const __FlashStringHelper *reason, const PowerReading &reading) {
+  if (pct == speedScalePct) return;
+  speedScalePct = pct;
+  Serial.print(F("POWER_GUARD scale="));
+  Serial.print(speedScalePct);
+  printGuardState("", reason, reading);
+  reissueArmGoals();
+}
+
+// Frena M1..M5 donde estan: el destino pasa a ser la posicion actual. No corta el
+// torque (el brazo no cae ni suelta el cubo). La PC lo toma como falla y se detiene.
+void holdArm(const __FlashStringHelper *reason, const PowerReading &reading) {
+  u8 ids[5];
+  s16 positions[5];
+  u16 speeds[5];
+  u8 accelerations[5];
+  uint8_t count = 0;
+  for (uint8_t id = 1; id <= 5; id++) {
+    int position = servoBus.ReadPos(id);
+    if (position < 0) continue;
+    ids[count] = id;
+    positions[count] = position;
+    speeds[count] = armMaxSpeed;
+    accelerations[count] = armAcc;
+    count++;
+  }
+  if (count > 0) servoBus.SyncWritePosEx(ids, count, positions, speeds, accelerations);
+  forgetArmGoals();
+  if (waypoint.id != 0) finishWaypoint(F("WAYPOINT_CANCELLED"), F("power_guard"));
+  printGuardState("POWER_GUARD_HOLD", reason, reading);
+}
+
+void evaluatePowerGuard(const PowerReading &reading) {
+  long totalMa = (long)(reading.totalRaw * CURRENT_MA_PER_UNIT);
+  bool lowHold = reading.minDv > 0 && reading.minDv < guardHoldDv;
+  bool lowSlow = reading.minDv > 0 && reading.minDv < guardSlowDv;
+  bool hold = lowHold || totalMa > guardHoldMa;
+  bool slow = hold || lowSlow || totalMa > guardSlowMa;
+  const __FlashStringHelper *reason = (lowHold || (lowSlow && !hold)) ? F("voltaje") : F("corriente");
+  if (hold) {
+    if (++guardHardSamples >= GUARD_HOLD_SAMPLES) {
+      guardHardSamples = 0;
+      holdArm(reason, reading);
+    }
+  } else {
+    guardHardSamples = 0;
+  }
+  if (slow) {
+    guardGoodSamples = 0;
+    setSpeedScale(max((int)GUARD_SCALE_MIN_PCT, speedScalePct / 2), reason, reading);
+  } else if (speedScalePct < 100 && ++guardGoodSamples >= GUARD_RECOVER_SAMPLES) {
+    guardGoodSamples = 0;
+    setSpeedScale(min(100, speedScalePct + GUARD_SCALE_STEP_UP_PCT), F("normal"), reading);
+  }
+}
+
+void processPower() {
+  if (!powerTelemetry && !powerGuard) return;
+  unsigned long now = millis();
+  if (now - lastPowerTelemMs < POWER_SAMPLE_INTERVAL_MS) return;
+  lastPowerTelemMs = now;
+  PowerReading reading;
+  readPower(reading);
+  if (powerTelemetry) printPowerTelemetry(now, reading);
+  if (powerGuard) evaluatePowerGuard(reading);
 }
 
 void loop() {
   processGripperClosing();
   processGripperWatch();
   autoPrintPositionsIfNeeded();
-  processPowerTelemetry();
+  processPower();
   processPendingMoveReport();
 
   for (uint8_t count = 0; count < 128 && Serial.available() > 0; count++) {

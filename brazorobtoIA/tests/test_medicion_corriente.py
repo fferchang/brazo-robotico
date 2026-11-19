@@ -25,7 +25,7 @@ class ParsePowerTests(unittest.TestCase):
     def test_firmware_prints_what_the_parser_expects(self) -> None:
         source = FIRMWARE.read_text(encoding="utf-8")
         for fragment in ('F("POWER_TELEM ms=")', 'F(" I=")', 'F(" total_ma=")', 'F(" v_min_dv=")', 'F(" v_id=")',
-                         '"power telem on"', "processPowerTelemetry();"):
+                         '"power telem on"', "processPower();"):
             self.assertIn(fragment, source)
 
 

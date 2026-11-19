@@ -151,6 +151,11 @@ lento son los movimientos grandes (salir de Inicio y volver), que van «en escal
   mensaje, revisión de la recta en el firmware). En el gemelo la vuelta bajó a ~34 s y
   las frenadas entre órdenes de 98% a 43%. Falta cargarlo y medirlo en el brazo real,
   y anticipar la preparación de Guardado (~6 s en el gemelo).
+- Avance (19/11, segunda parte): Guardado se prepara en segundo plano (espera 0 s; vuelta
+  ~28–29 s en el gemelo), hay supervisor de la fuente y `speed max`. Subir la velocidad
+  rinde poco hasta tener una cola de puntos en el firmware: cada paso de 6° termina
+  antes de que llegue la orden siguiente. Lo que más tiempo fijo queda es la garra
+  (~7 s por vuelta).
 
 ### Comunicación más rápida con el ESP32
 Hoy los comandos y la telemetría van como texto a 115200 baudios, con las posiciones

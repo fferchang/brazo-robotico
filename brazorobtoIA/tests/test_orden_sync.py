@@ -23,9 +23,13 @@ HOST_TESTS = ROOT / "firmware" / "prueba_pc"
 class FirmwareConstantsTests(unittest.TestCase):
     def test_sync_constants_match_the_twin(self) -> None:
         source = FIRMWARE.read_text(encoding="utf-8")
-        self.assertRegex(source, r"SYNC_MAX_SPEED = MOVE_SPEED;")
-        self.assertEqual(gemelo.SYNC_MAX_SPEED, gemelo.MOVE_SPEED)
-        for name in ("SYNC_MIN_SPEED", "SYNC_MAX_MOTORS", "SYNC_MAX_DURATION_MS"):
+        self.assertRegex(source, r"uint16_t armMaxSpeed = MOVE_SPEED;")
+        self.assertRegex(source, r"uint8_t armAcc = MOVE_ACC;")
+        self.assertAlmostEqual(float(re.search(r"ARM_GOAL_REISSUE_MS = (\d+);", source).group(1)) / 1000,
+                               gemelo.ARM_GOAL_REISSUE_S)
+        for name in ("SYNC_MIN_SPEED", "SYNC_MAX_MOTORS", "SYNC_MAX_DURATION_MS", "ARM_SPEED_MIN_SETTING",
+                     "ARM_SPEED_HARD_MAX", "ARM_ACC_MIN_SETTING", "ARM_ACC_MAX_SETTING", "GUARD_HOLD_SAMPLES",
+                     "GUARD_RECOVER_SAMPLES", "GUARD_SCALE_MIN_PCT", "GUARD_SCALE_STEP_UP_PCT"):
             match = re.search(rf"{name} = (\d+);", source)
             self.assertIsNotNone(match, name)
             self.assertEqual(int(match.group(1)), getattr(gemelo, name), name)
@@ -58,14 +62,15 @@ class TwinSyncTests(unittest.TestCase):
         return self.twin.log_since(count)
 
     def test_caps_announces_sync(self):
-        self.assertEqual(self.run_line("caps"), ["FIRMWARE_CAPS sync=1 sync_max_motors=5 sync_max_speed=450"])
+        self.assertEqual(self.run_line("caps"), ["FIRMWARE_CAPS sync=1 sync_max_motors=5 sync_max_speed=450 "
+                                                 "guard=1 speed_hard_max=1000"])
 
     def test_five_motors_start_together_with_proportional_speeds(self):
         reply = self.run_line("sync 0 1 190 2 175 3 95 4 182 5 260")
         self.assertEqual(len(reply), 1)
         self.assertTrue(reply[0].startswith("SYNC_MOVE_OK n=5 dur_ms=0 ids=1,2,3,4,5 speeds=450,"), reply)
         speeds = [int(value) for value in reply[0].split("speeds=")[1].split(",")]
-        self.assertTrue(all(gemelo.SYNC_MIN_SPEED <= speed <= gemelo.SYNC_MAX_SPEED for speed in speeds))
+        self.assertTrue(all(gemelo.SYNC_MIN_SPEED <= speed <= gemelo.MOVE_SPEED for speed in speeds))
         self.assertEqual({motor: self.twin.profiles[motor].target for motor in range(1, 6)},
                          {1: 190.0, 2: 175.0, 3: 95.0, 4: 182.0, 5: 260.0})
 

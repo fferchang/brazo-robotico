@@ -39,7 +39,7 @@ from brazoia.planner import (
 )
 from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
 from brazoia.rerun_view import RerunArmView
-from brazoia.robot import RobotEvent, RobotSerial
+from brazoia.robot import RobotEvent, RobotSerial, configure_motion
 from brazoia.runlog import ExecutionLog
 from brazoia.vision import detect_scene, draw_observation, observation_features, verify_cube_in_container
 
@@ -723,9 +723,23 @@ class App:
         self.robot = robot
         self.connection_status.set("Conectando...")
 
-        def connected(_result):
+        def connect_and_configure():
+            robot.connect()
+            # Firmware con `speed max` y `power guard`: la configuración de config.json.
+            return configure_motion(robot, self.config.motion)
+
+        def connected(commands):
             if self.robot is robot:
                 self.connection_status.set(f"Conectado · {robot.port}")
+                motion = self.config.motion
+                if commands:
+                    guard = (f"supervisor de fuente: lento < {motion.guard_slow_volts:g} V o > {motion.guard_slow_ma} mA, "
+                             f"freno < {motion.guard_hold_volts:g} V o > {motion.guard_hold_ma} mA"
+                             if motion.guard_enabled else "supervisor de fuente apagado")
+                    self.log(f"Firmware: velocidad máxima {motion.max_speed} pasos/s, aceleración "
+                             f"{motion.acceleration}; {guard}.")
+                elif robot.sync_supported is False:
+                    self.log("Firmware sin `sync` ni supervisor de fuente: se usa pair, como en la exposición.")
                 try:
                     # También para «Cerrar garra por presión» de «Mover a mano» (ver GRIPPER_CONTACT_RAW).
                     robot.send(f"gripper current {GRIPPER_CONTACT_RAW}")
@@ -737,7 +751,7 @@ class App:
                 self.connection_status.set(f"Error: {exc}")
 
         self.run_async(
-            robot.connect,
+            connect_and_configure,
             success=connected,
             failure=connection_failed,
         )

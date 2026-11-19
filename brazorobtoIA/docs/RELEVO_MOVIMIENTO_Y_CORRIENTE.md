@@ -148,13 +148,14 @@ seguimiento ni ignorados.
 ### Próxima tarea vigente
 
 **19/11, pendiente del usuario:** compilar con Arduino CLI y cargar el firmware
-con `sync` (cerrar antes la app que ocupa el COM), y correr una vuelta de DEMO
-en el brazo real con «Medir corriente». Comparar con la vuelta de referencia del
-6/11 (38,4 s, pico de M6 578 mA, mínimo 10,0 V) y observar las pausas cortas.
-Para volver a `pair` sin recargar: `app.py --sin-sync`. Después siguen, a
-confirmar: anticipar la preparación de Guardado (5,5–7 s en el gemelo), el
-supervisor de tensión y corriente que baja la velocidad de todos los motores
-por igual, y subir `SYNC_MAX_SPEED`.
+con `sync`, `speed max` y `power guard` (cerrar antes la app que ocupa el COM).
+Correr una vuelta de DEMO en el brazo real con «Medir corriente» y comparar con la
+del 6/11 (38,4 s, pico de M6 578 mA, mínimo 10,0 V). Revisar en el CSV si los
+umbrales del supervisor (9,5 V / 3000 mA lento, 8,0 V / 4500 mA freno, en
+`config.json`) quedan con margen sobre lo medido. Para volver atrás sin recargar:
+`app.py --sin-sync --sin-anticipar`; el supervisor se apaga con
+`"guardia_fuente": {"activa": false}`. Ver
+[Anticipación, supervisor y velocidad](#anticipación-supervisor-de-la-fuente-y-velocidad-máxima-1911).
 
 **Anterior (6/11), reemplazada por la orden `sync`:** probar primero en el gemelo
 un límite dinámico. Usar el mismo Traslado 2 y comparar contra el límite
@@ -225,6 +226,69 @@ perfil ≥5°/s) en los que el perfil llegó a 0 antes de la orden siguiente.
   un destino nuevo en movimiento. **No está verificado en el servo real.**
 - Pruebas: `tests/test_orden_sync.py` (18) y la suite completa (285, salvo las
   dos que necesitan `rerun`). No se movió el brazo real ni se cargó firmware.
+
+### Anticipación, supervisor de la fuente y velocidad máxima (19/11)
+
+**Guardado preparado de antemano.** `SupervisedExecution.start_ahead` arranca después
+de preparar la etapa 1: otro hilo prepara Guardado desde el destino de Soltado
+(`policy.predict`), con una copia de la política con su propio `VirtualArm` (0,19 s
+de construir). El plan vale para M6 en 90 ± 6° (`GRIPPER_OPEN_TOLERANCE`): el 3D se
+revisa con muestras de la banda a ≤8° y el 2D con el contorno de la banda o, si
+cruza un límite de forma, el desconocido. `adopt_ahead` lo usa solo con M1–M5 a
+≤1,2° (`ARRIVAL_TOLERANCE`, el desvío que ya se acepta entre tramos) y M6 en la
+banda. Primero se probó lanzarlo al empezar Soltado: la espera bajó de 5,6–7,2 s a
+3,3–4,7 s (preparar tarda 6–8 s en el gemelo y Soltado ~3 s); por eso se adelantó.
+
+**Supervisor de la fuente (`power guard`).** Firmware y gemelo: lectura de corriente
+y voltaje de los seis servos cada 100 ms (la misma de `power telem`, que mantiene su
+formato). Lento: escala de M1–M5 a la mitad por lectura mala hasta 25% y reenvío de
+los destinos pendientes (ordenados hace <5 s) con la velocidad nueva; sube 25% tras
+10 lecturas normales. Corte: 2 lecturas seguidas → destino = posición actual de
+M1–M5, se cancelan puntos de firmware y `POWER_GUARD_HOLD` (falla en la PC). Cambiar
+el torque olvida los destinos. Apagado al arrancar el ESP32: lo prende la app (si un
+servo no responde, las lecturas fallidas trabarían el bucle). El ejecutor estira el
+plazo de llegada con la escala. El gemelo calcula la corriente del brazo con
+`ARM_CURRENT_MA_PER_NM = 85` para dar lo medido el 6/11 (antes daba ~7 A); es una
+calibración con una sola medición.
+
+**Velocidad máxima (`speed max`).** 100–1000 pasos/s y aceleración 10–150, para
+`sync`, `pair` del brazo y órdenes de un motor de M1–M5; M6 sigue igual.
+
+Resultados en el gemelo (DEMO, una vuelta por fila, todas `success`):
+
+| Semilla | Configuración | Vuelta | Dentro del ejecutor | Frenadas | Espera antes de Guardado |
+|---|---|---:|---:|---:|---:|
+| 4 | sync, sin anticipar | 34,0–35,9 s | 24,3–24,6 s | 127/296 | 5,8–7,2 s |
+| 4 | sync, anticipando desde Soltado | 32,79 s | — | 115/295 | 4,73 s |
+| 4 | sync, anticipando desde la etapa 1 | 28,93 s | 24,39 s | 118/295 | 0,00 s |
+| 1 | sync, sin anticipar | 33,12 s | 23,89 s | 124/286 | 5,56 s |
+| 1 | sync, anticipando desde Soltado | 30,97 s | — | 112/287 | 3,34 s |
+| 1 | sync, anticipando desde la etapa 1 | 28,07 s | 23,91 s | 117/287 | 0,00 s |
+| 4 | todo por defecto (+ supervisor, 450/45) | 29,02 s | 24,51 s | 132/296 | 0,00 s |
+| 1 | todo por defecto (+ supervisor, 450/45) | 27,81 s | 23,62 s | 121/287 | 0,01 s |
+| 4 | velocidad 700/45 | 28,06 s | 23,47 s | 145/300 | — |
+| 4 | velocidad 900/45 | 27,92 s | 23,36 s | 156/306 | — |
+| 4 | velocidad 700/90 | 26,72 s | 22,01 s | 164/304 | — |
+| 4 | velocidad 1000/90 | 26,37 s | 21,79 s | 178/306 | — |
+
+- El supervisor no se activó en ninguna vuelta normal. Con una caída inyectada a 9,0 V
+  durante 1,5 s en Traslado 2 bajó a 50% y 25%, Traslado 2 tardó 2,85 s (1,24 s
+  normal), volvió a 100% y la vuelta terminó bien (31,2 s). Con 7,0 V frenó el brazo y
+  la demo se detuvo con `POWER_GUARD_HOLD`.
+- Tarea con recipiente, todo por defecto: 3/3 (35,7 / 32,0 / 33,6 s), con el plan
+  anticipado usado las tres veces y sin avisos (antes, con sync solo: 36,5–39,0 s).
+- **Velocidad:** con 1000/90 la física del gemelo llega a 80–85°/s, pero la vuelta
+  baja solo 2,6 s y las frenadas suben de 45% a 58%. Cada paso de 6° termina antes de
+  que llegue la orden siguiente (telemetría a 20 Hz, acuse y espaciado). Bajar el
+  espaciado a 35 ms (PC) y 25 ms (gemelo) no cambió nada (29,07 s y 26,53 s). Queda
+  en 450. Para aprovechar más velocidad hacen falta pasos más largos por orden (la caja
+  revisada está limitada a 10–12°) o una cola de puntos en el firmware.
+- Lo que más tiempo fijo queda es la garra: ~7,2 s por vuelta (abrir en Aproximación 2
+  1,9 s, cerrar en Agarre 2,8 s + 0,8 s de espera, abrir en Soltado 1,6 s, Guardado
+  0,9 s).
+- Firmware: compila en la PC (`firmware/prueba_pc/`) y pasa sus pruebas, incluidas las
+  del supervisor y `speed max`. El host encontró un `struct` declarado después de los
+  prototipos que genera Arduino: se movió arriba. Sigue sin compilarse con Arduino CLI.
 
 ### Cronómetro y métricas de ejecución
 

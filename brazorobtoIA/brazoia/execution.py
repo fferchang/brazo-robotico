@@ -492,6 +492,8 @@ class MotionExecutor:
         )
         timeout = min(8.0, max(2.0, 0.8 + largest / speed_deg_s))
         deadline = time.monotonic() + timeout
+        # Si el supervisor de la fuente baja la velocidad, el plazo se estira igual.
+        slowest = 1.0
         stable = 0
         stable_since = started
         recent: list[tuple[float, dict[int, float]]] = []
@@ -502,6 +504,10 @@ class MotionExecutor:
             snapshot = self.robot.snapshot()
             if snapshot.fault:
                 raise RuntimeError(snapshot.fault)
+            scale = getattr(snapshot, "speed_scale", 1.0)
+            if 0 < scale < slowest:
+                slowest = scale
+                deadline = started + timeout / slowest
             errors = {
                 motor_id: abs(snapshot.positions.get(motor_id, target + 1000.0) - target)
                 for motor_id, target in targets.items()

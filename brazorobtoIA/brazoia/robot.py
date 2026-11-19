@@ -27,6 +27,9 @@ WAYPOINT_REPLY = re.compile(r"WAYPOINT_(ACCEPTED|DONE|CANCELLED|REJECTED) id=(\d
 FAULT_MARKERS = (
     "pair_rejected",
     "sync_rejected",
+    "power_guard_hold",
+    "power_guard_rejected",
+    "arm_speed_rejected",
     "bloqueado",
     "fuera de rango",
     "sin respuesta",
@@ -62,6 +65,8 @@ class RobotSnapshot:
     move_acks: int = 0
     gripper_holds: int = 0
     gripper_hold_reason: str = ""
+    # Escala de velocidad de M1–M5 del supervisor de la fuente (1.0 = sin limitar).
+    speed_scale: float = 1.0
 
 
 POWER_TELEMETRY = re.compile(
@@ -129,6 +134,33 @@ def parse_positions(line: str) -> dict[int, float | None]:
     return values
 
 
+def motion_commands(motion) -> list[str]:
+    """Órdenes que dejan el firmware como pide `config.movimiento` (MotionConfig)."""
+    commands = [f"speed max {int(motion.max_speed)} {int(motion.acceleration)}"]
+    if motion.guard_enabled:
+        commands.append(f"power guard {round(motion.guard_slow_volts * 10)} {round(motion.guard_hold_volts * 10)} "
+                        f"{int(motion.guard_slow_ma)} {int(motion.guard_hold_ma)}")
+        commands.append("power guard on")
+    else:
+        commands.append("power guard off")
+    return commands
+
+
+def configure_motion(robot: "RobotSerial", motion, timeout: float = 1.5) -> list[str]:
+    """Después de conectar: espera la respuesta a `caps` y, si el firmware tiene `speed max`
+    y `power guard`, le manda la configuración. Con el firmware de la exposición no manda
+    nada. Devuelve las órdenes enviadas."""
+    deadline = time.monotonic() + timeout
+    while not robot.guard_supported and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not robot.guard_supported:
+        return []
+    commands = motion_commands(motion)
+    for command in commands:
+        robot.send(command)
+    return commands
+
+
 def is_fault_line(line: str) -> bool:
     lowered = line.strip().lower()
     if line.startswith("GRABARB_OVERRIDE"):
@@ -181,6 +213,10 @@ class RobotSerial:
         # El firmware con la orden `sync` lo anuncia al responder `caps`; el cargado
         # el 6/11 no responde y queda en False: se sigue usando pair como siempre.
         self.sync_supported = False
+        # `caps` con `guard=1`: el firmware tiene `power guard` y `speed max`.
+        self.guard_supported = False
+        self.speed_scale = 1.0
+        self.arm_max_speed: int | None = None
         # Medición de la fuente: última muestra, CSV abierto y la etapa que la app anota.
         self.power_last: PowerSample | None = None
         self.power_last_at = 0.0
@@ -285,6 +321,7 @@ class RobotSerial:
                 gripper_state=self.gripper_state,
                 fault=self.fault,
                 move_acks=self.move_acks,
+                speed_scale=self.speed_scale,
                 gripper_holds=self.gripper_holds,
                 gripper_hold_reason=self.gripper_hold_reason,
             )
@@ -382,7 +419,21 @@ class RobotSerial:
             elif line.startswith(("Moviendo ID", "PAIR_MOVE_OK", "SYNC_MOVE_OK")):
                 self.move_acks += 1
             elif line.startswith("FIRMWARE_CAPS "):
-                self.sync_supported = "sync=1" in line.split()
+                fields = line.split()
+                self.sync_supported = "sync=1" in fields
+                self.guard_supported = "guard=1" in fields
+            elif line.startswith("POWER_GUARD scale="):
+                try:
+                    self.speed_scale = int(line.split()[1].split("=", 1)[1]) / 100.0
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("POWER_GUARD="):
+                self.speed_scale = 1.0
+            elif line.startswith("ARM_SPEED max="):
+                try:
+                    self.arm_max_speed = int(line.split()[1].split("=", 1)[1])
+                except (IndexError, ValueError):
+                    pass
             elif line.startswith("POWER_TELEM "):
                 sample = parse_power(line)
                 if sample is not None:

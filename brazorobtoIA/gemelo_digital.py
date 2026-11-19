@@ -35,7 +35,7 @@ from brazoia.gemelo import (
     twin_config,
 )
 from brazoia.mujoco_sim import PickPlaceExpert, VirtualArm
-from brazoia.robot import RobotSerial
+from brazoia.robot import RobotSerial, configure_motion
 from brazoia.vision import detect_scene, verify_cube_in_container
 
 
@@ -79,6 +79,7 @@ class TwinSession:
         self.cameras = [VirtualCameraStream(twin, "frontal", 0), VirtualCameraStream(twin, "lateral", 1)]
         self.robot = RobotSerial(VIRTUAL_PORT, config.baud, opener=twin.open_port)
         self.robot.connect()
+        configure_motion(self.robot, config.motion)
         planner_arm = VirtualArm(config.root / "assets", limits=config.limits)
         self.policy = load_twin_policy(config, arm=planner_arm, expert=PickPlaceExpert(planner_arm))
 
