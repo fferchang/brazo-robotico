@@ -53,6 +53,8 @@ def parse_args(argv=None):
     parser.add_argument("--giro-max", type=float, default=5.0,
                         help="Giro máximo de cubo y recipiente en grados (alineados a mano).")
     parser.add_argument("--recalibrar", action="store_true", help="Recalcula la calibración de las cámaras virtuales.")
+    parser.add_argument("--sin-anticipar", action="store_true",
+                        help="Prepara Guardado recién al terminar Soltado, como antes.")
     parser.add_argument("--sin-sync", action="store_true",
                         help="Órdenes de a dos motores (pair), como el firmware de la exposición.")
     args = parser.parse_args(argv)
@@ -66,9 +68,12 @@ def parse_args(argv=None):
 class TwinSession:
     """Gemelo, cámaras virtuales, puerto serie virtual y política geométrica."""
 
-    def __init__(self, config, twin: DigitalTwin, log=print, *, sync_orders: bool = True):
+    def __init__(self, config, twin: DigitalTwin, log=print, *, sync_orders: bool = True,
+                 anticipate: bool = True):
         self.config = config
         self.sync_orders = sync_orders
+        self.anticipate = anticipate
+        self._ahead = None
         self.twin = twin
         self.log = log
         self.cameras = [VirtualCameraStream(twin, "frontal", 0), VirtualCameraStream(twin, "lateral", 1)]
@@ -108,6 +113,43 @@ class TwinSession:
                 return
             time.sleep(0.03)
         raise RuntimeError(message)
+
+    def _run_stages(self, execution, executor, entry, placement) -> None:
+        """Las etapas de un episodio; prepara Guardado mientras se ejecuta Soltado."""
+        self._ahead = None
+        while not execution.finished:
+            current = self.wait_stable()
+            proposal = None
+            if self._ahead is not None and self._ahead.stage_index == execution.next_stage_index:
+                plan, self._ahead = self._ahead, None
+                proposal, detail = execution.adopt_ahead(plan, current)
+                entry.setdefault("anticipada", []).append(detail if proposal is not None else f"descartada: {detail}")
+            if proposal is None:
+                proposal = execution.prepare(current, self.observations())
+            if proposal.stage_index == 1:
+                estimated, _ = self.policy.plan(execution.scene_features)
+                entry["error_cubo_mm"] = round(float(np.linalg.norm(
+                    np.subtract(estimated.cube_xy, placement.cube_xy)) * 1000), 1)
+                entry["error_recipiente_mm"] = round(float(np.linalg.norm(
+                    np.subtract(estimated.container_xy, placement.container_xy)) * 1000), 1)
+                self.log(f"  ubicación estimada: cubo a {entry['error_cubo_mm']:.0f} mm, "
+                         f"recipiente a {entry['error_recipiente_mm']:.0f} mm de la verdadera")
+            if self.anticipate and proposal.stage_index == 1:
+                self._ahead = execution.start_ahead(self.observations())
+            stage_started = time.monotonic()
+            try:
+                executor.execute(proposal)
+            except Exception as exc:
+                entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
+                                        "segundos": round(time.monotonic() - stage_started, 1),
+                                        "error": str(exc)})
+                raise
+            entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
+                                    "segundos": round(time.monotonic() - stage_started, 1),
+                                    "garra": self.robot.snapshot().gripper_state})
+            self.log(f"  {proposal.label:<26} {len(proposal.groups):2d} tramos · "
+                     f"{time.monotonic() - stage_started:4.1f} s")
+            execution.mark_completed()
 
     def wait_stable(self, timeout: float = 4.0) -> dict[int, float]:
         capture = self.config.capture
@@ -149,31 +191,7 @@ class TwinSession:
             executor = MotionExecutor(self.robot, status=lambda text: warnings.append(text)
                                       if text.startswith("Llegada con desvío") else None,
                                       sync_orders=None if self.sync_orders else False)
-            while not execution.finished:
-                current = self.wait_stable()
-                proposal = execution.prepare(current, self.observations())
-                if proposal.stage_index == 1:
-                    estimated, _ = self.policy.plan(execution.scene_features)
-                    entry["error_cubo_mm"] = round(float(np.linalg.norm(
-                        np.subtract(estimated.cube_xy, placement.cube_xy)) * 1000), 1)
-                    entry["error_recipiente_mm"] = round(float(np.linalg.norm(
-                        np.subtract(estimated.container_xy, placement.container_xy)) * 1000), 1)
-                    self.log(f"  ubicación estimada: cubo a {entry['error_cubo_mm']:.0f} mm, "
-                             f"recipiente a {entry['error_recipiente_mm']:.0f} mm de la verdadera")
-                stage_started = time.monotonic()
-                try:
-                    executor.execute(proposal)
-                except Exception as exc:
-                    entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
-                                            "segundos": round(time.monotonic() - stage_started, 1),
-                                            "error": str(exc)})
-                    raise
-                entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
-                                        "segundos": round(time.monotonic() - stage_started, 1),
-                                        "garra": self.robot.snapshot().gripper_state})
-                self.log(f"  {proposal.label:<26} {len(proposal.groups):2d} tramos · "
-                         f"{time.monotonic() - stage_started:4.1f} s")
-                execution.mark_completed()
+            self._run_stages(execution, executor, entry, placement)
             time.sleep(1.0)
             passed, checks = verify_cube_in_container(*self.frames_and_observations())
             entry["verificacion_visual"] = passed
@@ -212,7 +230,8 @@ def main(argv=None) -> int:
         viewer = mujoco.viewer.launch_passive(twin.arm.model, twin.arm.data)
         twin.viewer = viewer
     print("Conectando al firmware virtual...", flush=True)
-    session = TwinSession(config, twin, log=lambda text: print(text, flush=True), sync_orders=not args.sin_sync)
+    session = TwinSession(config, twin, log=lambda text: print(text, flush=True), sync_orders=not args.sin_sync,
+                           anticipate=not args.sin_anticipar)
     results = []
     started = time.monotonic()
     try:

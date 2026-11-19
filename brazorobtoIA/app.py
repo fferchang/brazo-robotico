@@ -122,13 +122,15 @@ def _executor_sync(app) -> bool | None:
 
 class App:
     def __init__(self, root: tk.Tk, *, gemelo: bool = False, firmware_waypoints: bool = False,
-                 sync_orders: bool = True):
+                 sync_orders: bool = True, anticipate: bool = True):
         if firmware_waypoints and not gemelo:
             raise ValueError("Los puntos de firmware solo se prueban con --gemelo.")
         self.firmware_waypoints = firmware_waypoints
         # Usar la orden `sync` (hasta cinco motores por mensaje) si el firmware la anuncia.
         # `--sin-sync` vuelve a pair de a dos, como en la exposición.
         self.sync_orders = sync_orders
+        # Preparar Guardado en segundo plano desde la etapa 1 (SupervisedExecution.start_ahead).
+        self.anticipate = anticipate
         self.root = root
         self.config = load_config()
         # Gemelo digital: el brazo y las cámaras de MuJoCo detrás del mismo puerto serie
@@ -1777,6 +1779,16 @@ class App:
         `inicio_problem(snapshots, observations, taken_at)`: lo que impide planificar
         con la foto de Inicio. `stage_photos`: foto al terminar cada etapa (la demo
         guarda solo la de Inicio y las de los bloqueos). `prefix`: para el estado."""
+        self._ahead = None
+        try:
+            self._drive_stages_loop(execution, executor, run_log, who, inicio_problem,
+                                    stage_photos=stage_photos, prefix=prefix, monitor_cube=monitor_cube)
+        finally:
+            self._ahead = None  # su hilo termina solo y usa su propia copia del modelo 3D
+
+    def _drive_stages_loop(self, execution: SupervisedExecution, executor: MotionExecutor,
+                           run_log: ExecutionLog | None, who: str, inicio_problem, *,
+                           stage_photos: bool, prefix: str, monitor_cube: bool) -> None:
         robot = self.robot
         recoveries = 0
         settled = False  # la etapa anterior se ejecutó acá y el ejecutor confirmó la llegada
@@ -1800,7 +1812,16 @@ class App:
                     problem = inicio_problem(snapshots, observations, taken_at)
                     if problem:
                         raise _Rejected("No arranca: " + problem)
-                proposal = execution.prepare(current, observations)
+                proposal = None
+                if self._ahead is not None and self._ahead.stage_index == execution.next_stage_index:
+                    plan, self._ahead = self._ahead, None
+                    proposal, detail = execution.adopt_ahead(plan, current)
+                    self.worker_messages.put(("log", f"{STAGE_LABELS[stage]}: "
+                                              + (detail if proposal is not None else f"se replanifica ({detail})")))
+                    if run_log is not None:
+                        run_log.note("anticipada" if proposal is not None else "anticipada_descartada", detail, stage)
+                if proposal is None:
+                    proposal = execution.prepare(current, observations)
                 stage = proposal.stage
                 if proposal.recovery:
                     recoveries += 1
@@ -1829,6 +1850,8 @@ class App:
                     run_log.proposal(proposal)
                 robot.power_label = f"{prefix}{proposal.stage}"  # columna «etapa» de la medición
                 self._stopped()
+                if proposal.stage_index == 1 and getattr(self, "anticipate", True):
+                    self._ahead = execution.start_ahead(observations)
                 timings = executor.execute(proposal)
             except Exception as exc:
                 # Si se vuelve a intentar, se replanifica desde donde quedó el brazo.
@@ -2206,7 +2229,8 @@ if __name__ == "__main__":
     root = tk.Tk()
     application = App(root, gemelo="--gemelo" in sys.argv,
                       firmware_waypoints="--puntos-firmware" in sys.argv,
-                      sync_orders="--sin-sync" not in sys.argv)
+                      sync_orders="--sin-sync" not in sys.argv,
+                      anticipate="--sin-anticipar" not in sys.argv)
     if "--trayecto-simulado" in sys.argv:
         root.after(200, application.open_trajectory_simulator)
     if "--calibracion" in sys.argv:

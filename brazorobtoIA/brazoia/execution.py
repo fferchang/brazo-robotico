@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 from itertools import product
 import math
@@ -19,6 +20,7 @@ from .planner import (
     classify_pose,
     edge_safe,
     floor_escape,
+    gripper_envelope,
     gripper_sweep_problem,
     planning_start,
 )
@@ -98,6 +100,14 @@ MOVE_ACK_TIMEOUT_SECONDS = 0.6
 # punto siguiente se manda apenas la telemetría muestra el pasaje: se revisa cada 10 ms
 # en vez de 50 ms para que la orden llegue antes de que el servo empiece a frenar.
 SYNC_POLL_SECONDS = 0.01
+# Preparación anticipada: mientras se ejecuta la etapa anterior, otro hilo prepara la
+# siguiente desde la pose ordenada al final de la anterior. Guardado tardaba 3–7 s en
+# prepararse después de soltar (revisión 3D de la cadena larga con la garra cerrándose).
+ANTICIPATED_STAGES = ("guardado",)
+# Se usa el plan anticipado si, al terminar, M1–M5 quedaron a esto o menos de lo
+# ordenado: la misma tolerancia con que el ejecutor da por llegado un punto, o sea el
+# mismo desvío que ya hay entre dos tramos de un plan normal. Más lejos, se replanifica.
+ANTICIPATED_POSE_TOLERANCE = ARRIVAL_TOLERANCE
 # Al cerrar sobre el cubo, M6 sube a ~1 A durante ~0,5 s y la fuente cae de 11,7 a 7,7 V
 # (medición del 6/11 en el brazo real). Hasta que afloje no se levanta el cubo: con
 # `power telem` prendido, hasta dos muestras seguidas de M6 bajo GRIP_SETTLE_MA; sin
@@ -596,6 +606,8 @@ class SupervisedExecution:
         self.sync_orders = sync_orders
         self.chain_step = SYNC_CHAIN_STEP_DEGREES if sync_orders else CHAIN_STEP_DEGREES
         self.blend_fraction = SYNC_BLEND_FRACTION if sync_orders else BLEND_FRACTION
+        # Solo en la copia que prepara por adelantado (ver start_ahead).
+        self._m6_band: tuple[float, float] | None = None
         self.direct_demo = direct_demo
         self.carried_cube_check = carried_cube_check
         self.limits = limits
@@ -703,7 +715,7 @@ class SupervisedExecution:
             # Los tramos se revisan con la garra como está; abrirla al final agranda su
             # contorno y puede barrer la mesa si queda horizontal y baja. Si se abre mientras
             # va el brazo, los tramos ya se planificaron con la apertura más desfavorable.
-            problem = gripper_sweep_problem((target[2], target[3], target[4]), m6, opening_to)
+            problem = gripper_sweep_problem((target[2], target[3], target[4]), self._m6_low(m6), opening_to)
             if problem:
                 raise ValueError(f"{STAGE_LABELS[stage]}: no se puede abrir la garra ahí: {problem}.")
         at_group = None
@@ -756,22 +768,23 @@ class SupervisedExecution:
         m6_goal = GRIPPER_CLOSED_DEGREES if gripper_degrees is None else gripper_degrees
         for index, waypoint in enumerate(waypoints):
             moving = index >= moving_from
-            if index == moving_from and m6_goal > m6:
+            if index == moving_from and m6_goal > self._m6_low(m6):
                 # Abre mientras va el brazo: la apertura empieza en esta pose, que tiene que
                 # admitir todo el barrido sin acercar la garra a la mesa (con el M6 real, no
                 # con el escape de la garra ya abierta) y quedar sobre el margen con cualquier
                 # apertura. Si no, la garra abre recién al llegar.
                 planar = (start[2], start[3], start[4])
-                problem = gripper_sweep_problem(planar, m6, m6_goal)
+                problem = gripper_sweep_problem(planar, self._m6_low(m6), m6_goal)
                 if problem or floor_escape(planar, None) is not None:
                     raise ValueError(f"no se puede abrir la garra en camino: {problem or 'brazo bajo'}")
             if index == moving_from:
                 gripper_segment = len(segments)
-            planning = {key: value for key, value in start.items() if not (moving and key == 6)}
-            m6_values = (m6,)
+            unknown_m6 = moving or self._rules_m6(m6) is None
+            planning = {key: value for key, value in start.items() if not (unknown_m6 and key == 6)}
+            m6_values = self._static_m6_values(m6)
             if moving:
-                m6_values = self._gripper_sweep_samples(m6, m6_goal)
-            m6_rules = None if moving else m6
+                m6_values = self._sweep_m6_values(m6, m6_goal)
+            m6_rules = None if moving else self._rules_m6(m6)
             last_waypoint = index == len(waypoints) - 1
             chain = None
             if self._chainable(start, waypoint):
@@ -809,6 +822,33 @@ class SupervisedExecution:
             together = len(planned) > 1 and self._together_problem(before, start, m6_rules, m6_values) is None
             segments.append(MotionSegment(first, len(groups), together, last_waypoint))
         return groups, self._blend(groups, segments, initial, gripper_segment, m6, m6_goal), gripper_segment
+
+    # ----- M6 dentro de una banda (preparación anticipada) -----
+    # Sin banda, M6 es la lectura actual. Con banda (lo, hi), el plan tiene que valer para
+    # cualquier M6 entre lo y hi: el 3D se revisa con muestras de la banda a ≤8° (como el
+    # barrido de la garra) y el 2D con el contorno de M6, que es el mismo en toda la banda
+    # o, si no, el más desfavorable (M6 desconocido).
+    def _m6_low(self, m6):
+        return m6 if self._m6_band is None else self._m6_band[0]
+
+    def _rules_m6(self, m6):
+        band = self._m6_band
+        if band is None:
+            return m6
+        return m6 if gripper_envelope(band[0]) == gripper_envelope(band[1]) else None
+
+    def _static_m6_values(self, m6):
+        band = self._m6_band
+        if band is None:
+            return (m6,)
+        return self._gripper_sweep_samples(band[0], band[1])
+
+    def _sweep_m6_values(self, m6, goal):
+        band = self._m6_band
+        if band is None:
+            return self._gripper_sweep_samples(m6, goal)
+        far = band[1] if goal <= band[0] else band[0]  # el extremo de la banda más lejos del destino
+        return tuple(sorted(set(self._gripper_sweep_samples(far, goal)) | set(self._static_m6_values(m6))))
 
     @staticmethod
     def _gripper_sweep_samples(start, goal):
@@ -886,8 +926,8 @@ class SupervisedExecution:
                 entry_bounds = (before, before)
                 continue
             moving = gripper_segment is not None and index + 1 >= gripper_segment
-            m6_rules = None if moving else m6
-            m6_values = self._gripper_sweep_samples(m6, m6_goal) if moving else (m6,)
+            m6_rules = None if moving else self._rules_m6(m6)
+            m6_values = self._sweep_m6_values(m6, m6_goal) if moving else self._static_m6_values(m6)
             target = poses[index]
             step = max(abs(target[motor] - before[motor]) for motor in range(1, 6))
             corners = (*entry_bounds, before, target, poses[index + 1])
@@ -963,6 +1003,98 @@ class SupervisedExecution:
 
     def cancel_proposal(self) -> None:
         self.proposal = None
+
+    # ----- preparación anticipada -----
+    def start_ahead(self, observations: list[SceneObservation], stage: str = "guardado") -> "AheadPlan | None":
+        """Empieza a preparar `stage` en otro hilo, desde la pose final prevista de la etapa
+        anterior: su destino según la política y M6 en la banda de su acción de garra.
+
+        Se llama apenas se conoce la escena (después de preparar la etapa 1). El hilo usa
+        una copia de la política con su propio modelo 3D: no comparte datos con la
+        planificación de las otras etapas, que sigue en paralelo."""
+        if stage not in ANTICIPATED_STAGES or self.scene_features is None or self.finished:
+            return None
+        index = KEYFRAME_STAGES.index(stage)
+        previous = index - 1
+        if self.next_stage_index > index or not hasattr(self.policy, "gripper_step"):
+            return None
+        action, degrees, _ = self.policy.gripper_step(previous, self.scene_features)
+        if action != "angle" or degrees is None:
+            return None  # abrir del todo o cerrar por presión: no se sabe dónde queda M6
+        # El ejecutor da la garra por llegada a GRIPPER_OPEN_TOLERANCE del ángulo pedido.
+        center = float(degrees)
+        band = (max(self.limits[6][0], center - GRIPPER_OPEN_TOLERANCE),
+                min(self.limits[6][1], center + GRIPPER_OPEN_TOLERANCE))
+        assumed = {motor: float(value) for motor, value in self.policy.predict(previous, self.scene_features).items()
+                   if motor in range(1, 6)}
+        plan = AheadPlan(index, dict(assumed), band)
+        state = copy.copy(self)
+        state.proposal = None
+        state.next_stage_index = index
+        state.finished = False
+        state._m6_band = band
+
+        def work() -> None:
+            started = time.monotonic()
+            try:
+                state.policy = _independent_policy(self.policy)
+                plan.proposal = state.prepare({**assumed, 6: center}, observations)
+            except Exception as exc:  # se replanifica normalmente y ahí se informa
+                plan.error = exc
+            finally:
+                plan.seconds = time.monotonic() - started
+
+        plan.thread = threading.Thread(target=work, name="preparar-anticipado", daemon=True)
+        plan.thread.start()
+        return plan
+
+    def adopt_ahead(self, plan: "AheadPlan", current: dict[int, float],
+                    timeout: float = 30.0) -> tuple[MotionProposal | None, str]:
+        """El plan anticipado si sigue valiendo para la pose medida; si no, (None, motivo)
+        y hay que llamar a prepare() como siempre."""
+        started = time.monotonic()
+        plan.thread.join(timeout)
+        waited = time.monotonic() - started
+        if plan.thread.is_alive():
+            return None, "la preparación anticipada no terminó a tiempo"
+        if self.finished or self.proposal is not None or self.next_stage_index != plan.stage_index:
+            return None, "cambió la etapa"
+        if plan.error is not None or plan.proposal is None:
+            return None, f"la preparación anticipada falló: {plan.error}"
+        if any(motor not in current for motor in range(1, 7)):
+            return None, "falta la lectura de algún motor"
+        error = max(abs(current[motor] - plan.assumed[motor]) for motor in range(1, 6))
+        if error > ANTICIPATED_POSE_TOLERANCE:
+            return None, f"el brazo quedó a {error:.1f}° de lo ordenado"
+        low, high = plan.m6_band
+        if not low <= current[6] <= high:
+            return None, f"M6 quedó en {current[6]:.1f}°, fuera de {low:.1f}–{high:.1f}°"
+        self.proposal = plan.proposal
+        return plan.proposal, f"preparada por adelantado ({plan.seconds:.1f} s; se esperó {waited:.1f} s)"
+
+
+
+def _independent_policy(policy):
+    """Copia de la política con su propio modelo 3D (las revisiones escriben en el MjData
+    del modelo). El plan del experto ya calculado se comparte: no cambia."""
+    arm = getattr(policy, "arm", None)
+    if arm is None or not hasattr(arm, "pose_problems"):
+        return policy
+    clone = copy.copy(policy)
+    clone.arm = type(arm)(arm.assets_root, limits=arm.limits, dimensions=arm.dimensions,
+                          floor_margin_mm=arm.floor_margin_mm)
+    return clone
+
+
+@dataclass
+class AheadPlan:
+    stage_index: int
+    assumed: dict[int, float]          # M1–M5 ordenados al final de la etapa anterior
+    m6_band: tuple[float, float]       # M6 con que vale el plan
+    thread: threading.Thread | None = None
+    proposal: MotionProposal | None = None
+    error: Exception | None = None
+    seconds: float = 0.0
 
 
 def canonical_pose_text(values: np.ndarray) -> str:
