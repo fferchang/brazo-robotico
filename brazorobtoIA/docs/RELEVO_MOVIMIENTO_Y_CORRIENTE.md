@@ -20,6 +20,7 @@ rama por sí solo trae la base, sin los cambios ni los ensayos locales.
 | App normal y gemelo de referencia | La planificación geométrica usa cadenas de 6° y caja de hasta 12° para los pasos anticipados. Guardado se prepara al terminar Soltado. Cada orden clásica lleva hasta dos motores. Los grupos clásicos pueden solaparse. |
 | Firmware candidato y réplica virtual | `waypoint` agrupa los destinos de un punto en un mensaje. Ejecuta grupos de uno o dos motores de forma secuencial, espera quietud, excluye M6 y permite cancelar pendientes. Compiló para ESP32 con core 3.3.2 y SCServo. Se validó en el gemelo y sigue sin cargar en el equipo. |
 | Ensayos locales | Los pasos selectivos de 10° y Guardado anticipado viven en un banco de prueba del gemelo. La variante logró 147 órdenes frente a 159 con 8° en la misma escena, y 0,15–0,26 s de pausa tras soltar en dos escenas. La app del gemelo ofrece una opción experimental para la salida y el regreso por poses directas. |
+| Límite dinámico (13/11) | Supervisor `brazoia/limite_dinamico.py` y banco virtual de Traslado 2. Con `ok_v` 10,0 V baja de 3,26 s a 2,08–2,36 s frente a fijo 2, y pasa las fallas inyectadas. Con 10,5 V no gana nada. Sin conectar a la app. Detalle en «Límite dinámico en el gemelo». |
 | Última verificación integral | 271 tests de Python pasaron. La demo virtual con el protocolo candidato completó una vuelta. En Traslado 2 bajó de 12 a 6 mensajes de movimiento desde la PC, pero pasó de 1,85 a 5,26 s por la espera entre grupos. Hubo 24 latidos adicionales y 12 grupos internos. |
 
 ### Límites y forma de trabajar
@@ -143,18 +144,86 @@ seguimiento ni ignorados.
   `tests/test_video_demo.py` y la línea local de `.gitignore` para
   `datos/videos/`. Recreá `.venv` y dejá fuera `__pycache__`.
 
+### Límite dinámico en el gemelo (13/11)
+
+El usuario autorizó el ensayo virtual. No se movió el brazo real ni se cargó
+firmware, y la app no usa el límite todavía.
+
+- **Supervisor:** `brazoia/limite_dinamico.py` (`DynamicMotorLimit`), con
+  tests en `tests/test_limite_dinamico.py`. Parte de 2 motores y suma de a
+  uno, con techo de 5 y solo cuando hay un grupo esperando cupo. Para sumar
+  necesita una lectura fresca (≤0,25 s), `calm_s` sin incidentes, tensión
+  ≥ `ok_v` y la garra bajo 300 mA. Antes de despachar reserva 200 mA por
+  cada motor que arranca: mira el total contra los 2 A y la tensión
+  proyectada contra `pause_v` (9 V). Un pico, una tensión baja o la garra
+  apretando lo devuelven a 2. Con una lectura vencida queda en 2. Bajo
+  9 V no sale ninguna orden.
+- **Banco:** `datos/gemelo/ensayo_limite/prototipo.py`, ignorado por Git
+  como los otros bancos. Usa la captura de Traslado 2 del banco de cola
+  (semilla 4, pasos de 6°). Se corre con
+  `.venv/Scripts/python.exe -X utf8 -m datos.gemelo.ensayo_limite.prototipo`,
+  y deja la salida en `resultado.json` de esa carpeta.
+- **Modelo eléctrico:** el gemelo pasaba el torque del brazo a corriente con
+  la escala de la garra. Eso daba ~2,2 A en reposo, y la garra sostenía con
+  ~0,3 A en vez de los 6–26 mA reales. El banco reescala M1..M5 a la mediana
+  real de Traslado 2 (65 mA, de las cuatro vueltas del 6/11) y M6 a 13 mA.
+  La fuente es de 11,7 V con 4 V/A, según la caída medida con la garra el
+  6/11. Se suponen 150 mA por arranque, con 0,1 s de constante. Ese valor
+  no está medido: se eligió para acercarse a los máximos muestreados en
+  Traslado 1.
+
+| Variante | Traslado 2 | Máx. activos | Reórdenes con perfil detenido | V mín. modelo |
+|---|---:|---:|---:|---:|
+| Fijo 2 (referencia del banco) | 3,26 s | 2 | 20 | 10,25 |
+| Dinámico, `ok_v` 10,5, calma 0,5 s | 3,25 s | 3 | 20 | 10,25 |
+| Dinámico, `ok_v` 10,0, calma 0,5 s | 2,36 s | 4 | 20 | 9,58 |
+| Dinámico, `ok_v` 10,0, calma 0,2 s | 2,08 s | 4 | 20 | 9,56 |
+| Techo 5 sin supervisor | 1,58 s | 4 | 14 | 9,52 |
+
+Las cinco variantes completan el tramo, con error final ≤0,633° y una
+variación máxima del cubo en la pinza de 3,4–4,4 mm.
+
+- Con `ok_v` 10,5 no gana nada. Con 4 V/A, dos motores arrancando bajan el
+  modelo a ~10,4 V, y cada vez que el límite sube a 3 vuelve a 2. Además,
+  como Traslado 2 alterna los pares M1/M5 y M2/M3, un cupo de 3 casi no
+  deja solapar: el salto útil es de 2 a 4.
+- En las mediciones reales del 6/11, 29 de 11 297 muestras (0,26 %)
+  marcaron menos de 10,5 V. Varias fueron con el brazo en reposo, así que
+  hay ruido de lectura. Con el brazo solo, en Traslado 1, se vio hasta 10,0 V.
+- El supervisor no baja las frenadas (20 en todas las variantes). Solo
+  ahorra espera.
+- **Fallas inyectadas** (0,4 s justo cuando el límite iba a subir) con
+  la configuración de 10,5 V y con la de 10,0 V y calma de 0,2 s:
+  - pico de +1,8 A;
+  - caída a `pause_v` − 0,5;
+  - tensión justa (`ok_v` − 0,4);
+  - 0,4 s sin muestras;
+  - garra a +500 mA;
+  - Detener justo después de la primera suba.
+
+  Las 30 verificaciones pasaron. Con cada falla no se sumaron motores
+  desde la primera muestra con la falla hasta la calma posterior; con la
+  caída no salió ninguna orden. Con Detener se cancelaron los grupos
+  pendientes y no salió ninguna orden más. La suite dio 285/285.
+- **Ojo con la referencia:** en la app real, los tramos «juntos» ya mandan
+  los grupos de un mismo punto seguidos, sin límite de motores en
+  movimiento (por eso Traslado 2 llega a 4 motores a la vez). Eso equivale
+  a «techo 5 sin supervisor», no a «fijo 2». Con esa forma de ejecutar, en
+  el brazo real se midieron menos de ~300 mA en el brazo y la vuelta de la
+  demo en 38,8 s. El supervisor serviría como protección encima de ese
+  comportamiento, no como una forma de acelerarlo.
+
 ### Próxima tarea vigente
 
-**Pendiente de confirmación del usuario:** probar primero en el gemelo
-un límite dinámico. Usar el mismo Traslado 2 y comparar contra el límite
-fijo. Partir de dos motores activos y ensayar sumar de a uno, con un
-máximo de cinco solo en el gemelo. Inyectar picos de corriente, caídas
-de tensión y lecturas vencidas para verificar que no se incorporen
-grupos en esas condiciones. Probar la prioridad de M6, la cancelación
-y medir órdenes, frenadas, tiempo y resultado. Los 2 A que propuso el
-usuario son un parámetro experimental. El resultado virtual sirve
-para verificar la lógica. La capacidad eléctrica requiere medición
-en el equipo y una autorización aparte.
+**Pendiente de confirmación del usuario.** Opciones:
+1. Medir en el brazo real, con `power telem` a 100 ms, la caída por ampere
+   y los picos de arranque, con una demo normal. Ya están en los CSV, pero
+   faltan arranques aislados. Con eso, recalibrar `ok_v`, `v_per_a` y la
+   reserva de arranque.
+2. Conectar `DynamicMotorLimit` como protección en los tramos «juntos» de
+   `MotionExecutor`, primero solo con `--gemelo`.
+
+Las dos necesitan una autorización aparte para el brazo real.
 
 ### Cronómetro y métricas de ejecución
 
