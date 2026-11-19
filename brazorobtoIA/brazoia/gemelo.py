@@ -26,6 +26,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -72,6 +73,14 @@ SIM_DETECTION = dict(minimum_red_area_ratio=0.001, minimum_lime_area_ratio=0.004
 STEPS_PER_TURN = 4095.0
 MOVE_SPEED = 450            # pasos/s del servo
 MOVE_ACC = 45               # unidades de 100 pasos/s²
+# Orden `sync` del firmware: hasta cinco motores M1..M5 juntos (ver handleSyncLine).
+SYNC_MAX_SPEED = MOVE_SPEED
+SYNC_MIN_SPEED = 20         # nunca 0: en el STS3215 sería la velocidad máxima
+SYNC_MAX_MOTORS = 5
+SYNC_MAX_DURATION_MS = 10000
+# Números como los aceptan strtol/strtof en el firmware (sin "nan", "inf" ni "1_0").
+_STRICT_INT = re.compile(r"[+-]?\d+")
+_STRICT_FLOAT = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 MOVE_COOLDOWN_S = 0.050
 WAYPOINT_SPACING_S = 0.065
 WAYPOINT_POLL_S = 0.050
@@ -316,6 +325,8 @@ class DigitalTwin:
         # Como en el firmware, `power telem` sigue prendido aunque cambie la escena.
         self.power_telemetry = False
         self.last_power_telemetry = -math.inf
+        # False: se comporta como el firmware cargado el 6/11, sin `caps` ni `sync`.
+        self.sync_firmware = True
         self._reset_state(self.placement)
 
     # ----- escena -----
@@ -744,6 +755,59 @@ class DigitalTwin:
             self.println(f"PAIR_MOVE_OK ID1={first} target1={first_deg:.2f} speed1={speeds[0]} "
                          f"ID2={second} target2={second_deg:.2f} speed2={speeds[1]}")
 
+    def _sync_command(self, line: str) -> None:
+        """Réplica de `handleSyncLine`: hasta cinco motores de M1..M5 en una orden."""
+        parts = line.split()[1:]
+        if not parts or not _STRICT_INT.fullmatch(parts[0]) or not 0 <= int(parts[0]) <= SYNC_MAX_DURATION_MS:
+            self.println("SYNC_REJECTED reason=formato")
+            return
+        duration_ms = int(parts[0])
+        targets: dict[int, float] = {}
+        values = parts[1:]
+        for index in range(0, len(values), 2):
+            if len(targets) == SYNC_MAX_MOTORS:
+                self.println("SYNC_REJECTED reason=formato")
+                return
+            motor_text = values[index]
+            if not _STRICT_INT.fullmatch(motor_text) or not 1 <= int(motor_text) <= SYNC_MAX_MOTORS \
+                    or int(motor_text) in targets:
+                self.println("SYNC_REJECTED reason=motores")
+                return
+            if index + 1 >= len(values) or not _STRICT_FLOAT.fullmatch(values[index + 1]):
+                self.println("SYNC_REJECTED reason=formato")
+                return
+            motor, degrees = int(motor_text), float(values[index + 1])
+            low, high = USER_LIMITS[motor]
+            if not low <= degrees <= high:
+                self.println("SYNC_REJECTED reason=fuera_de_rango")
+                return
+            targets[motor] = degrees
+        if not targets:
+            self.println("SYNC_REJECTED reason=formato")
+            return
+        if self.now - self.last_move < MOVE_COOLDOWN_S:
+            self.println("SYNC_REJECTED reason=cooldown")
+            return
+        current = {motor: self._logical_from_encoder(motor) for motor in targets}
+        reason = self._validate_pair(targets)  # M6 no cambia: la misma recta de 20 puntos
+        if reason != "OK":
+            self.println(f"SYNC_REJECTED reason=trayectoria_insegura detail={reason}")
+            return
+        largest = max(abs(targets[motor] - current[motor]) for motor in targets)
+        cruise = float(SYNC_MAX_SPEED)
+        if duration_ms > 0 and largest > 0.1:
+            wanted = (largest / 360.0 * STEPS_PER_TURN) / (duration_ms / 1000.0)
+            cruise = min(max(wanted, SYNC_MIN_SPEED), SYNC_MAX_SPEED)
+        speeds = {}
+        for motor, degrees in targets.items():
+            share = abs(degrees - current[motor]) / largest if largest > 0.1 else 1.0
+            speeds[motor] = int(max(SYNC_MIN_SPEED, cruise * share))
+            self._write_pos(motor, degrees, speeds[motor], MOVE_ACC)
+        self.last_move = self.now
+        self.pending_report = None
+        self.println(f"SYNC_MOVE_OK n={len(targets)} dur_ms={duration_ms} "
+                     f"ids={','.join(map(str, targets))} speeds={','.join(str(speeds[m]) for m in targets)}")
+
     def _waypoint_result(self, status: str, identifier: int, reason: str = "") -> None:
         detail = f" reason={reason}" if reason else ""
         self.println(f"WAYPOINT_{status} id={identifier}{detail}")
@@ -1032,6 +1096,9 @@ class DigitalTwin:
         if not line:
             return
         lowered = line.lower()
+        if self.sync_firmware and lowered == "caps":
+            self.println(f"FIRMWARE_CAPS sync=1 sync_max_motors={SYNC_MAX_MOTORS} sync_max_speed={SYNC_MAX_SPEED}")
+            return
         if lowered == "waypoint" or lowered.startswith("waypoint "):
             self._waypoint_command(lowered)
             return
@@ -1102,6 +1169,10 @@ class DigitalTwin:
         elif line.startswith("read "):
             self._read_one(_to_int(line[5:]))
             self._divider()
+        elif self.sync_firmware and line == "sync":
+            self.println("SYNC_REJECTED reason=formato")
+        elif self.sync_firmware and line.startswith("sync "):
+            self._sync_command(line)
         elif line.startswith(("bpair ", "pair ")):
             values = line.split()[1:]
             if len(values) != 4:

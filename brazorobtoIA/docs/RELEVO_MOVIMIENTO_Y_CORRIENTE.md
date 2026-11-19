@@ -8,9 +8,10 @@ el contexto de entonces. La próxima tarea vigente está al final de esta
 sección.
 
 El repositorio Git es la carpeta `brazo robotico` y la raíz de la app es
-`brazorobtoIA`. La rama es `claude/camera-esp32-testing-wgp4qh`, con base
-`313e3e6`. Los cambios de esta etapa siguen en el árbol local. Un clon de la
-rama por sí solo trae la base, sin los cambios ni los ensayos locales.
+`brazorobtoIA`. La exposición del 14/11 corrió la rama
+`claude/camera-esp32-testing-wgp4qh` (`0793b5c`) con el firmware cargado el 6/11.
+La etapa 2 (orden `sync`, 19/11) está en `claude/wizardly-johnson-jazaal`, sobre
+`0793b5c`: ver [Orden sync](#orden-sync-cinco-motores-por-mensaje-1911).
 
 ### Estado por entorno
 
@@ -18,6 +19,7 @@ rama por sí solo trae la base, sin los cambios ni los ensayos locales.
 |---|---|
 | ESP32 real (COM11) | La última carga autorizada registrada fue el 6/11. Es la versión con `power telem` y protecciones de M6 de `313e3e6`. La orden `waypoint` pertenece al candidato posterior. Al conectar, la PC fija el umbral de contacto en 60. |
 | App normal y gemelo de referencia | La planificación geométrica usa cadenas de 6° y caja de hasta 12° para los pasos anticipados. Guardado se prepara al terminar Soltado. Cada orden clásica lleva hasta dos motores. Los grupos clásicos pueden solaparse. |
+| Firmware con `sync` (19/11) | `caps` y `sync <ms> <id> <grados> ...`: hasta cinco motores M1–M5 en un `SyncWritePosEx`. Compila en la PC con stubs (`firmware/prueba_pc/`) y pasa sus pruebas; réplica en el gemelo. **No compilado con Arduino CLI ni cargado en el ESP32.** |
 | Firmware candidato y réplica virtual | `waypoint` agrupa los destinos de un punto en un mensaje. Ejecuta grupos de uno o dos motores de forma secuencial, espera quietud, excluye M6 y permite cancelar pendientes. Compiló para ESP32 con core 3.3.2 y SCServo. Se validó en el gemelo y sigue sin cargar en el equipo. |
 | Ensayos locales | Los pasos selectivos de 10° y Guardado anticipado viven en un banco de prueba del gemelo. La variante logró 147 órdenes frente a 159 con 8° en la misma escena, y 0,15–0,26 s de pausa tras soltar en dos escenas. La app del gemelo ofrece una opción experimental para la salida y el regreso por poses directas. |
 | Última verificación integral | 271 tests de Python pasaron. La demo virtual con el protocolo candidato completó una vuelta. En Traslado 2 bajó de 12 a 6 mensajes de movimiento desde la PC, pero pasó de 1,85 a 5,26 s por la espera entre grupos. Hubo 24 latidos adicionales y 12 grupos internos. |
@@ -145,7 +147,16 @@ seguimiento ni ignorados.
 
 ### Próxima tarea vigente
 
-**Pendiente de confirmación del usuario:** probar primero en el gemelo
+**19/11, pendiente del usuario:** compilar con Arduino CLI y cargar el firmware
+con `sync` (cerrar antes la app que ocupa el COM), y correr una vuelta de DEMO
+en el brazo real con «Medir corriente». Comparar con la vuelta de referencia del
+6/11 (38,4 s, pico de M6 578 mA, mínimo 10,0 V) y observar las pausas cortas.
+Para volver a `pair` sin recargar: `app.py --sin-sync`. Después siguen, a
+confirmar: anticipar la preparación de Guardado (5,5–7 s en el gemelo), el
+supervisor de tensión y corriente que baja la velocidad de todos los motores
+por igual, y subir `SYNC_MAX_SPEED`.
+
+**Anterior (6/11), reemplazada por la orden `sync`:** probar primero en el gemelo
 un límite dinámico. Usar el mismo Traslado 2 y comparar contra el límite
 fijo. Partir de dos motores activos y ensayar sumar de a uno, con un
 máximo de cinco solo en el gemelo. Inyectar picos de corriente, caídas
@@ -155,6 +166,65 @@ y medir órdenes, frenadas, tiempo y resultado. Los 2 A que propuso el
 usuario son un parámetro experimental. El resultado virtual sirve
 para verificar la lógica. La capacidad eléctrica requiere medición
 en el equipo y una autorización aparte.
+
+### Orden sync: cinco motores por mensaje (19/11)
+
+Objetivo del usuario: más rápido y sin micromovimientos, partiendo del modo
+geométrico automático de la exposición. Causa medida el 6/11: cada servo
+terminaba su paso de 6° y frenaba antes de recibir el siguiente, porque cada
+punto necesitaba hasta tres órdenes de dos motores con acuse y 65 ms entre ellas.
+
+Cambios:
+- **Firmware:** `caps` responde `FIRMWARE_CAPS sync=1 sync_max_motors=5
+  sync_max_speed=450`. `sync <ms> <id> <grados> ...` acepta de 1 a 5 motores de
+  M1–M5, cada uno una vez, y los manda en un `SyncWritePosEx`. Rechaza la orden
+  entera (`SYNC_REJECTED reason=formato|motores|fuera_de_rango|cooldown|
+  servo_sin_respuesta|trayectoria_insegura`) sin ajustes. Revisa piso,
+  autocolisión y regla de M4 en 20 puntos de la recta desde la pose medida, como
+  `pair`. Comparte el enfriamiento de 50 ms. Velocidad del que más recorre:
+  `SYNC_MAX_SPEED` (= `MOVE_SPEED`, 450); los demás, proporcionales, con piso de
+  20 (0 sería la máxima en el STS3215). Con `ms` > 0 baja la velocidad para
+  tardar ese tiempo. Con un `waypoint` activo responde `WAYPOINT_BUSY`.
+- **Gemelo:** réplica de `caps` y `sync`. `DigitalTwin.sync_firmware = False`
+  se comporta como el firmware del 6/11.
+- **PC:** `RobotSerial` manda `caps` al conectar y marca `sync_supported`.
+  `MotionExecutor` manda un `sync` por punto «junto» (o de un solo grupo) si
+  cada motor aparece una vez; si no, o sin `sync` en el firmware, todo sigue
+  como antes. `SupervisedExecution(sync_orders=True)` marca «juntos» también los
+  pasos de cadena de un solo grupo (ya revisados) y manda el punto siguiente con
+  el motor más atrasado a un paso del destino (`SYNC_BLEND_FRACTION = 1.0`). La
+  caja de ese anticipo sigue limitada a 12° y revisada en 2D y 3D. En los puntos
+  de paso la telemetría se mira cada 10 ms; la quietud cuenta lecturas nuevas.
+- `--sin-sync` en `app.py` y `gemelo_digital.py` fuerza `pair`.
+
+Resultados en el gemelo (una vuelta por fila, DEMO, `App(gemelo=True)` oculta).
+«Frenadas»: intervalos entre órdenes de un motor (destinos a ≥0,5° y pico del
+perfil ≥5°/s) en los que el perfil llegó a 0 antes de la orden siguiente.
+
+| Semilla | Modo | Paso / anticipo | Vuelta | Dentro del ejecutor | Frenadas | Preparar Guardado |
+|---|---|---|---:|---:|---:|---:|
+| 4 | pair (exposición) | 6° / 0,5 | 44,06 s | 33,56 s | 303/308 | — |
+| 4 | sync | 6° / 0,5 | 35,51 s | 25,52 s | 178/298 | — |
+| 4 | sync | 6° / 1,0 | 34,01 s | 24,33 s | 127/296 | — |
+| 4 | sync | 6° / 1,0 (repetida) | 35,91 s | 24,64 s | 127/295 | 7,15 s |
+| 4 | sync | 4° / 1,0 | 40,03 s | 23,82 s | 76/402 | — |
+| 1 | pair (exposición) | 6° / 0,5 | 42,72 s | 32,75 s | 293/301 | 6,19 s |
+| 1 | sync | 6° / 1,0 | 33,12 s | 23,89 s | 124/286 | 5,56 s |
+| 1 | sync | 4° / 1,0 | 39,82 s | 23,22 s | 68/398 | 11,46 s |
+
+- Todas `result=success`. Se eligió 6° / 1,0: con 4° frena menos, pero preparar
+  Guardado casi se duplica y la vuelta queda más lenta. La preparación es casi
+  toda revisión 3D (0,37 ms por pose, hasta 32 esquinas por caja y ~12 muestras
+  de la garra cerrándose en camino).
+- Tarea con recipiente (`gemelo_digital.py --episodios 3 --semilla 4`): 3/3 con
+  `--sin-sync` (46,9 / 44,1 / 46,9 s) y 3/3 con `sync` (39,0 / 36,5 / 38,4 s),
+  sin avisos de llegada con desvío.
+- En el gemelo el cálculo compite con la física por el GIL: las pausas de
+  preparación son mayores que en la PC del usuario (3,1–3,5 s el 6/11).
+- El perfil del gemelo supone que el STS3215 sigue con su velocidad al recibir
+  un destino nuevo en movimiento. **No está verificado en el servo real.**
+- Pruebas: `tests/test_orden_sync.py` (18) y la suite completa (285, salvo las
+  dos que necesitan `rerun`). No se movió el brazo real ni se cargó firmware.
 
 ### Cronómetro y métricas de ejecución
 

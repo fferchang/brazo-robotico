@@ -8,6 +8,14 @@ static const int TX_PIN = 17;
 
 static const uint16_t MOVE_SPEED = 450;
 static const uint8_t MOVE_ACC = 45;
+// Orden `sync`: hasta cinco motores del brazo (M1..M5) en un solo SyncWritePosEx,
+// con velocidades proporcionales para que lleguen juntos. El techo de velocidad es
+// el mismo de siempre: subirlo es otra prueba, midiendo con `power telem`.
+static const uint16_t SYNC_MAX_SPEED = MOVE_SPEED;
+// Nunca 0: en el STS3215 una velocidad 0 significa "maxima".
+static const uint16_t SYNC_MIN_SPEED = 20;
+static const uint8_t SYNC_MAX_MOTORS = 5;
+static const long SYNC_MAX_DURATION_MS = 10000;
 
 static const int MIN_ID = 1;
 static const int MAX_ID = 6;
@@ -476,6 +484,8 @@ void printHelp() {
   Serial.println(F("Comandos disponibles:"));
   Serial.println(F("  <id> <grados>"));
   Serial.println(F("  pair <id1> <grados1> <id2> <grados2>"));
+  Serial.println(F("  sync <ms> <id> <grados> [<id> <grados> ...]  (M1..M5 juntos, ms=0: maxima)"));
+  Serial.println(F("  caps"));
   Serial.println(F("  read <id>"));
   Serial.println(F("  scan"));
   Serial.println(F("  posall"));
@@ -1610,9 +1620,182 @@ void processWaypoint() {
   waypoint.lastPollAtMs = waypoint.groupStartedAtMs;
 }
 
+// Piso, autocolision y regla de M4 en 20 puntos de la recta desde la pose medida
+// hasta los destinos, como validatePairTrajectory pero con hasta cinco motores.
+// M1 y M5 no cambian el modelo plano; M6 queda como esta (sync no lo mueve).
+bool validateSyncTrajectory(const uint8_t *ids, const float *degrees, uint8_t count, String &reason) {
+  float currentM2 = 0.0f;
+  float currentM3 = 0.0f;
+  float currentM4 = 0.0f;
+  if (!getCurrentPoseDegrees(currentM2, currentM3, currentM4)) {
+    reason = "LECTURA_M2_M3_M4";
+    return false;
+  }
+  float m6 = currentGripperDegreesOrNan();
+  float targetM2 = currentM2;
+  float targetM3 = currentM3;
+  float targetM4 = currentM4;
+  for (uint8_t i = 0; i < count; i++) {
+    if (ids[i] == 2) targetM2 = degrees[i];
+    if (ids[i] == 3) targetM3 = degrees[i];
+    if (ids[i] == 4) targetM4 = degrees[i];
+  }
+  float escapeFrom = floorEscapeReference(currentM2, currentM3, currentM4, m6);
+  const int INTERPOLATION_STEPS = 20;
+  for (int step = 1; step <= INTERPOLATION_STEPS; step++) {
+    float t = (float)step / (float)INTERPOLATION_STEPS;
+    float m2 = currentM2 + (targetM2 - currentM2) * t;
+    float m3 = currentM3 + (targetM3 - currentM3) * t;
+    float m4 = currentM4 + (targetM4 - currentM4) * t;
+    if (m4 > getDynamicM4Max(m2, m3)) {
+      reason = "REGLA_DINAMICA_M4";
+      return false;
+    }
+    if (classifyPoseInvalid(m2, m3, m4, m6, reason, false, escapeFrom)) {
+      return false;
+    }
+  }
+  reason = "OK";
+  return true;
+}
+
+void rejectSync(const __FlashStringHelper *reason, const char *detail = nullptr) {
+  Serial.print(F("SYNC_REJECTED reason="));
+  Serial.print(reason);
+  if (detail != nullptr) {
+    Serial.print(F(" detail="));
+    Serial.print(detail);
+  }
+  Serial.println();
+}
+
+// sync <dur_ms> <id> <grados> [<id> <grados> ...]
+// Hasta cinco motores de M1..M5, cada uno una vez. dur_ms = 0: el motor que mas
+// recorre va a SYNC_MAX_SPEED y los demas proporcionales; dur_ms > 0: se intenta
+// llegar en ese tiempo, sin pasar SYNC_MAX_SPEED. Fuera de rango o trayectoria
+// insegura se rechaza entera: no hay ajustes automaticos.
+void handleSyncLine(const String &line) {
+  const char *cursor = line.c_str() + 5;
+  long durationMs;
+  if (!readWaypointInt(cursor, 0, SYNC_MAX_DURATION_MS, durationMs)) {
+    rejectSync(F("formato"));
+    return;
+  }
+  uint8_t ids[SYNC_MAX_MOTORS];
+  float degrees[SYNC_MAX_MOTORS];
+  uint8_t count = 0;
+  uint8_t usedMotors = 0;
+  skipWaypointSpaces(cursor);
+  while (*cursor) {
+    if (count == SYNC_MAX_MOTORS) {
+      rejectSync(F("formato"));
+      return;
+    }
+    long motor;
+    float value;
+    if (!readWaypointInt(cursor, 1, SYNC_MAX_MOTORS, motor)) {
+      rejectSync(F("motores"));
+      return;
+    }
+    uint8_t mask = 1 << motor;
+    if (usedMotors & mask) {
+      rejectSync(F("motores"));
+      return;
+    }
+    if (!readWaypointDegrees(cursor, value)) {
+      rejectSync(F("formato"));
+      return;
+    }
+    float minimum, maximum;
+    if (!getUserAngleLimits(motor, minimum, maximum) || value < minimum || value > maximum) {
+      rejectSync(F("fuera_de_rango"));
+      return;
+    }
+    usedMotors |= mask;
+    ids[count] = motor;
+    degrees[count] = value;
+    count++;
+    skipWaypointSpaces(cursor);
+  }
+  if (count == 0) {
+    rejectSync(F("formato"));
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastMoveCommandMs < MOVE_COOLDOWN_MS) {
+    rejectSync(F("cooldown"));
+    return;
+  }
+
+  float current[SYNC_MAX_MOTORS];
+  for (uint8_t i = 0; i < count; i++) {
+    if (!getCurrentLogicalDegrees(ids[i], current[i])) {
+      rejectSync(F("servo_sin_respuesta"));
+      return;
+    }
+  }
+  String safetyReason;
+  if (!validateSyncTrajectory(ids, degrees, count, safetyReason)) {
+    rejectSync(F("trayectoria_insegura"), safetyReason.c_str());
+    return;
+  }
+
+  float maxDelta = 0.0f;
+  for (uint8_t i = 0; i < count; i++) {
+    maxDelta = max(maxDelta, fabsf(degrees[i] - current[i]));
+  }
+  float cruise = SYNC_MAX_SPEED;
+  if (durationMs > 0 && maxDelta > 0.1f) {
+    float wanted = (maxDelta / 360.0f * 4095.0f) / (durationMs / 1000.0f);
+    cruise = constrain(wanted, (float)SYNC_MIN_SPEED, (float)SYNC_MAX_SPEED);
+  }
+  u8 syncIds[SYNC_MAX_MOTORS];
+  s16 positions[SYNC_MAX_MOTORS];
+  u16 speeds[SYNC_MAX_MOTORS];
+  u8 accelerations[SYNC_MAX_MOTORS];
+  for (uint8_t i = 0; i < count; i++) {
+    float share = maxDelta > 0.1f ? fabsf(degrees[i] - current[i]) / maxDelta : 1.0f;
+    syncIds[i] = ids[i];
+    positions[i] = (s16)degToPos(toRealServoDegrees(ids[i], degrees[i]));
+    speeds[i] = (u16)max((float)SYNC_MIN_SPEED, cruise * share);
+    accelerations[i] = MOVE_ACC;
+  }
+  servoBus.SyncWritePosEx(syncIds, count, positions, speeds, accelerations);
+  lastMoveCommandMs = now;
+  pendingMoveReport = false;
+
+  Serial.print(F("SYNC_MOVE_OK n="));
+  Serial.print(count);
+  Serial.print(F(" dur_ms="));
+  Serial.print(durationMs);
+  Serial.print(F(" ids="));
+  for (uint8_t i = 0; i < count; i++) {
+    if (i > 0) Serial.print(',');
+    Serial.print(ids[i]);
+  }
+  Serial.print(F(" speeds="));
+  for (uint8_t i = 0; i < count; i++) {
+    if (i > 0) Serial.print(',');
+    Serial.print(speeds[i]);
+  }
+  Serial.println();
+}
+
+void printCapabilities() {
+  Serial.print(F("FIRMWARE_CAPS sync=1 sync_max_motors="));
+  Serial.print(SYNC_MAX_MOTORS);
+  Serial.print(F(" sync_max_speed="));
+  Serial.println(SYNC_MAX_SPEED);
+}
+
 void handleLine(String line) {
   line.trim();
   if (line.length() == 0) {
+    return;
+  }
+
+  if (line.equalsIgnoreCase("caps")) {
+    printCapabilities();
     return;
   }
 
@@ -1761,6 +1944,15 @@ void handleLine(String line) {
     return;
   }
 
+  if (line == "sync") {
+    rejectSync(F("formato"));
+    return;
+  }
+  if (line.startsWith("sync ")) {
+    handleSyncLine(line);
+    return;
+  }
+
   if (line.startsWith("bpair ")) {
     int id1 = 0;
     int id2 = 0;
@@ -1836,10 +2028,10 @@ void setup() {
   servoBus.pSerial = &ServoSerial;
 
   printDivider();
-  Serial.println(F("Control sincronizado de hasta dos motores - TEST REGLAS"));
+  Serial.println(F("Control sincronizado: pair (dos motores) y sync (hasta cinco del brazo)"));
   Serial.println(F("Speed fijo = 450"));
   Serial.println(F("Acc fijo = 45"));
-  Serial.println(F("Maximo dos motores simultaneos por comando."));
+  Serial.println(F("sync: hasta cinco motores M1..M5 por comando, mismas reglas de piso y colision."));
   Serial.println(F("Lectura automatica de posiciones cada 0.05s (20 Hz)."));
   printHelp();
 }

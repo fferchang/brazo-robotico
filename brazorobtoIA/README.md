@@ -232,6 +232,27 @@ En el gemelo, cada vuelta de la demo bajó de ~88 s a ~38 s. Lo que queda lento 
 los movimientos grandes, como salir de Inicio y volver, que todavía van de a dos
 motores: es la etapa 2 (los 5 motores a la vez desde el firmware).
 
+### Etapa 2: cinco motores por orden (`sync`)
+
+El firmware nuevo agrega `sync <ms> <id> <grados> ...`: hasta cinco motores de M1–M5
+en un solo `SyncWritePosEx`, con velocidades proporcionales para que lleguen juntos.
+Revisa piso, autocolisiones y la regla de M4 en 20 puntos de la recta, como `pair`, y
+rechaza la orden entera (`SYNC_REJECTED`) sin ajustes automáticos. El techo de
+velocidad sigue en 450 (~40°/s). M6 no va por `sync`.
+
+- Al conectar, la app pregunta `caps`. Si el firmware responde `FIRMWARE_CAPS sync=1`,
+  cada punto de paso «junto» sale en una sola orden y el siguiente se manda cuando el
+  motor más atrasado está a un paso del destino, si la caja de esos puntos pasa las
+  revisiones 2D y 3D de siempre. Con el firmware de la exposición no hay respuesta y
+  todo sigue con `pair`, como antes.
+- `app.py --sin-sync` y `gemelo_digital.py --sin-sync` fuerzan `pair` aunque el
+  firmware tenga `sync`, para comparar.
+- Gemelo (19/11): la vuelta de la demo bajó de 42,7–44,1 s a 33,1–35,9 s y las frenadas
+  de los servos antes de la orden siguiente, de 97–98% a 43%. La tarea con recipiente,
+  de 44–47 s a 36–39 s (3/3 en ambos casos). Falta medirlo en el brazo real.
+- `firmware/prueba_pc/` compila el `.ino` en la PC con stubs de Arduino y del bus y
+  prueba `sync`; `tests/test_orden_sync.py` lo corre si hay `g++`.
+
 ### Demo: el cubo de un lado a otro, sin recipiente
 
 **🔁 DEMO: llevar el cubo de un lado a otro** (pestaña **Tarea automática**)
@@ -288,7 +309,7 @@ virtuales. Ver `docs/CALIBRACION_CAMARAS.md`.
 - ESP32 preferido en `COM4`, 115200 baud. Si cambia el número y hay un solo
   adaptador USB serie, la interfaz lo selecciona automáticamente.
 - Firmware compatible con `posall`, `arm torque on/off`, `torque on/off`, `pair`,
-  `gripper open/close/stop`.
+  `gripper open/close/stop`. Opcional: `caps` y `sync` (etapa 2).
 - Dos cámaras DirectShow.
 - Seis servos STS3215.
 

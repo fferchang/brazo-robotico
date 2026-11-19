@@ -72,6 +72,15 @@ CHAIN_STEP_DEGREES = 6.0
 # entre los puntos y los posibles rezagos de motores pasa las revisiones, hasta este tamaño.
 BLEND_MAX_DEGREES = 2 * CHAIN_STEP_DEGREES
 BLEND_FRACTION = 0.5
+# Con la orden `sync` (ver SupervisedExecution.sync_orders), elegidos en el gemelo (19/11,
+# semillas 1 y 4, una vuelta de DEMO cada una): con pasos de 6° y el punto siguiente
+# mandado apenas el motor más atrasado está a un paso del destino, la vuelta bajó de
+# 42,7–44,1 s (pair) a 33,1–35,9 s y las frenadas del perfil antes de la orden siguiente,
+# de 97–98% a 43%. Con 4° frenaban menos (17–19%), pero preparar Guardado tardaba ~11 s
+# en vez de ~6 s y la vuelta quedaba en ~40 s. La caja del paso anticipado sigue
+# acotada por BLEND_MAX_DEGREES y revisada en 2D y 3D como siempre.
+SYNC_CHAIN_STEP_DEGREES = CHAIN_STEP_DEGREES
+SYNC_BLEND_FRACTION = 1.0
 # Garra del modelo aprendido y del modo paso a paso sin política geométrica: la de las
 # demostraciones a mano (abrir del todo, cerrar sobre el cubo y volver a abrir).
 LEGACY_GRIPPER_ACTIONS = {
@@ -84,6 +93,11 @@ LEGACY_GRIPPER_ACTIONS = {
 }
 M6_ANGLE_SPEED_DEG_S = 450 * 360.0 / 4095.0  # MOVE_SPEED del firmware para «6 <grados>»
 MOVE_ACK_TIMEOUT_SECONDS = 0.6
+# Con la orden `sync` (firmware nuevo) cada punto sale en un solo mensaje con hasta cinco
+# motores, en vez de hasta tres órdenes de dos motores separadas 65 ms. Al encadenar, el
+# punto siguiente se manda apenas la telemetría muestra el pasaje: se revisa cada 10 ms
+# en vez de 50 ms para que la orden llegue antes de que el servo empiece a frenar.
+SYNC_POLL_SECONDS = 0.01
 # Al cerrar sobre el cubo, M6 sube a ~1 A durante ~0,5 s y la fuente cae de 11,7 a 7,7 V
 # (medición del 6/11 en el brazo real). Hasta que afloje no se levanta el cubo: con
 # `power telem` prendido, hasta dos muestras seguidas de M6 bajo GRIP_SETTLE_MA; sin
@@ -147,6 +161,7 @@ class MotionExecutor:
         abort: threading.Event | None = None,
         *,
         firmware_waypoints: bool = False,
+        sync_orders: bool | None = None,
     ):
         self.robot = robot
         self.status = status or (lambda text: None)
@@ -155,7 +170,14 @@ class MotionExecutor:
         # execute() no la borra: una parada pedida entre dos etapas no se pierde.
         self.abort = abort
         self.firmware_waypoints = firmware_waypoints
+        # None: usar `sync` si el firmware lo anunció (`caps`); False: nunca (como el 6/11).
+        self.sync_orders = sync_orders
         self._last_move_sent = -math.inf
+
+    @property
+    def uses_sync(self) -> bool:
+        return (self.sync_orders is not False and isinstance(self.robot, RobotSerial)
+                and getattr(self.robot, "sync_supported", False) is True)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -192,6 +214,7 @@ class MotionExecutor:
                 return timings
         angle = proposal.gripper_action == "angle"
         closing = proposal.gripper_action == "close"
+        use_sync = self.uses_sync
         holds_before = getattr(snapshot, "gripper_holds", None)
         gripper_sent = False
         pending_targets: dict[int, float] = {}
@@ -205,6 +228,23 @@ class MotionExecutor:
                         self._send_gripper_close()
                 gripper_sent = True
             groups = proposal.groups[segment.start:segment.end]
+            sync_targets = self._sync_targets(groups) if use_sync else None
+            if sync_targets is not None and (segment.together or len(groups) == 1):
+                # Un solo mensaje: los motores arrancan a la vez. Es lo mismo que los grupos
+                # «juntos», cuya caja ya se revisó, sin el desfase de 65 ms entre grupos.
+                if self._stop_requested():
+                    raise RuntimeError("Movimiento detenido por el operador.")
+                self.status(f"Tramo {segment.start + 1}–{segment.end}/{total}: sync {sync_targets}")
+                with _time_phase(timings, "orders"):
+                    self._send_move("sync 0 " + " ".join(f"{motor} {target:.2f}"
+                                                         for motor, target in sync_targets.items()))
+                pending_targets.update(sync_targets)
+                self._wait_arrival(sync_targets if segment.handoff else pending_targets,
+                                   settle=segment.final, handoff=segment.handoff, timings=timings,
+                                   poll=SYNC_POLL_SECONDS)
+                if not segment.handoff:
+                    pending_targets = {}
+                continue
             if segment.together and len(groups) > 1:
                 # Seguidos: el firmware revisa cada orden con la pose de ese momento, que la
                 # preparación ya revisó (todas las combinaciones intermedias del salto).
@@ -348,6 +388,15 @@ class MotionExecutor:
         raise RuntimeError("La garra no confirmó el contacto.")
 
     @staticmethod
+    def _sync_targets(groups: tuple[MotionGroup, ...]) -> dict[int, float] | None:
+        """Destinos para una sola orden `sync`: cada motor de M1..M5 una sola vez. Si un
+        motor aparece en dos grupos (un desvío del planificador), van en orden como antes."""
+        motors = [motor for group in groups for motor, _ in group.targets]
+        if not motors or len(motors) != len(set(motors)) or not all(1 <= motor <= 5 for motor in motors):
+            return None
+        return {motor: target for group in groups for motor, target in group.targets}
+
+    @staticmethod
     def _batchable(groups: tuple[MotionGroup, ...]) -> bool:
         motors = [motor for group in groups for motor, _ in group.targets]
         return (bool(groups) and all(1 <= len(group.targets) <= 2 for group in groups)
@@ -419,9 +468,12 @@ class MotionExecutor:
 
     def _wait_arrival(self, targets: dict[int, float], *, settle: bool, speed_deg_s: float = 45.0,
                       loaded_tolerance: float = LOADED_ARRIVAL_TOLERANCE, handoff: float = 0.0,
-                      timings: dict[str, float] | None = None) -> None:
+                      timings: dict[str, float] | None = None, poll: float = 0.05) -> None:
         """Hasta que los motores lleguen. Si se pide quietud, se mide desde la primera
-        lectura de la ventana aceptada hasta que termina la espera."""
+        lectura de la ventana aceptada hasta que termina la espera.
+
+        `poll` menor que 0,05 s solo adelanta el pasaje a un punto de paso: la quietud y la
+        llegada con desvío cuentan lecturas nuevas de telemetría, no vueltas del bucle."""
         started = time.monotonic()
         snapshot = self.robot.snapshot()
         largest = max(
@@ -433,8 +485,9 @@ class MotionExecutor:
         stable = 0
         stable_since = started
         recent: list[tuple[float, dict[int, float]]] = []
+        last_reading = None
         while time.monotonic() < deadline:
-            if self._stop_requested(0.05):
+            if self._stop_requested(poll):
                 raise RuntimeError("Movimiento detenido por el operador.")
             snapshot = self.robot.snapshot()
             if snapshot.fault:
@@ -448,6 +501,11 @@ class MotionExecutor:
                 if timings is not None:
                     timings["arrival"] += sampled_at - started
                 return
+            if poll < 0.05:
+                reading = tuple(snapshot.received_at.get(motor_id) for motor_id in targets)
+                if reading == last_reading:
+                    continue  # sin telemetría nueva: no cuenta para la quietud
+                last_reading = reading
             stable = stable + 1 if max(errors.values()) <= ARRIVAL_TOLERANCE else 0
             if stable == 1:
                 stable_since = sampled_at
@@ -530,8 +588,14 @@ class SupervisedExecution:
     def __init__(
         self, policy: StagePolicy, limits: dict[int, tuple[float, float]], *,
         direct_demo: bool = False, carried_cube_check: Callable[[], Callable[[], bool] | None] | None = None,
+        sync_orders: bool = False,
     ):
         self.policy = policy
+        # Con `sync` cada paso es un mensaje: los pasos de un solo grupo también van
+        # «juntos» (su caja ya se revisó en la cadena) y pueden encadenarse.
+        self.sync_orders = sync_orders
+        self.chain_step = SYNC_CHAIN_STEP_DEGREES if sync_orders else CHAIN_STEP_DEGREES
+        self.blend_fraction = SYNC_BLEND_FRACTION if sync_orders else BLEND_FRACTION
         self.direct_demo = direct_demo
         self.carried_cube_check = carried_cube_check
         self.limits = limits
@@ -729,7 +793,7 @@ class SupervisedExecution:
                 for offset, (planned, after) in enumerate(chain):
                     first = len(groups)
                     groups.extend(planned)
-                    segments.append(MotionSegment(first, len(groups), len(planned) > 1,
+                    segments.append(MotionSegment(first, len(groups), len(planned) > 1 or self.sync_orders,
                                                   last_waypoint and offset == len(chain) - 1))
                     start.update(after)
                 continue
@@ -762,7 +826,7 @@ class SupervisedExecution:
         el salto va como antes)."""
         origin = {motor: planning[motor] for motor in range(1, 6)}
         largest = max(abs(waypoint[motor] - origin[motor]) for motor in range(1, 6))
-        count = max(2, math.ceil(largest / CHAIN_STEP_DEGREES))
+        count = max(2, math.ceil(largest / self.chain_step))
         return self._straight_chain(planning, waypoint, m6, m6_values, count)
 
     def _straight_chain(
@@ -829,7 +893,7 @@ class SupervisedExecution:
             corners = (*entry_bounds, before, target, poses[index + 1])
             if self._together_problem(before, poses[index + 1], m6_rules, m6_values, poses=corners,
                                       limit=BLEND_MAX_DEGREES) is None:
-                handoff = BLEND_FRACTION * step
+                handoff = self.blend_fraction * step
                 result[index] = dataclasses.replace(segment, handoff=handoff)
                 # Al encadenar de nuevo, un motor que no recibió orden en este tramo
                 # todavía puede estar llegando al destino del tramo anterior.

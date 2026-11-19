@@ -115,11 +115,20 @@ class _CubeLost(RuntimeError):
     """La física del gemelo detectó que el cubo se separó de la pinza."""
 
 
+def _executor_sync(app) -> bool | None:
+    """Para MotionExecutor: None usa `sync` si el firmware lo anunció; False, nunca."""
+    return None if getattr(app, "sync_orders", True) else False
+
+
 class App:
-    def __init__(self, root: tk.Tk, *, gemelo: bool = False, firmware_waypoints: bool = False):
+    def __init__(self, root: tk.Tk, *, gemelo: bool = False, firmware_waypoints: bool = False,
+                 sync_orders: bool = True):
         if firmware_waypoints and not gemelo:
             raise ValueError("Los puntos de firmware solo se prueban con --gemelo.")
         self.firmware_waypoints = firmware_waypoints
+        # Usar la orden `sync` (hasta cinco motores por mensaje) si el firmware la anuncia.
+        # `--sin-sync` vuelve a pair de a dos, como en la exposición.
+        self.sync_orders = sync_orders
         self.root = root
         self.config = load_config()
         # Gemelo digital: el brazo y las cámaras de MuJoCo detrás del mismo puerto serie
@@ -697,6 +706,11 @@ class App:
         name = "Frontal" if index == 0 else "Lateral"
         self.rotation_vars[index].set(f"{name}: {value}°")
 
+    def _sync_active(self) -> bool:
+        """Para planificar: `sync` habilitado y anunciado por el firmware conectado."""
+        return bool(self.sync_orders and self.robot is not None
+                    and getattr(self.robot, "sync_supported", False) is True)
+
     def connect_robot(self) -> None:
         if self.robot is not None and self.robot.connected:
             return
@@ -836,7 +850,8 @@ class App:
         if self.robot is not robot or not robot.connected or self.execution_busy or self.execution is not None:
             self.status.set("Cambió el estado del robot; volvé a solicitar el movimiento.")
             return
-        executor = MotionExecutor(robot, status=lambda text: self.worker_messages.put(("log", text)))
+        executor = MotionExecutor(robot, status=lambda text: self.worker_messages.put(("log", text)),
+                                  sync_orders=_executor_sync(self))
         self.manual_executor = executor
         self.execution_busy = True
         self.status.set(f"Moviendo M{motor_id} a {target:g}°…")
@@ -910,7 +925,8 @@ class App:
             recovery=True,
         )
         executor = MotionExecutor(
-            robot, status=lambda text: self.worker_messages.put(("log", text))
+            robot, status=lambda text: self.worker_messages.put(("log", text)),
+            sync_orders=_executor_sync(self),
         )
         self.manual_executor = executor
         self.execution_busy = True
@@ -1270,7 +1286,7 @@ class App:
         if gripper_problem:
             self.status.set("Para iniciar la tarea automática: " + gripper_problem)
             return
-        self.execution = SupervisedExecution(policy, self.config.limits)
+        self.execution = SupervisedExecution(policy, self.config.limits, sync_orders=self._sync_active())
         run_log = ExecutionLog(
             self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "ejecuciones",
             {
@@ -1284,6 +1300,7 @@ class App:
                 },
                 "cameras": self.camera_configuration(),
                 "limits": {str(key): list(value) for key, value in self.config.limits.items()},
+                "sync": self.execution.sync_orders,
             },
         )
 
@@ -1294,7 +1311,8 @@ class App:
                 run_log.note("aviso", text, None if proposal is None else proposal.stage)
 
         # Detener/EMERGENCIA cortan también una parada pedida entre dos etapas.
-        self.executor = MotionExecutor(self.robot, status=executor_status, abort=self.auto_stop)
+        self.executor = MotionExecutor(self.robot, status=executor_status, abort=self.auto_stop,
+                                       sync_orders=_executor_sync(self))
         self.execution_log = run_log
         self.logged_scene = None
         self.automatic_verification = None
@@ -1894,7 +1912,7 @@ class App:
         self.set_camera_controls_enabled(False)
         self.executor = MotionExecutor(
             robot, status=lambda text: self.worker_messages.put(("log", text)), abort=self.auto_stop,
-            firmware_waypoints=self.firmware_waypoints)
+            firmware_waypoints=self.firmware_waypoints, sync_orders=_executor_sync(self))
         who = "Gemelo" if self.twin is not None else "Brazo"
         limit = f"{cycles} vueltas" if cycles else "hasta Detener"
         self.auto_status.set(f"Demo ({limit}): preparando...")
@@ -1961,10 +1979,12 @@ class App:
             execution = SupervisedExecution(
                 policy, self.config.limits, direct_demo=direct,
                 carried_cube_check=carried_cube_check if direct else None,
+                sync_orders=self._sync_active(),
             )
             run_log = ExecutionLog(root, {
                 "port": self.robot.port, "gemelo": self.twin is not None, "modo": "demo", "vuelta": cycle,
                 "poses_directas": execution.direct_demo,
+                "sync": execution.sync_orders,
                 "politica": dict(policy.metadata), "cameras": self.camera_configuration(),
                 "limits": {str(key): list(value) for key, value in self.config.limits.items()},
             })
@@ -2185,7 +2205,8 @@ class App:
 if __name__ == "__main__":
     root = tk.Tk()
     application = App(root, gemelo="--gemelo" in sys.argv,
-                      firmware_waypoints="--puntos-firmware" in sys.argv)
+                      firmware_waypoints="--puntos-firmware" in sys.argv,
+                      sync_orders="--sin-sync" not in sys.argv)
     if "--trayecto-simulado" in sys.argv:
         root.after(200, application.open_trajectory_simulator)
     if "--calibracion" in sys.argv:

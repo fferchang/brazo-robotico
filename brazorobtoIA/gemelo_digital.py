@@ -53,6 +53,8 @@ def parse_args(argv=None):
     parser.add_argument("--giro-max", type=float, default=5.0,
                         help="Giro máximo de cubo y recipiente en grados (alineados a mano).")
     parser.add_argument("--recalibrar", action="store_true", help="Recalcula la calibración de las cámaras virtuales.")
+    parser.add_argument("--sin-sync", action="store_true",
+                        help="Órdenes de a dos motores (pair), como el firmware de la exposición.")
     args = parser.parse_args(argv)
     if args.episodios < 1:
         parser.error("--episodios tiene que ser 1 o más.")
@@ -64,8 +66,9 @@ def parse_args(argv=None):
 class TwinSession:
     """Gemelo, cámaras virtuales, puerto serie virtual y política geométrica."""
 
-    def __init__(self, config, twin: DigitalTwin, log=print):
+    def __init__(self, config, twin: DigitalTwin, log=print, *, sync_orders: bool = True):
         self.config = config
+        self.sync_orders = sync_orders
         self.twin = twin
         self.log = log
         self.cameras = [VirtualCameraStream(twin, "frontal", 0), VirtualCameraStream(twin, "lateral", 1)]
@@ -139,10 +142,13 @@ class TwinSession:
             problem = validate_stage_gripper("inicio", current[6], self.robot.snapshot().gripper_state)
             if problem:
                 raise RuntimeError(problem)
-            execution = SupervisedExecution(self.policy, self.config.limits)
+            sync = self.sync_orders and self.robot.sync_supported
+            entry["sync"] = sync
+            execution = SupervisedExecution(self.policy, self.config.limits, sync_orders=sync)
             warnings = entry.setdefault("avisos", [])
             executor = MotionExecutor(self.robot, status=lambda text: warnings.append(text)
-                                      if text.startswith("Llegada con desvío") else None)
+                                      if text.startswith("Llegada con desvío") else None,
+                                      sync_orders=None if self.sync_orders else False)
             while not execution.finished:
                 current = self.wait_stable()
                 proposal = execution.prepare(current, self.observations())
@@ -206,7 +212,7 @@ def main(argv=None) -> int:
         viewer = mujoco.viewer.launch_passive(twin.arm.model, twin.arm.data)
         twin.viewer = viewer
     print("Conectando al firmware virtual...", flush=True)
-    session = TwinSession(config, twin, log=lambda text: print(text, flush=True))
+    session = TwinSession(config, twin, log=lambda text: print(text, flush=True), sync_orders=not args.sin_sync)
     results = []
     started = time.monotonic()
     try:

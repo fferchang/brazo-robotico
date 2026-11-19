@@ -26,6 +26,7 @@ WAYPOINT_REPLY = re.compile(r"WAYPOINT_(ACCEPTED|DONE|CANCELLED|REJECTED) id=(\d
 
 FAULT_MARKERS = (
     "pair_rejected",
+    "sync_rejected",
     "bloqueado",
     "fuera de rango",
     "sin respuesta",
@@ -177,6 +178,9 @@ class RobotSerial:
         self._waypoint_reply: tuple[int, str, str] | None = None
         self.gripper_holds = 0
         self.gripper_hold_reason = ""
+        # El firmware con la orden `sync` lo anuncia al responder `caps`; el cargado
+        # el 6/11 no responde y queda en False: se sigue usando pair como siempre.
+        self.sync_supported = False
         # Medición de la fuente: última muestra, CSV abierto y la etapa que la app anota.
         self.power_last: PowerSample | None = None
         self.power_last_at = 0.0
@@ -210,6 +214,7 @@ class RobotSerial:
         self.events.put(RobotEvent(time.monotonic(), "connected", self.port))
         # Lectura solamente: conectar nunca ordena movimiento ni cambia torque.
         self.send("posall")
+        self.send("caps")
 
     def disconnect(self) -> None:
         self.stop_event.set()
@@ -374,8 +379,10 @@ class RobotSerial:
                 self.gripper_holds += 1
                 reason = next((part[7:] for part in line.split() if part.startswith("reason=")), "")
                 self.gripper_hold_reason = reason
-            elif line.startswith("Moviendo ID") or line.startswith("PAIR_MOVE_OK"):
+            elif line.startswith(("Moviendo ID", "PAIR_MOVE_OK", "SYNC_MOVE_OK")):
                 self.move_acks += 1
+            elif line.startswith("FIRMWARE_CAPS "):
+                self.sync_supported = "sync=1" in line.split()
             elif line.startswith("POWER_TELEM "):
                 sample = parse_power(line)
                 if sample is not None:

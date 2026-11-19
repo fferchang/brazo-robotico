@@ -147,6 +147,10 @@ Es la «etapa 2» de la vuelta más rápida. Hace falta:
 Con la etapa 1 la vuelta de la demo bajó de ~88 s a ~39 s en el gemelo. Lo que queda
 lento son los movimientos grandes (salir de Inicio y volver), que van «en escalera».
 - Esfuerzo: alto (firmware, planificador y gemelo).
+- Avance (19/11): el primer punto está hecho con la orden `sync` (cinco motores por
+  mensaje, revisión de la recta en el firmware). En el gemelo la vuelta bajó a ~34 s y
+  las frenadas entre órdenes de 98% a 43%. Falta cargarlo y medirlo en el brazo real,
+  y anticipar la preparación de Guardado (~6 s en el gemelo).
 
 ### Comunicación más rápida con el ESP32
 Hoy los comandos y la telemetría van como texto a 115200 baudios, con las posiciones
