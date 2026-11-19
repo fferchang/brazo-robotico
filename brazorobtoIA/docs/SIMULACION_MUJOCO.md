@@ -19,6 +19,7 @@ Se agregan al `.bat` o a `simulacion_mujoco.py`:
 - `--ritmo X`: velocidad del visor respecto del tiempo real (2 = el doble).
 - `--sin-visor`: sin ventana, lo más rápido posible (~1 s por episodio).
 - `--rerun`: muestra también brazo, cubo y recipiente en Rerun.
+- `--paneles`: el visor con los paneles de los costados (por defecto, solo la escena; Tab los muestra).
 - `--fotos`: guarda en `datos/simulacion/` una foto de cada cámara virtual por
   etapa, con los mismos nombres que las demostraciones reales, y un `metadata.json`.
 - `--cerrar-al-terminar`: cierra el visor al final en lugar de esperar.

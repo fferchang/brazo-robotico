@@ -95,6 +95,10 @@ GRIP_SETTLE_MA = 300.0
 # (~390 mA) detecta el contacto antes; en la física agarra y sostiene igual (40/40 con
 # ambos, M6 sosteniendo a ~38,5° en vez de ~38°). La garra libre consume 6–20 mA.
 GRIPPER_CONTACT_RAW = 60
+# Modo clásico: el umbral con que arranca el firmware (92, ~600 mA), el de las primeras corridas
+# que funcionaron. Aprieta más: en el gemelo, con la demo clásica, 60 dejó caer el cubo en
+# Traslado 3 en 2 de 5 intentos y 92 en ninguno de 4. Contra: la fuente cae más al cerrar.
+CLASSIC_CONTACT_RAW = 92
 GRIP_SETTLE_SECONDS = 0.8
 GRIP_SETTLE_TIMEOUT_SECONDS = 2.0
 POWER_FRESH_SECONDS = 0.5
@@ -137,6 +141,8 @@ class MotionProposal:
     gripper_at_group: int | None = None
     # Vacío: cada grupo por separado, esperando que el brazo quede quieto (como antes).
     segments: tuple[MotionSegment, ...] = ()
+    # Umbral de contacto del cierre por presión, en crudo; None: GRIPPER_CONTACT_RAW.
+    contact_raw: int | None = None
 
 
 class MotionExecutor:
@@ -202,7 +208,7 @@ class MotionExecutor:
                     if angle:
                         self._send_gripper_angle(proposal.gripper_degrees)
                     else:
-                        self._send_gripper_close()
+                        self._send_gripper_close(proposal.contact_raw)
                 gripper_sent = True
             groups = proposal.groups[segment.start:segment.end]
             if segment.together and len(groups) > 1:
@@ -249,7 +255,7 @@ class MotionExecutor:
             with _time_phase(timings, "gripper"):
                 if not gripper_sent:
                     holds_before = getattr(self.robot.snapshot(), "gripper_holds", None)
-                    self._send_gripper_close()
+                    self._send_gripper_close(proposal.contact_raw)
                 self._wait_gripper_hold(holds_before, timeout=16.0)
                 if proposal.stage == "agarre" and getattr(self.robot.snapshot(), "gripper_hold_reason", "") == "closed_limit":
                     # Cerró hasta el tope sin tocar nada: no hay cubo entre los dedos.
@@ -326,9 +332,9 @@ class MotionExecutor:
         detail = "sin lectura" if current is None else f"{current:.0f} mA"
         self.status(f"La garra sigue consumiendo {detail} después de agarrar; se levanta igual.")
 
-    def _send_gripper_close(self) -> None:
+    def _send_gripper_close(self, contact_raw: int | None = None) -> None:
         self.status("Cerrando la garra por presión...")
-        self.robot.send(f"gripper current {GRIPPER_CONTACT_RAW}")
+        self.robot.send(f"gripper current {GRIPPER_CONTACT_RAW if contact_raw is None else contact_raw}")
         self.robot.send("gripper close")
 
     def _wait_gripper_hold(self, holds_before: int | None, timeout: float) -> None:
@@ -530,9 +536,15 @@ class SupervisedExecution:
     def __init__(
         self, policy: StagePolicy, limits: dict[int, tuple[float, float]], *,
         direct_demo: bool = False, carried_cube_check: Callable[[], Callable[[], bool] | None] | None = None,
+        classic: bool = False,
     ):
         self.policy = policy
-        self.direct_demo = direct_demo
+        # Modo clásico (el de antes de las optimizaciones del 6/11): cada tramo por separado,
+        # esperando que el brazo quede quieto, y la garra de las demostraciones a mano con el
+        # brazo quieto. Más lento, pero cada movimiento es uno solo y suave. Va con un experto
+        # armado con mujoco_sim.CLASSIC_EXPERT.
+        self.classic = classic
+        self.direct_demo = direct_demo and not classic
         self.carried_cube_check = carried_cube_check
         self.limits = limits
         self.next_stage_index = 1
@@ -601,6 +613,9 @@ class SupervisedExecution:
         # el modelo aprendido no tiene.
         via_points = self.policy.via(stage_index, self.scene_features) if hasattr(self.policy, "via") else []
         waypoints = (*via_points, target)
+        if self.classic:
+            self.proposal = self._classic_proposal(stage_index, stage, current, start, waypoints, target)
+            return self.proposal
         if hasattr(self.policy, "gripper_step"):
             # La política geométrica elige cómo y cuándo mover la garra (mujoco_sim.EXPERT_GRIPPER_STEPS).
             gripper_action, gripper_degrees, timing = self.policy.gripper_step(stage_index, self.scene_features)
@@ -657,6 +672,41 @@ class SupervisedExecution:
             segments=tuple(segments),
         )
         return self.proposal
+
+    def _classic_proposal(self, stage_index, stage, current, start, waypoints, target) -> MotionProposal:
+        """La etapa como antes del 6/11: los tramos de cada punto en orden, cada uno por
+        separado y esperando quietud (sin segmentos), y la garra al final, quieta."""
+        groups = []
+        for waypoint in waypoints:
+            planned = build_motion_plan(start, waypoint, self.limits)
+            groups.extend(planned)
+            # El planificador no mueve un motor por menos de 0,5°: el tramo siguiente
+            # parte de lo ordenado, no del punto. Si no, con puntos cercanos (el empuje
+            # avanza de a 4 mm) un motor que cambia poco en cada uno nunca se movería.
+            for group in planned:
+                start.update(dict(group.targets))
+        if hasattr(self.policy, "gripper_step"):
+            # El experto clásico (mujoco_sim.CLASSIC_EXPERT) abre una sola vez y cierra en Agarre.
+            gripper_action = self.policy.gripper_step(stage_index, self.scene_features)[0]
+            if gripper_action == "angle":
+                gripper_action = "open"  # sin mover la garra en camino: del todo, con el brazo quieto
+        else:
+            gripper_action = LEGACY_GRIPPER_ACTIONS.get(stage)
+        if gripper_action == "open":
+            # Los tramos se revisan con la garra como está; abrirla al final agranda su
+            # contorno y puede barrer la mesa si queda horizontal y baja.
+            problem = gripper_sweep_problem((target[2], target[3], target[4]), current.get(6), GRIPPER_OPEN_TARGET)
+            if problem:
+                raise ValueError(f"{STAGE_LABELS[stage]}: no se puede abrir la garra ahí: {problem}.")
+        return MotionProposal(
+            stage_index=stage_index,
+            stage=stage,
+            label=STAGE_LABELS[stage],
+            target=target,
+            groups=tuple(groups),
+            gripper_action=gripper_action,
+            contact_raw=CLASSIC_CONTACT_RAW if gripper_action == "close" else None,
+        )
 
     def _direct_transfer(self, start, m6) -> MotionProposal | None:
         if m6 is None or not math.isfinite(m6) or self.policy.container_obstacle:

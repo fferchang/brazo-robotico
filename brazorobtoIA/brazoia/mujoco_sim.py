@@ -93,6 +93,16 @@ EXPERT_GRIPPER_STEPS = {
     "soltado": ("angle", "open", "after"),
     "guardado": ("close", None, "final"),
 }
+# Modo clásico: el de las primeras corridas que funcionaron en el brazo real (5–6/11), antes
+# de las optimizaciones de velocidad, con un solo cambio: la garra abre del todo una sola vez
+# (en Aproximación 2) y no cierra ni vuelve a abrir sobre el cubo, el tiempo perdido que el
+# usuario señaló primero. Siempre con el brazo quieto. El agarre empuja 18/15 mm: arrastra un
+# poco el cubo, pero aguanta más error de ubicación de las cámaras que 10/6.
+# Va con SupervisedExecution(classic=True): cada tramo por separado, esperando quietud.
+CLASSIC_GRIPPER_STEPS = {stage: (action, None, "after") for stage, action in
+                         (("aproximacion_2", "open"), ("agarre", "close"), ("soltado", "open"), ("guardado", "close"))}
+CLASSIC_EXPERT = {"push_clearance": 0.018, "push_extra": 0.015, "open_degrees": GRIPPER_OPEN,
+                  "gripper_steps": CLASSIC_GRIPPER_STEPS}
 
 PART_NAMES = {"world": "base", "shoulder": "hombro", "upper_arm": "brazo", "lower_arm": "antebrazo",
               "wrist": "muñeca", "gripper": "garra", "jaw": "dedo móvil"}
@@ -696,8 +706,11 @@ class PickPlaceExpert:
                              {1: 180.0, 2: 212.0, 3: 90.0, 4: 224.0, 5: 263.0})
 
     def __init__(self, arm: VirtualArm, *, grasp_height=0.028, side_gap=0.003, release_margin=0.03,
-                 push_clearance=0.010, push_extra=0.006, push_step=0.004, open_degrees=GRIPPER_GRASP_OPEN):
+                 push_clearance=0.010, push_extra=0.006, push_step=0.004, open_degrees=GRIPPER_GRASP_OPEN,
+                 gripper_steps=None):
         self.arm = arm
+        # Qué hace la garra en cada etapa: EXPERT_GRIPPER_STEPS, o CLASSIC_GRIPPER_STEPS (CLASSIC_EXPERT).
+        self.gripper_steps = EXPERT_GRIPPER_STEPS if gripper_steps is None else gripper_steps
         # Apertura de la garra para bajar al costado del cubo y para soltarlo (ver GRIPPER_GRASP_OPEN).
         self.open_degrees = float(open_degrees)
         # El dedo móvil cierra en arco y toca primero cerca de la arista superior
@@ -856,7 +869,7 @@ class PickPlaceExpert:
         return Plan(keyframes, warnings + self._check_path(keyframes))
 
     def _keyframe(self, stage, pose, via) -> Keyframe:
-        action, degrees, timing = EXPERT_GRIPPER_STEPS.get(stage, (None, None, "after"))
+        action, degrees, timing = self.gripper_steps.get(stage, (None, None, "after"))
         if degrees == "open":
             degrees = self.open_degrees
         if timing == "final" and not via:

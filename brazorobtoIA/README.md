@@ -247,11 +247,52 @@ Cada vuelta usa lo mismo que **HACER LA TAREA SOLA** (la calibración de cámara
 el planificador, el ejecutor y las reglas del firmware), sin confirmar cada
 etapa. **Vueltas: 0** sigue hasta **Detener** o **EMERGENCIA**. Entre vueltas
 espera 2 s en Inicio y mira dónde quedó el cubo: si quedó a más de 40 mm del
-destino lo anota y sigue, y si no lo ve, se frena. Si una etapa se bloquea, la
-demo se frena y el brazo queda donde estaba. Cada vuelta se registra en
+destino lo anota y sigue. Si una vuelta falla (una etapa se bloquea, no ve el
+cubo o lo pierde) y está marcada la casilla de reintento (lo está por defecto),
+la demo se recupera sola: si sostiene el cubo (contacto, no un cierre en vacío)
+espera a que el brazo quede quieto y lo suelta donde está; sube la garra en
+vertical antes de girar la base, vuelve a Inicio, cierra la garra, espera 5 s y
+lo busca de nuevo con las cámaras. Reintenta hasta 5 veces seguidas
+(`DEMO_MAX_RETRIES` en `app.py`); si la vuelta siguiente también falla, se rinde.
+No reintenta ante un fallo del firmware (sobrecorriente, torque), Detener,
+EMERGENCIA o un brazo que no vuelve a Inicio (eso pide revisarlo a mano). Sin la casilla, la demo se frena y el brazo queda donde estaba. En
+el gemelo, si no encuentra el cubo pone una escena nueva, como haría una
+persona. Para dejarla sola, abrir `lanzadores/DEMO_BRAZO.bat`: es la app de
+siempre, pero evita que la PC se suspenda o apague la pantalla con el cargador
+enchufado (`powercfg`; el cambio queda después). Cada vuelta se registra en
 `datos/demo/` (en el gemelo, `datos/gemelo/demo/`) con la foto de Inicio, la final
 y las de los bloqueos. En el gemelo, la demo saca el recipiente de la mesa: para
 volver a la tarea normal, **Nueva escena**.
+
+### Modo clásico y movimiento rápido
+
+Por defecto, la demo y **HACER LA TAREA SOLA** usan el **modo clásico**, el de las
+primeras corridas que funcionaron en el brazo real (5–6/11): un movimiento por vez
+(cada tramo de uno o dos motores, esperando que el brazo quede quieto), agarre
+empujando 18/15 mm y cierre de la garra con el umbral 92 del firmware. Tiene un
+solo cambio respecto de entonces: la garra abre del todo una vez, en Aproximación
+2, y ya no cierra y vuelve a abrir sobre el cubo. En el gemelo tarda ~72–80 s por
+vuelta (14/11: demo 4/4, tarea con recipiente 3/3), y en el brazo real ~71–87 s.
+La casilla **Movimiento rápido (experimental)** vuelve a las optimizaciones del
+6/11 (tramos juntos, garra a 90° en camino, agarre 10/6 mm): ~39 s por vuelta,
+pero en el brazo real se veía trabado y el 14/11 falló el agarre seguido.
+
+Las cámaras no se tienen que mover después de calibrarlas: la calibración pasa de
+píxeles a la mesa con la pose de cada cámara. El 14/11, en otra sala, la frontal
+quedó ~57 px más abajo en la imagen: el cubo salía «fuera de la zona calibrada» y
+la garra cerraba sin agarrarlo. Con la cámara reacomodada (~11 px de diferencia)
+la demo volvió a andar sola.
+
+### Ver el brazo en 3D
+
+**Ver en 3D (MuJoCo)** (barra de arriba) abre el visor de MuJoCo con el brazo
+copiando la pose del real, solo la escena, sin los paneles de los costados (Tab y
+Shift+Tab los muestran). Se abre y se actualiza en su propio hilo: arrastrar su
+ventana, por ejemplo al proyector, no congela la app ni el botón de EMERGENCIA.
+Con el gemelo abre la física del gemelo con el mismo encuadre. **Abrir Rerun**
+sigue al lado: muestra la propuesta de cada etapa del modo paso a paso y la
+distancia garra-mesa en vivo. La simulación MuJoCo y el gemelo por consola
+también abren el visor sin paneles (`--paneles` para verlos).
 
 ## Simulación física en MuJoCo
 

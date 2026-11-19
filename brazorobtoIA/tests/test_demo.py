@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 import types
 import unittest
+import unittest.mock
 
 import mujoco
 import numpy as np
@@ -171,6 +172,202 @@ class DemoInicioTests(unittest.TestCase):
         self.assertIn("imagen actual", App._demo_inicio_problem(self.ui(), self.pair(age=5.0), seen))
         hidden = [seen[0], SceneObservation(None, None)]
         self.assertIn("lateral no ve el cubo", App._demo_inicio_problem(self.ui(), self.pair(), hidden))
+
+
+class DemoRetryTests(unittest.TestCase):
+    """Tras una vuelta fallida, la demo se recupera sola y sigue (con un tope de fallas)."""
+
+    def fake(self, outcomes, *, fault=None):
+        import queue
+        import threading
+
+        calls = {"cycles": 0, "recover": []}
+
+        def cycle(_policy, _who, _cycle, _cycles, done, *_rest):
+            calls["cycles"] += 1
+            outcome = outcomes.pop(0) if outcomes else None
+            if outcome is not None:
+                raise outcome
+            done[0] += 1
+
+        ui = types.SimpleNamespace(
+            config=types.SimpleNamespace(root=CONFIG.root), twin=None, auto_stop=threading.Event(),
+            emergency_active=False, operator_stop=False, worker_messages=queue.Queue(),
+            robot=types.SimpleNamespace(snapshot=lambda: types.SimpleNamespace(fault=fault)),
+            _set_auto_status_from_worker=lambda _text: None,
+        )
+        ui._demo_cycle = cycle
+        ui._demo_recover = lambda _policy, rejected: calls["recover"].append(rejected)
+        return ui, calls
+
+    def test_retries_after_failures_and_counts_only_complete_laps(self) -> None:
+        from app import _Rejected
+
+        ui, calls = self.fake([RuntimeError("bloqueo"), _Rejected("no ve el cubo")])
+        done = [0]
+        App._demo_cycles(ui, None, "Brazo", 2, done, retry=True)
+        self.assertEqual(done[0], 2)
+        self.assertEqual(calls["cycles"], 4)
+        self.assertEqual(calls["recover"], [False, True])
+
+    def test_gives_up_after_too_many_failures_in_a_row(self) -> None:
+        from app import DEMO_MAX_RETRIES
+
+        ui, calls = self.fake([RuntimeError("bloqueo")] * (DEMO_MAX_RETRIES + 1))
+        with self.assertRaisesRegex(RuntimeError, "seguidas"):
+            App._demo_cycles(ui, None, "Brazo", 0, [0], retry=True)
+        self.assertEqual(len(calls["recover"]), DEMO_MAX_RETRIES)
+
+    def test_no_retry_when_disabled_stopped_or_with_a_fault(self) -> None:
+        ui, calls = self.fake([RuntimeError("bloqueo")])
+        with self.assertRaises(RuntimeError):
+            App._demo_cycles(ui, None, "Brazo", 1, [0], retry=False)
+        ui, calls = self.fake([RuntimeError("Detenido por el operador.")])
+        ui.auto_stop.set()
+        with self.assertRaises(RuntimeError):
+            App._demo_cycles(ui, None, "Brazo", 1, [0], retry=True)
+        ui, calls = self.fake([RuntimeError("sobrecorriente")], fault="M6 sobrecorriente")
+        with self.assertRaises(RuntimeError):
+            App._demo_cycles(ui, None, "Brazo", 1, [0], retry=True)
+        self.assertEqual(calls["recover"], [])
+
+
+    def test_needs_hands_is_never_retried(self) -> None:
+        from app import _NeedsHands
+
+        ui, calls = self.fake([_NeedsHands("el brazo no vuelve a Inicio")])
+        with self.assertRaises(_NeedsHands):
+            App._demo_cycles(ui, None, "Brazo", 0, [0], retry=True)
+        self.assertEqual(calls["recover"], [])
+
+    def test_twin_cube_loss_is_retried_but_an_operator_stop_is_kept(self) -> None:
+        from app import _CubeLost
+
+        ui, calls = self.fake([_CubeLost("se le cayó")])
+        ui.auto_stop.set()  # lo puso el monitor del cubo del gemelo
+        done = [0]
+        App._demo_cycles(ui, None, "Gemelo", 1, done, retry=True)
+        self.assertEqual((done[0], calls["recover"]), (1, [False]))
+        ui, calls = self.fake([_CubeLost("se le cayó")])
+        ui.operator_stop = True  # y además el operador tocó Detener
+        ui.auto_stop.set()
+        with self.assertRaises(_CubeLost):
+            App._demo_cycles(ui, None, "Gemelo", 1, [0], retry=True)
+        self.assertTrue(ui.auto_stop.is_set())
+        self.assertEqual(calls["recover"], [])
+
+
+class GripperHasObjectTests(unittest.TestCase):
+    def test_only_a_contact_hold_at_holding_angle_counts(self) -> None:
+        from app import gripper_has_object
+
+        self.assertTrue(gripper_has_object("holding", "contact", 40.0))
+        self.assertFalse(gripper_has_object("holding", "closed_limit", 1.2))  # cerró en vacío
+        self.assertFalse(gripper_has_object("holding", "contact", 1.2))
+        self.assertFalse(gripper_has_object("holding", "contact", 90.0))  # abierta por ángulo después
+        self.assertFalse(gripper_has_object("opening", "contact", 40.0))
+        self.assertFalse(gripper_has_object("holding", "contact", None))
+
+
+class FakeGripperRobot:
+    """Lo mínimo del brazo para la recuperación: M6, estado de la garra y las órdenes."""
+
+    def __init__(self, m6, state, reason, holds=3):
+        import threading
+
+        self.lock = threading.Lock()
+        self.m6, self.state, self.reason, self.holds = m6, state, reason, holds
+        self.sent = []
+
+    def send(self, command):
+        self.sent.append(command)
+        if command == "gripper open":
+            self.m6, self.state = 137.2, "opening"
+        elif command == "gripper close":
+            self.m6, self.state, self.reason, self.holds = 1.2, "holding", "closed_limit", self.holds + 1
+
+    def snapshot(self):
+        return types.SimpleNamespace(positions={6: self.m6}, gripper_state=self.state,
+                                     gripper_hold_reason=self.reason, gripper_holds=self.holds, fault="")
+
+
+class DemoRecoverTests(unittest.TestCase):
+    """La recuperación suelta el cubo solo si lo sostiene y sube antes de girar la base."""
+
+    LOW = {1: 150.0, 2: 189.5, 3: 191.9, 4: 248.7, 5: 226.4}   # agarre (garra a ~28 mm)
+    HIGH = {1: 160.0, 2: 150.0, 3: 175.0, 4: 255.0, 5: 240.0}  # traslado
+
+    def recover(self, robot, pose):
+        import threading
+
+        calls = []
+        policy = types.SimpleNamespace(canonical_start=[INITIAL_POSE[m] for m in range(1, 6)])
+        ui = types.SimpleNamespace(
+            robot=robot, config=CONFIG, twin=None, auto_stop=threading.Event(),
+            _wait_stable_pose=lambda _robot: {**pose, 6: robot.m6},
+            _demo_lift=lambda _policy, current, m6: calls.append(("subir", round(m6))),
+            executor=types.SimpleNamespace(execute=lambda proposal: calls.append(("a_inicio", proposal.stage))),
+        )
+        with unittest.mock.patch("app.DEMO_RETRY_SECONDS", 0.01):
+            App._demo_recover(ui, policy, rejected=False)
+        return calls
+
+    def test_empty_closed_gripper_is_not_opened_and_rises_before_turning(self) -> None:
+        robot = FakeGripperRobot(1.2, "holding", "closed_limit")  # «cerró hasta el tope sin agarrar»
+        calls = self.recover(robot, self.LOW)
+        self.assertEqual(robot.sent, [])
+        self.assertEqual(calls, [("subir", 1), ("a_inicio", "recuperacion_inicio")])
+
+    def test_held_cube_is_released_then_the_gripper_rises_returns_and_closes(self) -> None:
+        robot = FakeGripperRobot(40.0, "holding", "contact")
+        calls = self.recover(robot, self.HIGH)
+        self.assertEqual(robot.sent[0], "gripper open")
+        self.assertEqual(robot.sent[-1], "gripper close")
+        self.assertEqual(calls, [("subir", 137), ("a_inicio", "recuperacion_inicio")])
+
+    def test_closing_on_something_at_inicio_stops_the_demo(self) -> None:
+        robot = FakeGripperRobot(137.2, "opening", "contact")
+        original = robot.send
+
+        def send(command):
+            original(command)
+            if command == "gripper close":
+                robot.m6, robot.reason = 30.0, "contact"  # algo entre los dedos
+
+        robot.send = send
+        with self.assertRaisesRegex(RuntimeError, "volvió a agarrar"):
+            self.recover(robot, self.HIGH)
+
+
+class DemoLiftTests(unittest.TestCase):
+    def test_lift_rises_straight_up_without_turning_the_base_or_wrist(self) -> None:
+        from brazoia.demo import lift_waypoints
+
+        arm = VirtualArm(limits=CONFIG.limits)
+        expert = TablePlaceExpert(arm)
+        plan = expert.plan(Placement(DEMO_SPOTS[0], 0.0, DEMO_SPOTS[1], 0.0))
+        grasp = dict(plan.keyframes[KEYFRAME_STAGES.index("agarre")].pose)
+        points = lift_waypoints(expert, {**grasp, 6: 1.0}, 1.0)
+        self.assertGreaterEqual(len(points), 3)
+        self.assertAlmostEqual(pinza(arm, points[-1])[2] - arm.floor_z, 0.10, delta=0.002)
+        for point in points:
+            self.assertLess(abs(point[1] - grasp[1]), 1.0)
+            self.assertLess(abs(point[5] - grasp[5]), 1.0)
+        start_xy = pinza(arm, grasp)[:2]
+        for point in points:
+            self.assertLess(np.linalg.norm(pinza(arm, point)[:2] - start_xy), 0.004)  # en vertical
+        self.assertEqual(lift_waypoints(expert, {**points[-1], 6: 1.0}, 1.0), [])  # ya arriba
+
+    def test_unsolvable_lift_asks_for_hands_instead_of_retrying(self) -> None:
+        import app
+
+        policy = types.SimpleNamespace(expert=object())
+        ui = types.SimpleNamespace(config=CONFIG)
+        from brazoia.mujoco_sim import PlanningError
+
+        with unittest.mock.patch("brazoia.demo.lift_waypoints", side_effect=PlanningError("sin pose")):
+            with self.assertRaises(app._NeedsHands):
+                App._demo_lift(ui, policy, {**INITIAL_POSE, 6: 1.0}, 1.0)
 
 
 class DemoButtonTests(unittest.TestCase):

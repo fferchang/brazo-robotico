@@ -47,6 +47,8 @@ def parse_args(argv=None):
     parser.add_argument("--episodios", type=int, default=3, help="Escenas a probar (por defecto 3).")
     parser.add_argument("--semilla", type=int, default=1, help="Semilla de las ubicaciones.")
     parser.add_argument("--visor", action="store_true", help="Abre la ventana de MuJoCo para ver el brazo.")
+    parser.add_argument("--paneles", action="store_true",
+                        help="Con --visor: los paneles de los costados (por defecto, solo la escena; Tab los muestra).")
     parser.add_argument("--ritmo", type=float, default=1.0,
                         help="Velocidad respecto del tiempo real (1 = real). Las esperas del ejecutor son de "
                              "tiempo real: con más de 1 dejan de medir lo que pasaría en el brazo.")
@@ -203,7 +205,9 @@ def main(argv=None) -> int:
     if args.visor:
         import mujoco.viewer
 
-        viewer = mujoco.viewer.launch_passive(twin.arm.model, twin.arm.data)
+        from brazoia.mujoco_view import launch_scene_viewer
+
+        viewer = launch_scene_viewer(twin.arm.model, twin.arm.data, panels=args.paneles)
         twin.viewer = viewer
     print("Conectando al firmware virtual...", flush=True)
     session = TwinSession(config, twin, log=lambda text: print(text, flush=True))

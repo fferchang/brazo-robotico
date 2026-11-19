@@ -18,6 +18,8 @@ from serial.tools import list_ports
 
 from brazoia.capture import CameraStream, discover_camera_index, validate_frame_pair
 from brazoia.config import (
+    GRIPPER_CLOSED_MAX_DEGREES,
+    GRIPPER_OPEN_MIN_DEGREES,
     INITIAL_POSE,
     KEYFRAME_STAGES,
     REFERENCE_POSE,
@@ -34,10 +36,12 @@ from brazoia.planner import (
     build_motion_plan,
     edge_safe,
     floor_escape,
+    GRIPPER_OPEN_TARGET,
     gripper_sweep_problem,
     planning_start,
 )
 from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
+from brazoia.mujoco_view import MujocoArmView, launch_scene_viewer
 from brazoia.rerun_view import RerunArmView
 from brazoia.robot import RobotEvent, RobotSerial
 from brazoia.runlog import ExecutionLog
@@ -51,6 +55,13 @@ PREVIEW_SIZE = (480, 272)
 POLICY_SUMMARY_KEYS = ("tipo", "calibracion", "demonstrations", "mean_absolute_error_degrees", "validation_passed")
 # Pausa de la demo en la pose de Inicio entre una vuelta y la siguiente.
 DEMO_PAUSE_SECONDS = 2.0
+# Demo sin intervención: tras una vuelta fallida suelta el cubo si lo sostiene, sube la garra,
+# vuelve a Inicio y lo busca de nuevo. Reintenta hasta DEMO_MAX_RETRIES veces seguidas; si la
+# vuelta siguiente también falla, se rinde.
+DEMO_MAX_RETRIES = 5
+# Con el cubo agarrado M6 queda en ~36–45° (demostraciones reales); más abierta, no sostiene.
+GRIPPER_HOLD_MAX_DEGREES = 70.0
+DEMO_RETRY_SECONDS = 5.0
 
 
 def build_reference_pose_plan(
@@ -111,6 +122,19 @@ class _Rejected(RuntimeError):
     """La tarea autónoma no arranca o no sigue: no se movió nada."""
 
 
+class _NeedsHands(RuntimeError):
+    """La demo o la tarea no pueden seguir solas: hay que revisar el brazo (no se reintenta)."""
+
+
+def gripper_has_object(state: str, reason: str, m6: float | None) -> bool:
+    """La garra sostiene algo: GRIPPER_HOLD por contacto y M6 en el rango de sostener el cubo.
+
+    El firmware también manda GRIPPER_HOLD al cerrar en vacío (reason=closed_limit, M6 ~1°), y
+    el estado queda «holding» aunque después se abra por ángulo (M6 a 90°)."""
+    return (state == "holding" and reason == "contact" and m6 is not None
+            and GRIPPER_CLOSED_MAX_DEGREES < m6 < GRIPPER_HOLD_MAX_DEGREES)
+
+
 class _CubeLost(RuntimeError):
     """La física del gemelo detectó que el cubo se separó de la pinza."""
 
@@ -126,6 +150,7 @@ class App:
         # y la misma interfaz de cámara (brazoia/gemelo.py). Nunca abre COM ni DirectShow.
         self.twin = None
         self.twin_viewer = None
+        self.twin_viewer_thread = None
         self.auto_stop = threading.Event()        # Detener/Emergencia para la tarea sin confirmación
         self.twin_scene_used = False              # la tarea ya se hizo en esta escena
         self.twin_calibration_ready = threading.Event()
@@ -139,6 +164,9 @@ class App:
         self.observations = []
         self.latest_scene = ([], [])               # (cuadros, detecciones) del mismo tick
         self.emergency_active = False
+        # Detener, EMERGENCIA o cerrar la app: el reintento de la demo no la borra (auto_stop sí
+        # puede venir del monitor del cubo del gemelo).
+        self.operator_stop = False
         self.preview_images = [None, None]
         self.robot: RobotSerial | None = None
         self.demonstration: DemonstrationSession | None = None
@@ -152,6 +180,9 @@ class App:
         self.execution_busy = False
         self.camera_settings_locked = True
         self.rerun = RerunArmView(self.config.root / "assets")
+        # Visor 3D de MuJoCo que copia la pose del brazo real (reemplaza a Rerun en la barra).
+        self.mujoco_view = MujocoArmView(self.config.root / "assets", limits=self.config.limits)
+        self.last_mujoco_update = 0.0
         self.closing = False
         self.last_rerun_update = 0.0
         self.worker_messages: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -168,10 +199,14 @@ class App:
         # "aprendido": modelo entrenado con demostraciones; "geometrico": cámaras calibradas
         # y cinemática inversa del modelo 3D (brazoia/politica_geometrica.py).
         self.automatic_mode = tk.StringVar(value="geometrico" if self.twin is not None else "aprendido")
-        self.geometric_model = None  # (VirtualArm, PickPlaceExpert): armarlo tarda ~1 s
+        self.geometric_model = None  # (VirtualArm, PickPlaceExpert, clásico): armarlo tarda ~1 s
+        # Movimiento rápido (las optimizaciones del 6/11: tramos juntos, garra a 90° en camino,
+        # agarre 10/6 mm). Apagado = modo clásico, el de las primeras corridas que funcionaron.
+        self.fast_motion = tk.BooleanVar(value=False)
         self.demo_arm = None         # VirtualArm de la demo (brazoia/demo.py)
         self.demo_cycles = tk.StringVar(value="0")
         self.demo_direct = tk.BooleanVar(value=False)
+        self.demo_retry = tk.BooleanVar(value=True)
         # Medición de la fuente (firmware con «power telem»): corriente de M1..M6 y voltaje mínimo.
         self.power_measure = tk.BooleanVar(value=False)
         self.power_status = tk.StringVar(value="")
@@ -297,7 +332,9 @@ class App:
         ttk.Button(top, text="Actualizar", command=self.refresh_ports).pack(side="left", padx=3)
         ttk.Button(top, text="Conectar robot", command=self.connect_robot).pack(side="left", padx=6)
         ttk.Button(top, text="Desconectar", command=self.disconnect_robot).pack(side="left")
-        ttk.Button(top, text="Abrir Rerun", command=self.open_rerun).pack(side="left", padx=8)
+        ttk.Button(top, text="Ver en 3D (MuJoCo)", command=self.open_3d_view).pack(side="left", padx=(8, 3))
+        # Rerun sigue para la vista previa de cada propuesta y la distancia garra-mesa en vivo.
+        ttk.Button(top, text="Abrir Rerun", command=self.open_rerun).pack(side="left", padx=(0, 8))
         ttk.Label(top, textvariable=self.connection_status).pack(side="left", padx=8)
 
         readings = ttk.Frame(parent, padding=(8, 2, 8, 4))
@@ -377,6 +414,16 @@ class App:
             foreground="#555",
         ).pack(side="left")
 
+        ttk.Checkbutton(
+            tab, variable=self.fast_motion,
+            text="Movimiento rápido (experimental): tramos juntos, garra a 90° y agarre 10/6 mm. "
+                 "Apagado = modo clásico: un movimiento por vez, más lento y suave.",
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tab, variable=self.demo_retry,
+            text="Si una vuelta falla, reintentar sola: suelta el cubo si lo tiene, sube la garra y lo vuelve "
+                 f"a buscar desde Inicio (hasta {DEMO_MAX_RETRIES} reintentos seguidos).",
+        ).pack(anchor="w")
         if self.twin is not None:
             ttk.Checkbutton(tab, text="Poses directas (experimental)", variable=self.demo_direct).pack(anchor="w")
 
@@ -944,6 +991,31 @@ class App:
 
         self.run_async(operation, success=finished, failure=failed)
 
+    def open_3d_view(self) -> None:
+        """El brazo en el visor de MuJoCo, solo la escena (Tab muestra los paneles)."""
+        if self.twin is not None:
+            self.open_twin_viewer()
+            return
+        if self.mujoco_view.running:
+            self.status.set("El visor 3D ya está abierto.")
+            return
+        self.mujoco_view.open()
+        self.status.set("Abriendo el visor 3D...")
+
+        def check(waited: float = 0.0) -> None:
+            if self.closing:
+                return
+            if self.mujoco_view.running:
+                self.status.set("Visor 3D abierto: copia la pose del brazo real. Tab muestra los paneles.")
+            elif self.mujoco_view.error:
+                self.status.set(f"No se pudo abrir el visor 3D: {self.mujoco_view.error}")
+            elif waited < 20.0:
+                self.root.after(500, lambda: check(waited + 0.5))
+            else:
+                self.status.set("El visor 3D no termina de abrir (¿OpenGL o Escritorio remoto?).")
+
+        check()
+
     def open_rerun(self) -> None:
         self.run_async(
             self.rerun.open,
@@ -1270,7 +1342,7 @@ class App:
         if gripper_problem:
             self.status.set("Para iniciar la tarea automática: " + gripper_problem)
             return
-        self.execution = SupervisedExecution(policy, self.config.limits)
+        self.execution = SupervisedExecution(policy, self.config.limits, classic=not self.fast_motion.get())
         run_log = ExecutionLog(
             self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "ejecuciones",
             {
@@ -1308,12 +1380,14 @@ class App:
             from brazoia.politica_geometrica import load_geometric_policy
 
             try:
-                if self.geometric_model is None:
-                    from brazoia.mujoco_sim import PickPlaceExpert, VirtualArm
+                classic = not self.fast_motion.get()
+                if self.geometric_model is None or self.geometric_model[2] != classic:
+                    from brazoia.mujoco_sim import CLASSIC_EXPERT, PickPlaceExpert, VirtualArm
 
                     arm = VirtualArm(limits=self.config.limits)
-                    self.geometric_model = (arm, PickPlaceExpert(arm))
-                arm, expert = self.geometric_model
+                    self.geometric_model = (arm, PickPlaceExpert(arm, **(CLASSIC_EXPERT if classic else {})),
+                                            classic)
+                arm, expert, _ = self.geometric_model
                 # Se relee en cada tarea: toma una calibración recién guardada.
                 if self.twin is not None:
                     if not self.twin_calibration_ready.is_set():
@@ -1396,6 +1470,7 @@ class App:
         # Confirmar es una orden nueva: deja atrás un Detener o una EMERGENCIA anterior.
         self.auto_stop.clear()
         self.emergency_active = False
+        self.operator_stop = False
         self.auto_status.set(f"Ejecutando: {proposal.label}")
 
         def success(timings):
@@ -1426,6 +1501,7 @@ class App:
         )
 
     def stop_automatic(self) -> None:
+        self.operator_stop = True
         self.auto_stop.set()
         if self.executor is not None:
             self.executor.stop()
@@ -1501,8 +1577,9 @@ class App:
         self.auto_status.set("Modo automático detenido")
 
     def emergency(self) -> None:
-        self.auto_stop.set()
         self.emergency_active = True
+        self.operator_stop = True
+        self.auto_stop.set()
         if self.executor is not None:
             self.executor.stop()
         if self.manual_executor is not None:
@@ -1565,8 +1642,27 @@ class App:
             return
         import mujoco.viewer
 
-        self.twin_viewer = mujoco.viewer.launch_passive(self.twin.arm.model, self.twin.arm.data)
-        self.twin.viewer = self.twin_viewer
+        if self.twin_viewer_thread is not None and self.twin_viewer_thread.is_alive():
+            return
+        from brazoia.gemelo import _RENDERER_LOCK
+
+        twin = self.twin
+
+        def launch() -> None:
+            # Fuera del hilo de la interfaz (launch_passive espera a la ventana) y con el lock de
+            # las cámaras virtuales: GLFW no tolera crear contextos a la vez desde dos hilos.
+            try:
+                with _RENDERER_LOCK:
+                    viewer = launch_scene_viewer(twin.arm.model, twin.arm.data)
+            except Exception as exc:
+                self.worker_messages.put(("log", f"No se pudo abrir el visor 3D: {exc}"))
+                return
+            self.twin_viewer = viewer
+            twin.viewer = viewer
+
+        self.twin_viewer_thread = threading.Thread(target=launch, name="visor-gemelo", daemon=True)
+        self.twin_viewer_thread.start()
+        self.status.set("Abriendo el visor 3D del gemelo...")
 
     # ----- tarea autónoma: las doce etapas seguidas, sin confirmar cada una -----
     def run_autonomous_task(self) -> None:
@@ -1595,6 +1691,7 @@ class App:
             self.finish_execution("sin_marcar")
         self.auto_stop.clear()
         self.emergency_active = False
+        self.operator_stop = False
         self.execution_busy = True
         self.auto_status.set("Preparando la tarea autónoma...")
 
@@ -1787,7 +1884,7 @@ class App:
                 if proposal.recovery:
                     recoveries += 1
                     if recoveries > 2:
-                        raise _Rejected("el brazo no queda en la pose de Inicio después de dos "
+                        raise _NeedsHands("el brazo no queda en la pose de Inicio después de dos "
                                         "recuperaciones (algún motor a más de 2°). Revisalo en «Mover a mano».")
                 elif proposal.stage_index == 1:
                     if hasattr(execution.policy, "describe"):
@@ -1869,6 +1966,7 @@ class App:
             return
         from brazoia.demo import load_demo_policy
 
+        classic = not self.fast_motion.get()
         try:
             if self.twin is not None and not self.twin_calibration_ready.is_set():
                 raise ValueError("todavía se están calibrando las cámaras virtuales; probá en unos segundos")
@@ -1876,7 +1974,7 @@ class App:
                 from brazoia.mujoco_sim import VirtualArm
 
                 self.demo_arm = VirtualArm(limits=self.config.limits)
-            policy = load_demo_policy(self.config, arm=self.demo_arm, twin=self.twin is not None)
+            policy = load_demo_policy(self.config, arm=self.demo_arm, twin=self.twin is not None, classic=classic)
         except (OSError, ValueError) as exc:
             self.status.set(f"Demo: {exc}")
             return
@@ -1890,6 +1988,7 @@ class App:
             self.describe_twin_scene()
         self.auto_stop.clear()
         self.emergency_active = False
+        self.operator_stop = False
         self.execution_busy = True
         self.set_camera_controls_enabled(False)
         self.executor = MotionExecutor(
@@ -1900,7 +1999,8 @@ class App:
         self.auto_status.set(f"Demo ({limit}): preparando...")
         self.log(f"Demo con la calibración de cámaras del {policy.metadata['calibracion']}, {limit}.")
         done: list[int] = [0]
-        direct = self.twin is not None and self.demo_direct.get()
+        direct = self.twin is not None and self.demo_direct.get() and not classic
+        retry = self.demo_retry.get()
 
         def operation():
             if robot.snapshot().torque_enabled is not True:
@@ -1912,7 +2012,7 @@ class App:
                     time.sleep(0.05)
             # Telemetría y cuadros nuevos (en el gemelo, de la escena nueva) antes de mirar.
             time.sleep(self.config.capture.stable_window_seconds + 0.5)
-            self._demo_cycles(policy, who, cycles, done, direct=direct)
+            self._demo_cycles(policy, who, cycles, done, direct=direct, retry=retry, classic=classic)
             return done[0]
 
         def finished(count):
@@ -1928,6 +2028,8 @@ class App:
             self.set_camera_controls_enabled(True)
             if self.emergency_active:
                 text = "EMERGENCIA: torque OFF solicitado. Sostené el brazo."
+            elif isinstance(exc, _NeedsHands):
+                text = f"Demo detenida en la vuelta {done[0] + 1}: {exc}"
             elif isinstance(exc, _CubeLost):
                 text = f"Demo detenida en la vuelta {done[0] + 1}: {exc}"
             elif self.auto_stop.is_set():
@@ -1942,10 +2044,9 @@ class App:
 
         self.run_async(operation, success=finished, failure=failed)
 
-    def _demo_cycles(self, policy, who: str, cycles: int, done: list[int], *, direct: bool = False) -> None:
+    def _demo_cycles(self, policy, who: str, cycles: int, done: list[int], *, direct: bool = False,
+                     retry: bool = False, classic: bool = False) -> None:
         """Las vueltas de la demo, en el hilo de trabajo. `done[0]`: vueltas completas."""
-        from brazoia.demo import ARRIVAL_RADIUS_MM, arrival_error_mm
-
         root = self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "demo"
         direct = direct and self.twin is not None
 
@@ -1955,73 +2056,203 @@ class App:
             return None
 
         cycle = 0
-        while not cycles or cycle < cycles:
+        failures = 0  # vueltas fallidas seguidas
+        while not cycles or done[0] < cycles:
             cycle += 1
-            self._stopped()
-            execution = SupervisedExecution(
-                policy, self.config.limits, direct_demo=direct,
-                carried_cube_check=carried_cube_check if direct else None,
-            )
-            run_log = ExecutionLog(root, {
-                "port": self.robot.port, "gemelo": self.twin is not None, "modo": "demo", "vuelta": cycle,
-                "poses_directas": execution.direct_demo,
-                "politica": dict(policy.metadata), "cameras": self.camera_configuration(),
-                "limits": {str(key): list(value) for key, value in self.config.limits.items()},
-            })
-            run_log.data["task"] = "demo_cubo_entre_dos_puntos_de_la_mesa"
-            self.demo_run_log = run_log
-            prefix = f"Demo · vuelta {cycle}{f'/{cycles}' if cycles else ''} · "
-            twin = self.twin
-            if twin is not None:
-                twin.start_cube_monitor(self.auto_stop)
             try:
-                try:
-                    self._stopped()
-                    self._drive_stages(execution, self.executor, run_log, who, self._demo_inicio_problem,
-                                       stage_photos=False, prefix=prefix, monitor_cube=twin is not None)
-                finally:
-                    loss = twin.finish_cube_monitor() if twin is not None else None
+                self._demo_cycle(policy, who, cycle, cycles, done, root, direct, carried_cube_check, classic)
             except Exception as exc:
-                if loss is not None:
-                    message = (f"El cubo se separó {loss.displacement_mm:.1f} mm de la pinza "
-                               f"en {STAGE_LABELS[loss.stage]}.")
-                    run_log.note("cubo_perdido", message, loss.stage)
-                    run_log.finish("cubo_perdido", False, message)
-                    self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
-                    raise _CubeLost(message) from exc
-                result = "interrupted" if self.auto_stop.is_set() else \
-                    "rechazada" if isinstance(exc, _Rejected) else "bloqueada"
-                run_log.finish(result, None, str(exc))
-                self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
-                raise
-            # De vuelta en Inicio: ¿dónde quedó el cubo? Si no se lo ve, no hay vuelta siguiente.
-            target = policy.plan(execution.scene_features)[0].container_xy
-            time.sleep(1.0)  # que el cubo se asiente y haya cuadros nuevos
-            snapshots, observations = self.latest_scene
-            record = self._run_capture(run_log, "final")
-            try:
-                error = arrival_error_mm(policy, observation_features(observations), target)
-            except ValueError as exc:
-                run_log.finish("cubo_perdido", False, str(exc))
-                self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
-                raise RuntimeError(f"terminó la vuelta pero no encuentro el cubo ({exc})") from exc
-            arrived = error <= ARRIVAL_RADIUS_MM
-            run_log.note("llegada", f"cubo a {error:.0f} mm del destino", "guardado")
-            run_log.finish("success" if arrived else "fuera_de_lugar", arrived,
-                           "" if record is not None else "sin foto final")
-            self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
-            done[0] = cycle
-            text = (f"{prefix}el cubo quedó a {error:.0f} mm del destino"
-                    + ("." if arrived else f" (más de {ARRIVAL_RADIUS_MM:.0f} mm: la próxima vuelta lo busca ahí)."))
-            if self.twin is not None:
-                cube = self.twin.cube_position()
-                text += f" Física: a {math.hypot(cube[0] - target[0], cube[1] - target[1]) * 1000:.0f} mm."
-            self.worker_messages.put(("log", text))
-            self._set_auto_status_from_worker(text)
-            self.robot.power_label = f"{prefix}pausa"
-            if not cycles or cycle < cycles:
-                if self.auto_stop.wait(DEMO_PAUSE_SECONDS):
+                if isinstance(exc, _CubeLost) and retry and not (self.operator_stop or self.emergency_active):
+                    self.auto_stop.clear()  # lo pidió el monitor del cubo del gemelo, no el operador
+                    if self.operator_stop or self.emergency_active:
+                        self.auto_stop.set()  # Detener llegó justo entre medio: no se pierde
+                if (self.auto_stop.is_set() or self.operator_stop or self.emergency_active or not retry
+                        or isinstance(exc, _NeedsHands) or self.robot.snapshot().fault):
+                    raise
+                failures += 1
+                if failures > DEMO_MAX_RETRIES:
+                    raise RuntimeError(f"{failures} vueltas fallidas seguidas; la última: {exc}") from exc
+                text = (f"Demo · intento {cycle} falló: {exc} Reintento {failures}/{DEMO_MAX_RETRIES}: "
+                        f"suelto el cubo si lo tengo, subo la garra y vuelvo a buscarlo desde Inicio.")
+                self.worker_messages.put(("log", text))
+                self._set_auto_status_from_worker(text)
+                self._demo_recover(policy, rejected=isinstance(exc, _Rejected))
+                continue
+            failures = 0
+
+    def _demo_recover(self, policy, *, rejected: bool) -> None:
+        """Después de una vuelta fallida, en el hilo de trabajo: con el brazo quieto, suelta el
+        cubo solo si lo sostiene (GRIPPER_HOLD por contacto, no un cierre en vacío), sube la
+        garra en vertical antes de girar M1/M5, vuelve a Inicio y cierra la garra ahí. La
+        vuelta siguiente busca el cubo con las cámaras."""
+        robot = self.robot
+
+        def wait_m6(done, timeout: float) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if self.auto_stop.wait(0.05):
                     raise RuntimeError("Detenido por el operador.")
+                snapshot = robot.snapshot()
+                if snapshot.fault:
+                    raise RuntimeError(snapshot.fault)
+                m6 = snapshot.positions.get(6)
+                if m6 is not None and done(m6, snapshot.gripper_state):
+                    return True
+            return False
+
+        # Quieto antes de tocar la garra: tras una falla de llegada puede seguir llegando.
+        current = self._wait_stable_pose(robot)
+        snapshot = robot.snapshot()
+        m6 = snapshot.positions.get(6, current.get(6))
+        if m6 is None:
+            raise RuntimeError("falta la lectura de M6")
+        lifted = False
+        if gripper_has_object(snapshot.gripper_state, snapshot.gripper_hold_reason, m6):
+            # Sostiene el cubo (contacto, no un cierre al tope en vacío): lo suelta donde está.
+            if gripper_sweep_problem((current[2], current[3], current[4]), m6, GRIPPER_OPEN_TARGET):
+                # Abrir acá barrería la mesa: primero sube en vertical, con el cubo.
+                self._demo_lift(policy, current, m6)
+                lifted = True
+                current = self._wait_stable_pose(robot)
+            robot.send("gripper open")
+            if not wait_m6(lambda value, _state: value >= GRIPPER_OPEN_MIN_DEGREES - 5.0, 9.0):
+                raise RuntimeError("no pude abrir la garra para soltar el cubo")
+            time.sleep(0.5)
+            current = self._wait_stable_pose(robot)
+            m6 = robot.snapshot().positions.get(6, m6)
+        if not lifted:
+            # Antes de girar M1/M5 hacia Inicio, la garra sube en vertical, como hace el experto.
+            self._demo_lift(policy, current, m6)
+            current = self._wait_stable_pose(robot)
+        canonical = {motor: float(policy.canonical_start[motor - 1]) for motor in range(1, 6)}
+        if max(abs(current[motor] - canonical[motor]) for motor in range(1, 6)) > 2.0:
+            groups = build_motion_plan(planning_start(current, self.config.limits), canonical, self.config.limits)
+            self.executor.execute(MotionProposal(
+                stage_index=None, stage="recuperacion_inicio", label="Recuperar pose inicial",
+                target=canonical, groups=tuple(groups), gripper_action=None, recovery=True,
+            ))
+        # Cierra en Inicio (lejos de la mesa y del cubo) si quedó abierta.
+        snapshot = robot.snapshot()
+        m6 = snapshot.positions.get(6)
+        if m6 is None or m6 > GRIPPER_CLOSED_MAX_DEGREES:
+            holds_before = snapshot.gripper_holds
+            robot.send(f"gripper current {GRIPPER_CONTACT_RAW}")
+            robot.send("gripper close")
+            # El cierre termina con un GRIPPER_HOLD nuevo: closed_limit (vacía) o contact (algo).
+            if not wait_m6(lambda _value, _state: robot.snapshot().gripper_holds > holds_before, 12.0):
+                raise RuntimeError("no pude cerrar la garra")
+            snapshot = robot.snapshot()
+            if gripper_has_object(snapshot.gripper_state, snapshot.gripper_hold_reason,
+                                  snapshot.positions.get(6, 0.0)):
+                raise RuntimeError("la garra volvió a agarrar algo al cerrarse en Inicio; revisala a mano")
+        if self.twin is not None and rejected:
+            # En el gemelo nadie vuelve a poner el cubo: escena nueva, como haría una persona.
+            from brazoia.demo import twin_demo_placement
+
+            self.twin.new_scene(twin_demo_placement(self.twin.rng))
+            robot.clear_fault()
+        if self.auto_stop.wait(DEMO_RETRY_SECONDS):
+            raise RuntimeError("Detenido por el operador.")
+
+    def _demo_lift(self, policy, current: dict[int, float], m6: float) -> None:
+        """Sube la garra en vertical (M2–M4, M1 y M5 quietos) hasta RECOVERY_LIFT_HEIGHT."""
+        from brazoia.demo import lift_waypoints
+        from brazoia.mujoco_sim import PlanningError
+
+        expert = getattr(policy, "expert", None)
+        if expert is None:
+            return
+        try:
+            waypoints = lift_waypoints(expert, current, m6)
+        except PlanningError as exc:
+            raise _NeedsHands(f"no encuentro cómo subir la garra en vertical desde donde quedó ({exc}); "
+                              "revisá el brazo en «Mover a mano»") from exc
+        if not waypoints:
+            return
+        start = planning_start(current, self.config.limits)
+        groups = []
+        for waypoint in waypoints:
+            planned = build_motion_plan(start, waypoint, self.config.limits)
+            groups.extend(planned)
+            for group in planned:
+                start.update(dict(group.targets))
+        self.executor.execute(MotionProposal(
+            stage_index=None, stage="recuperacion_subida", label="Subir la garra en vertical",
+            target=dict(waypoints[-1]), groups=tuple(groups), gripper_action=None, recovery=True,
+        ))
+
+    def _demo_cycle(self, policy, who: str, cycle: int, cycles: int, done: list[int], root: Path,
+                    direct: bool, carried_cube_check, classic: bool = False) -> None:
+        """Una vuelta de la demo; `done[0]` suma uno si termina."""
+        from brazoia.demo import ARRIVAL_RADIUS_MM, arrival_error_mm
+
+        self._stopped()
+        execution = SupervisedExecution(
+            policy, self.config.limits, direct_demo=direct, classic=classic,
+            carried_cube_check=carried_cube_check if direct else None,
+        )
+        run_log = ExecutionLog(root, {
+            "port": self.robot.port, "gemelo": self.twin is not None, "modo": "demo", "vuelta": cycle,
+            "movimiento": "clasico" if classic else "rapido",
+            "poses_directas": execution.direct_demo,
+            "politica": dict(policy.metadata), "cameras": self.camera_configuration(),
+            "limits": {str(key): list(value) for key, value in self.config.limits.items()},
+        })
+        run_log.data["task"] = "demo_cubo_entre_dos_puntos_de_la_mesa"
+        self.demo_run_log = run_log
+        prefix = (f"Demo · vuelta {done[0] + 1}{f'/{cycles}' if cycles else ''}"
+                  + (f" (intento {cycle})" if cycle != done[0] + 1 else "") + " · ")
+        twin = self.twin
+        if twin is not None:
+            twin.start_cube_monitor(self.auto_stop)
+        try:
+            try:
+                self._stopped()
+                self._drive_stages(execution, self.executor, run_log, who, self._demo_inicio_problem,
+                                   stage_photos=False, prefix=prefix, monitor_cube=twin is not None)
+            finally:
+                loss = twin.finish_cube_monitor() if twin is not None else None
+        except Exception as exc:
+            if loss is not None:
+                message = (f"El cubo se separó {loss.displacement_mm:.1f} mm de la pinza "
+                           f"en {STAGE_LABELS[loss.stage]}.")
+                run_log.note("cubo_perdido", message, loss.stage)
+                run_log.finish("cubo_perdido", False, message)
+                self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+                raise _CubeLost(message) from exc
+            result = "interrupted" if self.auto_stop.is_set() else \
+                "rechazada" if isinstance(exc, _Rejected) else "bloqueada"
+            run_log.finish(result, None, str(exc))
+            self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+            raise
+        # De vuelta en Inicio: ¿dónde quedó el cubo? Si no se lo ve, no hay vuelta siguiente.
+        target = policy.plan(execution.scene_features)[0].container_xy
+        time.sleep(1.0)  # que el cubo se asiente y haya cuadros nuevos
+        snapshots, observations = self.latest_scene
+        record = self._run_capture(run_log, "final")
+        try:
+            error = arrival_error_mm(policy, observation_features(observations), target)
+        except ValueError as exc:
+            run_log.finish("cubo_perdido", False, str(exc))
+            self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+            raise RuntimeError(f"terminó la vuelta pero no encuentro el cubo ({exc})") from exc
+        arrived = error <= ARRIVAL_RADIUS_MM
+        run_log.note("llegada", f"cubo a {error:.0f} mm del destino", "guardado")
+        run_log.finish("success" if arrived else "fuera_de_lugar", arrived,
+                       "" if record is not None else "sin foto final")
+        self._show_attempt_metrics(f"Demo · vuelta {cycle}", run_log.data["attempt_metrics"][-1])
+        done[0] += 1
+        text = (f"{prefix}el cubo quedó a {error:.0f} mm del destino"
+                + ("." if arrived else f" (más de {ARRIVAL_RADIUS_MM:.0f} mm: la próxima vuelta lo busca ahí)."))
+        if self.twin is not None:
+            cube = self.twin.cube_position()
+            text += f" Física: a {math.hypot(cube[0] - target[0], cube[1] - target[1]) * 1000:.0f} mm."
+        self.worker_messages.put(("log", text))
+        self._set_auto_status_from_worker(text)
+        self.robot.power_label = f"{prefix}pausa"
+        if not cycles or done[0] < cycles:
+            if self.auto_stop.wait(DEMO_PAUSE_SECONDS):
+                raise RuntimeError("Detenido por el operador.")
 
     def _demo_inicio_problem(self, snapshots, observations, now: float | None = None) -> str | None:
         """Para la demo: cuadros actuales y el cubo visto por las dos cámaras."""
@@ -2112,6 +2343,9 @@ class App:
         torque = "ON" if snapshot.torque_enabled is True else "OFF" if snapshot.torque_enabled is False else "desconocido"
         self.torque_status.set(f"Torque: {torque}")
         self.gripper_status.set(f"Garra: {snapshot.gripper_state}")
+        if self.mujoco_view.active and now - self.last_mujoco_update > 0.05:
+            self.mujoco_view.log_pose(snapshot.positions)
+            self.last_mujoco_update = now
         if self.rerun.available and now - self.last_rerun_update > 0.15:
             self.rerun.log_pose(snapshot.positions)
             self.last_rerun_update = now
@@ -2152,6 +2386,7 @@ class App:
             ):
                 return
         self.closing = True
+        self.operator_stop = True
         self.auto_stop.set()  # la tarea autónoma no empieza otra etapa
         if self.executor is not None:
             self.executor.stop()
@@ -2175,6 +2410,7 @@ class App:
                 pass
             self.robot.stop_power_log()
             self.robot.disconnect()
+        self.mujoco_view.close()
         if self.twin is not None:
             self.twin.stop()
             if self.twin_viewer is not None:

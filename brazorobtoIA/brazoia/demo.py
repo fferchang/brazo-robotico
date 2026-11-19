@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import math
 
+import mujoco
 import numpy as np
 
 from .calibracion_camaras import KIND_LABELS, CameraCalibration, object_pixels
 from .config import AppConfig
 from .mujoco_sim import (
+    CLASSIC_EXPERT,
     GRIPPER_HOLD_ESTIMATE,
     TRANSIT_TILTS_DEGREES,
     PickPlaceExpert,
@@ -41,6 +43,39 @@ DEMO_SPOTS = ((-0.060, -0.210), (0.130, -0.210))
 RELEASE_DROPS = (0.008, 0.015, 0.025, 0.035)
 # Al volver a Inicio, el cubo cuenta como «llegó» si se lo ve a menos de esto del destino.
 ARRIVAL_RADIUS_MM = 40.0
+# Recuperación tras una vuelta fallida: antes de girar M1/M5 hacia Inicio, la garra sube en
+# vertical hasta esta altura del punto pinza sobre la mesa (el retiro que hace el experto).
+RECOVERY_LIFT_HEIGHT = 0.10
+
+
+def lift_waypoints(expert, current: dict[int, float], m6: float,
+                   top: float = RECOVERY_LIFT_HEIGHT) -> list[dict[int, float]]:
+    """Poses para subir la garra en vertical desde `current` hasta `top` (m sobre la mesa),
+    con el mismo rumbo y casi sin mover M1 ni M5; [] si ya está a esa altura o más.
+
+    Con la garra abajo (un agarre fallido, el soltado), girar la base primero arrastra lo que
+    haya al lado de los dedos. Lanza PlanningError si no hay subida libre de choques."""
+    arm = expert.arm
+    data = mujoco.MjData(arm.model)
+    for motor in range(1, 7):
+        data.qpos[arm.qadr[motor]] = arm.to_qpos(motor, current.get(motor, m6 if motor == 6 else 0.0))
+    mujoco.mj_kinematics(arm.model, data)
+    position = data.site_xpos[arm.site_id].copy()
+    rotation = data.site_xmat[arm.site_id].reshape(3, 3)
+    height = float(position[2] - arm.floor_z)
+    if height >= top - 1e-3:
+        return []
+    yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+    xy = (float(position[0]), float(position[1]))
+
+    def above(_yaw):
+        return xy
+
+    previous = {motor: float(current[motor]) for motor in range(1, 6)}
+    via = expert._vertical(above, yaw, height, top, previous, (m6,))
+    _, final, _ = expert._solve("subida vertical", above, [top], [yaw], via[-1] if via else previous,
+                                grippers=(m6,))
+    return [*via, final]
 # Recipiente del gemelo, fuera de la mesa y de la vista de las cámaras virtuales.
 TWIN_CONTAINER_AWAY = (2.5, 2.5)
 
@@ -175,8 +210,10 @@ def arrival_error_mm(policy: DemoPolicy, scene_features, target_xy) -> float:
     return math.hypot(cube[0] - target_xy[0], cube[1] - target_xy[1]) * 1000.0
 
 
-def load_demo_policy(config: AppConfig, *, arm: VirtualArm, twin: bool = False) -> DemoPolicy:
-    """Con la misma calibración (y los mismos controles) que la tarea geométrica."""
+def load_demo_policy(config: AppConfig, *, arm: VirtualArm, twin: bool = False, classic: bool = False) -> DemoPolicy:
+    """Con la misma calibración (y los mismos controles) que la tarea geométrica.
+
+    `classic`: el experto de antes de las optimizaciones (mujoco_sim.CLASSIC_EXPERT)."""
     if twin:
         from .gemelo import load_twin_policy
 
@@ -185,7 +222,8 @@ def load_demo_policy(config: AppConfig, *, arm: VirtualArm, twin: bool = False) 
         from .politica_geometrica import load_geometric_policy
 
         geometric = load_geometric_policy(config, arm=arm, expert=PickPlaceExpert(arm))
-    return DemoPolicy(geometric.calibration, config.limits, arm=arm)
+    expert = TablePlaceExpert(arm, **CLASSIC_EXPERT) if classic else None
+    return DemoPolicy(geometric.calibration, config.limits, arm=arm, expert=expert)
 
 
 def twin_demo_placement(rng: np.random.Generator, spots=DEMO_SPOTS) -> Placement:

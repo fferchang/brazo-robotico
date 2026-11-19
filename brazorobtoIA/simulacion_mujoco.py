@@ -33,6 +33,8 @@ def parse_args(argv=None):
                         help="Cantidad de episodios (por defecto 3). 0 = sin fin, hasta cerrar la ventana.")
     parser.add_argument("--semilla", type=int, default=None, help="Semilla para repetir las mismas posiciones.")
     parser.add_argument("--sin-visor", action="store_true", help="Sin ventana: corre lo más rápido posible.")
+    parser.add_argument("--paneles", action="store_true",
+                        help="Visor con los paneles de los costados (por defecto, solo la escena; Tab los muestra).")
     parser.add_argument("--ritmo", type=float, default=1.0, help="Velocidad del visor respecto del tiempo real.")
     parser.add_argument("--rerun", action="store_true", help="También muestra brazo, cubo y recipiente en Rerun.")
     parser.add_argument("--fotos", action="store_true",
@@ -138,7 +140,9 @@ def main(argv=None):
         import mujoco.viewer
 
         before = set(threading.enumerate())
-        viewer = mujoco.viewer.launch_passive(arm.model, arm.data)
+        from brazoia.mujoco_view import launch_scene_viewer
+
+        viewer = launch_scene_viewer(arm.model, arm.data, panels=args.paneles)
         viewer_threads = [thread for thread in threading.enumerate() if thread not in before]
         observers.append(make_viewer_observer(viewer, max(0.05, args.ritmo)))
     arm.observer = (lambda current: [observer(current) for observer in observers]) if observers else None
