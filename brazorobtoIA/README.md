@@ -304,6 +304,11 @@ Con el firmware nuevo (`caps` con `gripper_fast=1`):
   que mirar con «Medir corriente» que M6 sosteniendo quede bien por debajo de ~1,1 A:
   si no, la protección de la garra afloja de a 1,5° (`GRIPPER_HOLD_RELIEF`); en ese
   caso, bajá `apriete_grados`.
+- **Espera después de agarrar**: el firmware avisa `GRIPPER_SETTLED` cuando la corriente
+  de M6 queda estable (dos lecturas seguidas, cada 100 ms, a 6 o menos de diferencia,
+  pasados 200 ms; como máximo 2 s), y recién ahí se levanta el cubo. Antes eran 0,8 s
+  fijos o, con «Medir corriente», hasta que M6 bajara de 300 mA, que con el apriete no
+  pasaría nunca. Gemelo: se asienta a los 200–300 ms y Agarre bajó ~0,5 s.
 
 ### Demo: el cubo de un lado a otro, sin recipiente
 

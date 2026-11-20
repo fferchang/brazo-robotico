@@ -239,6 +239,7 @@ class MotionExecutor:
         closing = proposal.gripper_action == "close"
         use_sync = self.uses_sync
         holds_before = getattr(snapshot, "gripper_holds", None)
+        settles_before = getattr(snapshot, "gripper_settles", 0)
         gripper_sent = False
         pending_targets: dict[int, float] = {}
         for segment in segments:
@@ -312,6 +313,7 @@ class MotionExecutor:
             with _time_phase(timings, "gripper"):
                 if not gripper_sent:
                     holds_before = getattr(self.robot.snapshot(), "gripper_holds", None)
+                    settles_before = getattr(self.robot.snapshot(), "gripper_settles", 0)
                     self._send_gripper_close(proposal.stage)
                 self._wait_gripper_hold(holds_before, timeout=16.0)
                 if proposal.stage == "agarre" and getattr(self.robot.snapshot(), "gripper_hold_reason", "") == "closed_limit":
@@ -319,7 +321,7 @@ class MotionExecutor:
                     raise RuntimeError("La garra cerró hasta el tope sin agarrar el cubo (closed_limit).")
             if proposal.stage == "agarre":
                 with _time_phase(timings, "after_grasp"):
-                    self._wait_grip_settle()
+                    self._wait_grip_settle(settles_before)
         elif proposal.gripper_action == "open":
             with _time_phase(timings, "gripper"):
                 self.status("Abriendo la garra...")
@@ -363,8 +365,25 @@ class MotionExecutor:
                 raise RuntimeError(f"El firmware no confirmó la orden «{command}».")
             time.sleep(0.005)
 
-    def _wait_grip_settle(self) -> None:
-        """Después de agarrar, hasta que baje la corriente de M6 (ver GRIP_SETTLE_MA)."""
+    def _wait_grip_settle(self, settles_before: int = 0) -> None:
+        """Después de agarrar, antes de levantar. Con el firmware que avisa GRIPPER_SETTLED
+        (corriente de M6 estable: sin pico del cierre ni apriete en curso), hasta ese aviso.
+        Si no, hasta que baje la corriente de M6 (ver GRIP_SETTLE_MA) o GRIP_SETTLE_SECONDS.
+
+        Con apriete (`gripper squeeze`) M6 sostiene con más corriente: el criterio de bajar
+        de GRIP_SETTLE_MA esperaría siempre el máximo. Por eso el aviso mira estabilidad."""
+        if getattr(self.robot, "gripper_settle_supported", False) is True:
+            deadline = time.monotonic() + GRIP_SETTLE_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                snapshot = self.robot.snapshot()
+                if snapshot.fault:
+                    raise RuntimeError(snapshot.fault)
+                if getattr(snapshot, "gripper_settles", 0) > settles_before:
+                    return
+                if self._stop_requested(0.01):
+                    raise RuntimeError("Movimiento detenido por el operador.")
+            self.status("La garra no avisó que se asentó después de agarrar; se levanta igual.")
+            return
         reading = getattr(self.robot, "power_reading", None)
         started = time.monotonic()
         sample, received = reading() if callable(reading) else (None, 0.0)

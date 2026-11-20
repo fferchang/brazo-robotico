@@ -1,9 +1,16 @@
 """Garra más rápida: cierre por presión con tramo rápido y apertura con `gripper speed`."""
+import time
 import unittest
 
 from brazoia import gemelo
 from brazoia.config import MotionConfig, load_motion
-from brazoia.execution import GRIPPER_FAST_CLOSE_EMPTY_UNTIL, GRIPPER_FAST_CLOSE_UNTIL, MotionExecutor
+from brazoia.execution import (
+    GRIP_SETTLE_SECONDS,
+    GRIP_SETTLE_TIMEOUT_SECONDS,
+    GRIPPER_FAST_CLOSE_EMPTY_UNTIL,
+    GRIPPER_FAST_CLOSE_UNTIL,
+    MotionExecutor,
+)
 from brazoia.gemelo import DigitalTwin, speed_to_deg_s
 from brazoia.robot import RobotSerial, configure_motion
 
@@ -68,7 +75,9 @@ class TwinFastCloseTests(unittest.TestCase):
         self.assertFalse(any("GRIPPER_SPEED" in line for line in self.run_line("gripper speed 900")))
 
 
-class TwinSqueezeTests(unittest.TestCase):
+class ClosingOnCube:
+    """Cierre por presión en el gemelo que toca el cubo (sin pruebas propias)."""
+
     def setUp(self):
         self.twin = DigitalTwin(seed=4)
 
@@ -87,6 +96,8 @@ class TwinSqueezeTests(unittest.TestCase):
             twin._process_gripper_closing()
         return twin.log_since(0)
 
+
+class TwinSqueezeTests(ClosingOnCube, unittest.TestCase):
     def test_hold_from_first_contact_minus_squeeze(self):
         self.assertEqual(self.twin.log_since(0)[-1:], [])
         self.twin.handle_line("gripper squeeze 2")
@@ -108,6 +119,70 @@ class TwinSqueezeTests(unittest.TestCase):
             self.twin.handle_line(line)
             self.assertEqual(self.twin.log_since(count), ["GRIPPER_SQUEEZE_REJECTED reason=fuera_de_rango"])
         self.assertEqual(self.twin.gripper_squeeze, 0.0)
+
+
+class TwinSettleTests(ClosingOnCube, unittest.TestCase):
+    def watch(self, current):
+        twin = self.twin
+        twin._gripper_current_raw = lambda value=current: value
+        twin.gripper_watch_started -= 0.1  # 100 ms más desde el agarre
+        twin.gripper_last_watch = -1e9
+        count = twin.log_count
+        twin._process_gripper_watch()
+        return twin.log_since(count)
+
+    def test_settled_when_the_current_is_stable(self):
+        self.twin.handle_line("gripper squeeze 5")
+        self.close_on_contact()
+        self.assertEqual(self.watch(110), [])
+        self.assertEqual(self.watch(141), [])
+        self.assertEqual(self.watch(143), ["GRIPPER_SETTLED reason=stable current_raw=143 elapsed_ms=300"])
+        self.assertEqual(self.watch(143), [])
+
+    def test_unstable_current_settles_by_time(self):
+        self.close_on_contact()
+        replies = []
+        for index in range(25):
+            replies += self.watch(60 if index % 2 else 150)
+        self.assertEqual(len(replies), 1)
+        self.assertTrue(replies[0].startswith("GRIPPER_SETTLED reason=timeout"), replies)
+
+
+class SettleSerial(RobotSerial):
+    def __init__(self, settle_after=None):
+        super().__init__("SIMULADO", 115200)
+        self.gripper_settle_supported = True
+        self.started = time.monotonic()
+        self.settle_after = settle_after
+
+    def snapshot(self):
+        if self.settle_after is not None and time.monotonic() - self.started >= self.settle_after:
+            self.settle_after = None
+            self._consume_line("GRIPPER_SETTLED reason=stable current_raw=140 elapsed_ms=300", time.monotonic())
+        return super().snapshot()
+
+
+class ExecutorSettleTests(unittest.TestCase):
+    def test_lifts_as_soon_as_the_grip_settles(self):
+        robot = SettleSerial(settle_after=0.3)
+        started = time.monotonic()
+        MotionExecutor(robot)._wait_grip_settle(0)
+        self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_without_the_notice_it_waits_the_maximum_and_warns(self):
+        robot = SettleSerial()
+        messages = []
+        started = time.monotonic()
+        MotionExecutor(robot, status=messages.append)._wait_grip_settle(0)
+        self.assertGreaterEqual(time.monotonic() - started, GRIP_SETTLE_TIMEOUT_SECONDS - 0.05)
+        self.assertIn("no avisó", messages[-1])
+
+    def test_old_firmware_keeps_the_fixed_wait(self):
+        robot = SettleSerial()
+        robot.gripper_settle_supported = False
+        started = time.monotonic()
+        MotionExecutor(robot)._wait_grip_settle(0)
+        self.assertAlmostEqual(time.monotonic() - started, GRIP_SETTLE_SECONDS, delta=0.15)
 
 
 class Recorder(RobotSerial):

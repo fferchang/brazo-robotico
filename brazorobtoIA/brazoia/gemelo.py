@@ -126,6 +126,10 @@ GRIPPER_SPEED_HARD_MAX = 1000
 # `gripper squeeze <grados>`: al detectar el contacto, la garra queda en la posición de la
 # primera lectura de contacto menos esto (0 = como antes). Ver el firmware.
 GRIPPER_SQUEEZE_MAX_DEGREES = 10.0
+# GRIPPER_SETTLED: corriente de M6 estable después de un agarre (ver el firmware).
+GRIPPER_SETTLE_MIN_S = 0.200
+GRIPPER_SETTLE_MAX_S = 2.000
+GRIPPER_SETTLE_DELTA_RAW = 6
 # Vigilancia fuera del cierre, igual que processGripperWatch() del firmware.
 GRIPPER_WATCH_INTERVAL_S = 0.100
 GRIPPER_MOVE_INRUSH_IGNORE_S = 0.250
@@ -396,6 +400,8 @@ class DigitalTwin:
         self.gripper_closing = False
         self.gripper_fast_until: float | None = None  # tramo rápido del cierre en curso
         self.gripper_contact_degrees: float | None = None  # M6 en la primera lectura de contacto
+        self.gripper_settle_pending = False
+        self.gripper_settle_last_raw: int | None = None
         self.gripper_command = GRIPPER_CLOSED_DEGREES
         self.gripper_started = 0.0
         self.gripper_last_step = -math.inf
@@ -1103,6 +1109,8 @@ class DigitalTwin:
         self.gripper_contact_degrees = None
         self.gripper_closing = False
         self.gripper_samples = 0
+        self.gripper_settle_pending = reason == "contact"
+        self.gripper_settle_last_raw = None
         self.println(f"GRIPPER_HOLD reason={reason} current_raw={current_raw} "
                      f"current_ma_aprox={current_raw * 6.5:.1f} position_raw={position} "
                      f"logical_deg={self.gripper_command:.1f}{squeeze}")
@@ -1145,6 +1153,14 @@ class DigitalTwin:
                 return
         else:
             self.gripper_hard_samples = 0
+        if self.gripper_watch == "holding" and self.gripper_settle_pending:
+            last = self.gripper_settle_last_raw
+            stable = last is not None and abs(current_raw - last) <= GRIPPER_SETTLE_DELTA_RAW
+            if (elapsed >= GRIPPER_SETTLE_MIN_S - 1e-9 and stable) or elapsed >= GRIPPER_SETTLE_MAX_S - 1e-9:
+                self.gripper_settle_pending = False
+                self.println(f"GRIPPER_SETTLED reason={'stable' if stable else 'timeout'} current_raw={current_raw} "
+                             f"elapsed_ms={int(round(elapsed * 1000))}")
+            self.gripper_settle_last_raw = current_raw
         if self.gripper_watch == "holding":
             self.gripper_high_samples = self.gripper_high_samples + 1 if current_raw >= GRIPPER_HOLD_LIMIT_RAW else 0
             if self.gripper_high_samples < GRIPPER_HOLD_LIMIT_SAMPLES:
@@ -1259,7 +1275,7 @@ class DigitalTwin:
         if self.sync_firmware and lowered == "caps":
             self.println(f"FIRMWARE_CAPS sync=1 sync_max_motors={SYNC_MAX_MOTORS} sync_max_speed={self.arm_max_speed} "
                          f"guard=1 speed_hard_max={ARM_SPEED_HARD_MAX} gripper_fast=1 "
-                         f"gripper_squeeze=1")
+                         f"gripper_squeeze=1 gripper_settle=1")
             return
         if lowered == "waypoint" or lowered.startswith("waypoint "):
             self._waypoint_command(lowered)

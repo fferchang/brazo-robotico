@@ -157,8 +157,9 @@ lento son los movimientos grandes (salir de Inicio y volver), que van «en escal
   antes de que llegue la orden siguiente. Lo que más tiempo fijo queda es la garra
   (~7 s por vuelta).
 - Avance (20/11): la garra abre a ~79°/s y cierra rápido hasta 55° (vuelta ~26 s en el
-  gemelo). Queda la espera de 0,8 s después de agarrar. El apriete ya no depende de en
-  qué lectura cae el contacto (5° desde el primer contacto): falta medirlo en el real.
+  gemelo). El apriete ya no depende de en qué lectura cae el contacto (5° desde el
+  primer contacto) y se levanta cuando la corriente de M6 se estabiliza (~0,3 s en vez
+  de 0,8 s). Falta medir las dos cosas en el brazo real.
 
 ### Comunicación más rápida con el ESP32
 Hoy los comandos y la telemetría van como texto a 115200 baudios, con las posiciones

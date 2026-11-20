@@ -22,6 +22,7 @@ static void resetPose() {
   gripperFastPhase = false;
   gripperWatch = WATCH_NONE;
   gripperContactPositionRaw = -1;
+  gripperSettlePending = false;
   powerGuard = false;
   powerTelemetry = false;
   speedScalePct = 100;
@@ -332,6 +333,41 @@ int main() {
   gripperTick();
   CHECK(Serial.out.find("GRIPPER_HOLD reason=closed_limit") != std::string::npos &&
         Serial.out.find("squeeze_deg") == std::string::npos, "closed_limit sin apriete");
+  run("gripper squeeze 0");
+
+  // ----- agarre asentado -----
+  auto watchTick = [&](int current) {
+    fake_millis += 100;
+    servoBus.servo[6].current = current;
+    Serial.out.clear();
+    processGripperWatch();
+    return Serial.out;
+  };
+  run("caps");
+  CHECK(Serial.out.find("gripper_settle=1") != std::string::npos, "caps anuncia gripper_settle");
+  closeOnCube("gripper squeeze 5");  // termina con GRIPPER_HOLD reason=contact
+  CHECK(watchTick(110).empty(), "primera lectura (100 ms): sin comparacion");
+  CHECK(watchTick(141).empty(), "todavia subiendo (apriete en curso)");
+  std::string settled = watchTick(143);
+  CHECK(settled.find("GRIPPER_SETTLED reason=stable current_raw=143 elapsed_ms=300") == 0, "asentado al estabilizarse");
+  CHECK(watchTick(143).empty(), "se avisa una sola vez");
+  // Si la corriente no se estabiliza, avisa igual a los 2 s.
+  closeOnCube("gripper squeeze 5");
+  std::string out;
+  for (int i = 0; i < 25 && out.empty(); i++) out = watchTick(i % 2 ? 60 : 150);
+  CHECK(out.find("GRIPPER_SETTLED reason=timeout") == 0, "asentado por tiempo");
+  // Cerrar sin cubo no avisa.
+  resetPose();
+  gripperClosing = false;
+  servoBus.servo[6].current = 0;
+  servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(11);
+  gripperCommandDegrees = 0;
+  gripperClosing = true;
+  gripperCloseStartedMs = fake_millis;
+  gripperTick();
+  bool any = false;
+  for (int i = 0; i < 25; i++) any = any || watchTick(10).find("GRIPPER_SETTLED") != std::string::npos;
+  CHECK(!any, "closed_limit no avisa asentado");
   run("gripper squeeze 0");
 
   if (failures == 0) std::cout << "OK: pruebas de sync en la PC" << std::endl;

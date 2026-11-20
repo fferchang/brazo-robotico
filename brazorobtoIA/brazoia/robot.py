@@ -69,6 +69,8 @@ class RobotSnapshot:
     gripper_hold_reason: str = ""
     # Escala de velocidad de M1–M5 del supervisor de la fuente (1.0 = sin limitar).
     speed_scale: float = 1.0
+    # GRIPPER_SETTLED recibidos: el agarre ya no tiene pico ni apriete en curso.
+    gripper_settles: int = 0
 
 
 POWER_TELEMETRY = re.compile(
@@ -224,6 +226,8 @@ class RobotSerial:
         # `caps` con `gripper_fast=1`: `gripper close <hasta>` y `gripper speed`.
         self.gripper_fast_supported = False
         self.gripper_squeeze_supported = False
+        self.gripper_settle_supported = False
+        self.gripper_settles = 0
         self.speed_scale = 1.0
         self.arm_max_speed: int | None = None
         # Medición de la fuente: última muestra, CSV abierto y la etapa que la app anota.
@@ -331,6 +335,7 @@ class RobotSerial:
                 fault=self.fault,
                 move_acks=self.move_acks,
                 speed_scale=self.speed_scale,
+                gripper_settles=self.gripper_settles,
                 gripper_holds=self.gripper_holds,
                 gripper_hold_reason=self.gripper_hold_reason,
             )
@@ -433,6 +438,9 @@ class RobotSerial:
                 self.guard_supported = "guard=1" in fields
                 self.gripper_fast_supported = "gripper_fast=1" in fields
                 self.gripper_squeeze_supported = "gripper_squeeze=1" in fields
+                self.gripper_settle_supported = "gripper_settle=1" in fields
+            elif line.startswith("GRIPPER_SETTLED"):
+                self.gripper_settles += 1
             elif line.startswith("POWER_GUARD scale="):
                 try:
                     self.speed_scale = int(line.split()[1].split("=", 1)[1]) / 100.0

@@ -375,6 +375,31 @@ corriente de M6 sosteniendo pasa ~1,1 A durante 2 s, la protección afloja de a 
 (hasta 3 veces; recién después corta el torque): con 5° quedaría en 0,5°. Medir con
 «Medir corriente» y bajar `apriete_grados` si aparece `GRIPPER_HOLD_RELIEF`.
 
+### Espera después de agarrar (20/11)
+
+La espera existía para que el pico del cierre (~1 A con el umbral viejo) no se sumara
+al arranque de Traslado 1. Con «Medir corriente» esperaba hasta que M6 bajara de
+300 mA (máximo 2 s); sin medición, 0,8 s fijos. Con apriete, M6 sostiene más fuerte
+(en el gemelo, 140–155 crudo ≈ 0,9–1 A): con la medición prendida habría esperado
+siempre los 2 s. Además, el apriete tarda en armarse: en el gemelo la consigna llega
+al destino a los 0,2 s y la corriente pasa de 110 a ~150 y queda estable.
+
+Cambio: con `caps` `gripper_settle=1`, después de un `GRIPPER_HOLD reason=contact` la
+vigilancia de la garra (cada 100 ms) avisa `GRIPPER_SETTLED reason=stable` cuando dos
+lecturas seguidas difieren en ≤6 crudo, pasados 200 ms, o `reason=timeout` a los 2 s.
+`MotionExecutor._wait_grip_settle` espera un aviso posterior al cierre (máximo 2 s);
+sin ese firmware, lo de antes. El supervisor de la fuente sigue frenando el brazo si
+el bus cae.
+
+Gemelo, tarea con recipiente: semilla 7 con giro hasta 15° 5/5 y semilla 4 con giro
+hasta 5° 5/5; asentado a los 200–300 ms (140–156 crudo); Agarre 1,8–2,2 s (antes
+2,5–2,7 s); M6 sosteniendo en Traslado 1 igual que antes (79–128). DEMO: 25,56 s
+(semilla 4) y 24,59 s (semilla 1); Agarre 2,19 y 2,18 s.
+
+En el brazo real, sin apriete la corriente después de congelar bajaba en ~0,6 s; con
+apriete puede quedar más alta pero estable. Si en el registro aparece seguido
+`reason=timeout`, la corriente no se estabiliza: revisarlo con «Medir corriente».
+
 ### Cronómetro y métricas de ejecución
 
 La pestaña **Tarea automática** muestra el tiempo del último intento.

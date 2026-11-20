@@ -63,7 +63,7 @@ class TwinSyncTests(unittest.TestCase):
 
     def test_caps_announces_sync(self):
         self.assertEqual(self.run_line("caps"), ["FIRMWARE_CAPS sync=1 sync_max_motors=5 sync_max_speed=450 "
-                                                 "guard=1 speed_hard_max=1000 gripper_fast=1 gripper_squeeze=1"])
+                                                 "guard=1 speed_hard_max=1000 gripper_fast=1 gripper_squeeze=1 gripper_settle=1"])
 
     def test_five_motors_start_together_with_proportional_speeds(self):
         reply = self.run_line("sync 0 1 190 2 175 3 95 4 182 5 260")

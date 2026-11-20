@@ -116,6 +116,15 @@ float gripperFastUntil = 0.0f;
 static const float GRIPPER_SQUEEZE_MAX_DEGREES = 10.0f;
 float gripperSqueezeDegrees = 0.0f;
 int gripperContactPositionRaw = -1;
+// Agarre asentado: despues de un GRIPPER_HOLD por contacto, la vigilancia (cada 100 ms)
+// avisa GRIPPER_SETTLED cuando dos lecturas seguidas de corriente difieren en
+// GRIPPER_SETTLE_DELTA_RAW o menos, pasados GRIPPER_SETTLE_MIN_MS: ya no hay pico del
+// cierre ni apriete en curso. La PC espera esto antes de levantar, en vez de un tiempo fijo.
+static const unsigned long GRIPPER_SETTLE_MIN_MS = 200;
+static const unsigned long GRIPPER_SETTLE_MAX_MS = 2000;
+static const int GRIPPER_SETTLE_DELTA_RAW = 6;
+bool gripperSettlePending = false;
+int gripperSettleLastRaw = -1;
 // Vigilancia de corriente fuera del cierre: al abrir, al mover M6 por angulo y al
 // sostener (docs/DIAGNOSTICO_GARRA.md). El cierre tiene la suya en
 // processGripperClosing(). Con la fuente de 12 V / 5 A compartida, una garra
@@ -1203,6 +1212,8 @@ void freezeGripperAtCurrentPosition(const char *reason, int currentRaw) {
   gripperContactPositionRaw = -1;
   gripperClosing = false;
   gripperHighCurrentSamples = 0;
+  gripperSettlePending = strcmp(reason, "contact") == 0;
+  gripperSettleLastRaw = -1;
   Serial.print(F("GRIPPER_HOLD reason="));
   Serial.print(reason);
   Serial.print(F(" current_raw="));
@@ -1383,6 +1394,20 @@ void processGripperWatch() {
     }
   } else {
     gripperWatchHardSamples = 0;
+  }
+
+  if (gripperWatch == WATCH_HOLDING && gripperSettlePending) {
+    bool stable = gripperSettleLastRaw >= 0 && abs(currentRaw - gripperSettleLastRaw) <= GRIPPER_SETTLE_DELTA_RAW;
+    if ((elapsed >= GRIPPER_SETTLE_MIN_MS && stable) || elapsed >= GRIPPER_SETTLE_MAX_MS) {
+      gripperSettlePending = false;
+      Serial.print(F("GRIPPER_SETTLED reason="));
+      Serial.print(stable ? F("stable") : F("timeout"));
+      Serial.print(F(" current_raw="));
+      Serial.print(currentRaw);
+      Serial.print(F(" elapsed_ms="));
+      Serial.println(elapsed);
+    }
+    gripperSettleLastRaw = currentRaw;
   }
 
   if (gripperWatch == WATCH_HOLDING) {
@@ -1952,7 +1977,7 @@ void printCapabilities() {
   Serial.print(armMaxSpeed);
   Serial.print(F(" guard=1 speed_hard_max="));
   Serial.print(ARM_SPEED_HARD_MAX);
-  Serial.println(F(" gripper_fast=1 gripper_squeeze=1"));
+  Serial.println(F(" gripper_fast=1 gripper_squeeze=1 gripper_settle=1"));
 }
 
 void handleLine(String line) {
