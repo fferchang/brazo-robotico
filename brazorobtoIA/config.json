@@ -8,17 +8,17 @@
       "name": "USB CAMERA",
       "fallback_index": 2,
       "rotation_degrees": 180,
-      "brightness_percent": 0.0,
-      "contrast_percent": -25.0,
-      "saturation_percent": 70.0,
+      "brightness_percent": -25.0,
+      "contrast_percent": 50.0,
+      "saturation_percent": 10.0,
       "zoom_factor": 1.0
     },
     "lateral": {
       "name": "GENERAL WEBCAM",
       "fallback_index": 1,
       "rotation_degrees": 180,
-      "brightness_percent": 0.0,
-      "contrast_percent": 0.0,
+      "brightness_percent": -25.0,
+      "contrast_percent": -30.0,
       "saturation_percent": 0.0,
       "zoom_factor": 1.0
     }
