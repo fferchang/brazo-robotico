@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "modelo_3d": "bc797e84d5a85462",
+  "camaras": {
+    "frontal": {
+      "nombre": "USB CAMERA",
+      "rotacion": 180,
+      "zoom": 1.0
+    },
+    "lateral": {
+      "nombre": "GENERAL WEBCAM",
+      "rotacion": 180,
+      "zoom": 1.0
+    }
+  },
+  "muestras": []
+}
