@@ -338,9 +338,42 @@ DEMO, todo por defecto: semilla 4 26,80 s (antes 29,02), semilla 1 25,65 s (ante
 27,81). Dentro del ejecutor: 20,98 y 20,21 s (antes 24,51 y 23,62). Aproximación 2
 2,52 → 1,50 s, Agarre 3,77 → 2,71 s, Soltado 2,94 → 2,39 s, Guardado 6,03 → 5,18 s.
 
-Pendiente posible: hacer que el apriete no dependa de en qué lectura cae el contacto
-(por ejemplo, congelar unos grados más adentro de donde se detectó). Cambia la fuerza
-sobre el cubo y la corriente al sostener: medirlo antes en el brazo real.
+### Apriete al agarrar (20/11)
+
+`gripper squeeze <grados>` (0–10, arranca en 0; `caps` anuncia `gripper_squeeze=1`): el
+firmware guarda la posición de M6 en la primera lectura de contacto (la garra ya está
+frenada contra el cubo) y, al confirmar el contacto, la deja en esa posición menos el
+apriete, a 120/15. Solo con motivo `contact`; `closed_limit`, `timeout` y `manual`
+siguen igual. La línea `GRIPPER_HOLD` agrega `squeeze_deg=`. La app manda
+`movimiento.apriete_grados` (5°) al conectar.
+
+Ojo con el gemelo: no modela la elasticidad del cubo y los dedos, y al congelar sin
+apriete conserva la consigna interna del servo, que siguió avanzando ~19°/s durante las
+tres lecturas de confirmación. Eso equivale a varios grados de apriete, así que 1,5° y
+3° desde el primer contacto apretaban menos que antes.
+
+Gemelo, tarea con recipiente (cierre rápido hasta 55°, apertura 900); «sostener» es
+la corriente cruda de M6 al terminar Traslado 1, 2 y 3:
+
+| Semilla, giro máx. | Apriete | Éxitos | Sostener (Traslado 1) | Alivios |
+|---|---:|---:|---|---:|
+| 7, 15° | 0 (antes) | 4/5 | 38–79 | 0 |
+| 7, 15° | 1,5° | 1/5 | 13–39 | 0 |
+| 7, 15° | 3° | 3/5 | 38–75 | 0 |
+| 7, 15° | 5° | 5/5 | 81–119 | 0 |
+| 7, 15° | 7° | 5/5 | 94–161 | 0 |
+| 4, 5° | 5° | 5/5 | 108–127 | 0 |
+| 9, 5° | 5° | 5/5 | 109–130 | 0 |
+
+Con 7° el cubo alineado llega a 161, cerca del límite de alivio (170 durante 2 s). Se
+eligió 5°. DEMO con todo por defecto: 25,75 s (semilla 4) y 24,85 s (semilla 1). En el
+gemelo la corriente al sostener baja durante los traslados (el cubo se acomoda entre
+los dedos).
+
+En el brazo real la fuerza depende de la elasticidad que el gemelo no tiene. Si la
+corriente de M6 sosteniendo pasa ~1,1 A durante 2 s, la protección afloja de a 1,5°
+(hasta 3 veces; recién después corta el torque): con 5° quedaría en 0,5°. Medir con
+«Medir corriente» y bajar `apriete_grados` si aparece `GRIPPER_HOLD_RELIEF`.
 
 ### Cronómetro y métricas de ejecución
 

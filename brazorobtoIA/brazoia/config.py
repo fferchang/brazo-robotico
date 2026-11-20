@@ -128,6 +128,13 @@ class MotionConfig:
     gripper_open_speed: int = 900
     # Cierre por presión con tramo rápido hasta 55° (execution.GRIPPER_FAST_CLOSE_UNTIL).
     fast_gripper_close: bool = True
+    # Al agarrar, la garra queda en la posición del primer contacto menos estos grados
+    # (`gripper squeeze`; 0 = como antes: donde estaba al confirmar el contacto, con un
+    # apriete que dependía de en qué lectura de corriente caía). Gemelo (20/11): con 5°,
+    # 15/15 incluidos cubos girados ~14° que antes se resbalaban; 1,5° y 3° apretaban
+    # menos que antes. En el brazo real la protección de la garra afloja de a 1,5° si
+    # sostiene sobre ~1,1 A durante 2 s: medir con «Medir corriente».
+    gripper_squeeze_degrees: float = 5.0
     # Supervisor de la fuente: con la tensión más baja de los servos bajo `slow_volts` o la
     # corriente total sobre `slow_ma`, M1–M5 van más despacio, todos por igual; bajo
     # `hold_volts` o sobre `hold_ma` durante 200 ms, el brazo se frena donde está.
@@ -146,6 +153,7 @@ def load_motion(raw: dict) -> MotionConfig:
         acceleration=int(raw.get("aceleracion", defaults.acceleration)),
         gripper_open_speed=int(raw.get("velocidad_garra_abrir", defaults.gripper_open_speed)),
         fast_gripper_close=bool(raw.get("cierre_rapido", defaults.fast_gripper_close)),
+        gripper_squeeze_degrees=float(raw.get("apriete_grados", defaults.gripper_squeeze_degrees)),
         guard_enabled=bool(guard.get("activa", defaults.guard_enabled)),
         guard_slow_volts=float(guard.get("lento_v", defaults.guard_slow_volts)),
         guard_hold_volts=float(guard.get("corte_v", defaults.guard_hold_volts)),
@@ -154,9 +162,10 @@ def load_motion(raw: dict) -> MotionConfig:
     )
     # Los mismos rangos que acepta el firmware (`speed max` y `power guard`).
     if not 100 <= motion.max_speed <= 1000 or not 10 <= motion.acceleration <= 150 \
-            or not 100 <= motion.gripper_open_speed <= 1000:
+            or not 100 <= motion.gripper_open_speed <= 1000 \
+            or not 0.0 <= motion.gripper_squeeze_degrees <= 10.0:
         raise ValueError("movimiento: velocidad_max y velocidad_garra_abrir entre 100 y 1000, "
-                         "aceleracion entre 10 y 150.")
+                         "aceleracion entre 10 y 150 y apriete_grados entre 0 y 10.")
     if not 5.0 <= motion.guard_hold_volts < motion.guard_slow_volts <= 13.0 \
             or not 100 <= motion.guard_slow_ma < motion.guard_hold_ma <= 10000:
         raise ValueError("movimiento.guardia_fuente: 5 <= corte_v < lento_v <= 13 y 100 <= lento_ma < corte_ma <= 10000.")

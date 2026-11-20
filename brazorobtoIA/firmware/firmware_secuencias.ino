@@ -109,6 +109,13 @@ uint16_t gripperOpenSpeed = GRIPPER_OPEN_SPEED_DEFAULT;
 uint16_t gripperAngleOpenSpeed = MOVE_SPEED;
 bool gripperFastPhase = false;
 float gripperFastUntil = 0.0f;
+// Apriete al agarrar (`gripper squeeze <grados>`): al detectar el contacto, la garra queda
+// en la posicion de la PRIMERA lectura de contacto menos estos grados. La garra ya esta
+// frenada contra el cubo en esa lectura, asi que el apriete no depende de en que lectura
+// (cada 40 ms) termino la deteccion. 0 = como antes: queda donde estaba al detectar.
+static const float GRIPPER_SQUEEZE_MAX_DEGREES = 10.0f;
+float gripperSqueezeDegrees = 0.0f;
+int gripperContactPositionRaw = -1;
 // Vigilancia de corriente fuera del cierre: al abrir, al mover M6 por angulo y al
 // sostener (docs/DIAGNOSTICO_GARRA.md). El cierre tiene la suya en
 // processGripperClosing(). Con la fuente de 12 V / 5 A compartida, una garra
@@ -551,6 +558,7 @@ void printHelp() {
   Serial.println(F("  power guard on|off"));
   Serial.println(F("  gripper close 55     (rapido hasta 55 grados, despues por presion)"));
   Serial.println(F("  gripper speed 900    (velocidad al abrir la garra)"));
+  Serial.println(F("  gripper squeeze 2    (grados de apriete desde el primer contacto)"));
   Serial.println(F("  power guard 95 80 3000 4500  (lento/corte en decimas de V y en mA)"));
   Serial.println(F("  read <id>"));
   Serial.println(F("  scan"));
@@ -1183,10 +1191,16 @@ void startGripperWatch(GripperWatchMode mode) {
 
 void freezeGripperAtCurrentPosition(const char *reason, int currentRaw) {
   int position = servoBus.ReadPos(6);
-  if (position >= 0) {
+  bool squeezed = strcmp(reason, "contact") == 0 && gripperSqueezeDegrees > 0.0f && gripperContactPositionRaw >= 0;
+  if (squeezed) {
+    float target = max(GRIPPER_CLOSED_DEGREES, posToDeg(gripperContactPositionRaw) - 10.0f - gripperSqueezeDegrees);
+    servoBus.WritePosEx(6, (int)degToPos(toRealServoDegrees(6, target)), 120, 15);
+    gripperCommandDegrees = target;
+  } else if (position >= 0) {
     servoBus.WritePosEx(6, position, 120, 15);
     gripperCommandDegrees = posToDeg(position) - 10.0f;
   }
+  gripperContactPositionRaw = -1;
   gripperClosing = false;
   gripperHighCurrentSamples = 0;
   Serial.print(F("GRIPPER_HOLD reason="));
@@ -1198,7 +1212,12 @@ void freezeGripperAtCurrentPosition(const char *reason, int currentRaw) {
   Serial.print(F(" position_raw="));
   Serial.print(position);
   Serial.print(F(" logical_deg="));
-  Serial.println(gripperCommandDegrees, 1);
+  Serial.print(gripperCommandDegrees, 1);
+  if (squeezed) {
+    Serial.print(F(" squeeze_deg="));
+    Serial.print(gripperSqueezeDegrees, 1);
+  }
+  Serial.println();
   startGripperWatch(WATCH_HOLDING);
 }
 
@@ -1254,6 +1273,7 @@ void startClosingGripper(float fastUntil = NAN) {
   gripperCloseStartedMs = millis();
   gripperLastStepMs = 0;
   gripperHighCurrentSamples = 0;
+  gripperContactPositionRaw = -1;
   gripperFastPhase = !isnan(fastUntil) && gripperCommandDegrees > fastUntil + GRIPPER_FAST_HANDOFF_DEGREES;
   if (gripperFastPhase) {
     gripperFastUntil = fastUntil;
@@ -1434,6 +1454,9 @@ void processGripperClosing() {
   }
 
   if (now - gripperCloseStartedMs >= GRIPPER_INRUSH_IGNORE_MS && currentRaw >= gripperContactCurrentRaw) {
+    if (gripperHighCurrentSamples == 0) {
+      gripperContactPositionRaw = servoBus.ReadPos(6);  // ya frenada contra el cubo
+    }
     gripperHighCurrentSamples++;
   } else {
     gripperHighCurrentSamples = 0;
@@ -1929,7 +1952,7 @@ void printCapabilities() {
   Serial.print(armMaxSpeed);
   Serial.print(F(" guard=1 speed_hard_max="));
   Serial.print(ARM_SPEED_HARD_MAX);
-  Serial.println(F(" gripper_fast=1"));
+  Serial.println(F(" gripper_fast=1 gripper_squeeze=1"));
 }
 
 void handleLine(String line) {
@@ -2000,6 +2023,20 @@ void handleLine(String line) {
       return;
     }
     startClosingGripper(fastUntil);
+    return;
+  }
+
+  if (line.startsWith("gripper squeeze ")) {
+    const char *cursor = line.c_str() + 16;
+    float squeeze;
+    if (!readWaypointDegrees(cursor, squeeze) || (skipWaypointSpaces(cursor), *cursor) ||
+        squeeze < 0.0f || squeeze > GRIPPER_SQUEEZE_MAX_DEGREES) {
+      Serial.println(F("GRIPPER_SQUEEZE_REJECTED reason=fuera_de_rango"));
+      return;
+    }
+    gripperSqueezeDegrees = squeeze;
+    Serial.print(F("GRIPPER_SQUEEZE deg="));
+    Serial.println(gripperSqueezeDegrees, 1);
     return;
   }
 

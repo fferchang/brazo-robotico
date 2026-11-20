@@ -21,6 +21,7 @@ static void resetPose() {
   gripperClosing = false;
   gripperFastPhase = false;
   gripperWatch = WATCH_NONE;
+  gripperContactPositionRaw = -1;
   powerGuard = false;
   powerTelemetry = false;
   speedScalePct = 100;
@@ -288,6 +289,50 @@ int main() {
     CHECK(Serial.out.find("GRIPPER_SPEED_REJECTED reason=fuera_de_rango") == 0, line);
   }
   run("gripper speed 300");
+
+  // ----- apriete desde el primer contacto -----
+  auto closeOnCube = [&](const char *squeezeLine) {
+    resetPose();
+    gripperClosing = false;
+    run(squeezeLine);
+    servoBus.servo[6].current = 0;
+    servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(60);  // 50 logico
+    run("gripper close");
+    fake_millis += 300;  // pasada la exclusion inicial
+    servoBus.servo[6].pos = toPos(53.6f);  // 43,6 logico: toca el cubo
+    servoBus.servo[6].current = 100;  // sobre el umbral de 92
+    gripperTick();  // primera lectura de contacto
+    servoBus.servo[6].pos = toPos(52.8f);  // sigue entrando mientras se confirma
+    servoBus.servo[6].current = 120;
+    gripperTick();
+    gripperTick();
+  };
+  run("caps");
+  CHECK(Serial.out.find("gripper_squeeze=1") != std::string::npos, "caps anuncia gripper_squeeze");
+  closeOnCube("gripper squeeze 2");
+  CHECK(Serial.out.find("GRIPPER_HOLD reason=contact") != std::string::npos &&
+        Serial.out.find("squeeze_deg=2.0") != std::string::npos, "agarre con apriete");
+  CHECK(abs(servoBus.servo[6].goal - toPos(51.6f)) <= 1, "primer contacto (43,6) menos 2 grados");
+  closeOnCube("gripper squeeze 0");
+  CHECK(Serial.out.find("squeeze_deg") == std::string::npos, "sin apriete: como antes");
+  CHECK(servoBus.servo[6].goal == toPos(52.8f), "sin apriete queda donde estaba al detectar");
+  for (const char *line : {"gripper squeeze 11", "gripper squeeze -1", "gripper squeeze x", "gripper squeeze 2 3"}) {
+    run(line);
+    CHECK(Serial.out.find("GRIPPER_SQUEEZE_REJECTED reason=fuera_de_rango") == 0, line);
+  }
+  // Cerrar sin cubo (closed_limit) no aprieta de mas.
+  resetPose();
+  gripperClosing = false;
+  run("gripper squeeze 2");
+  servoBus.servo[6].current = 0;
+  servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(11);  // 1 logico
+  gripperCommandDegrees = 0;
+  gripperClosing = true;
+  gripperCloseStartedMs = fake_millis;
+  gripperTick();
+  CHECK(Serial.out.find("GRIPPER_HOLD reason=closed_limit") != std::string::npos &&
+        Serial.out.find("squeeze_deg") == std::string::npos, "closed_limit sin apriete");
+  run("gripper squeeze 0");
 
   if (failures == 0) std::cout << "OK: pruebas de sync en la PC" << std::endl;
   return failures == 0 ? 0 : 1;

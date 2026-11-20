@@ -78,6 +78,7 @@
     "aceleracion": 45,
     "velocidad_garra_abrir": 900,
     "cierre_rapido": true,
+    "apriete_grados": 5.0,
     "guardia_fuente": {
       "activa": true,
       "lento_v": 9.5,

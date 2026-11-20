@@ -296,6 +296,14 @@ Con el firmware nuevo (`caps` con `gripper_fast=1`):
   recipiente con cubos girados hasta 5°, 10/10 igual que antes. Con cubos girados ~15°
   los agarres quedan al límite con los dos cierres y con el rápido fallaron más: si en
   el brazo real se resbalan cubos, apagalo.
+- **Apriete al agarrar** (`apriete_grados`, 5°): al detectar el contacto, la garra queda
+  en la posición de la primera lectura de contacto menos esos grados, siempre igual.
+  Antes quedaba donde estaba al confirmar el contacto, y el apriete dependía de en qué
+  lectura de corriente (cada 40 ms) caía. Gemelo: 15/15 escenas, también los cubos
+  girados ~14° que antes se resbalaban. `0` vuelve a lo de antes. En el brazo real hay
+  que mirar con «Medir corriente» que M6 sosteniendo quede bien por debajo de ~1,1 A:
+  si no, la protección de la garra afloja de a 1,5° (`GRIPPER_HOLD_RELIEF`); en ese
+  caso, bajá `apriete_grados`.
 
 ### Demo: el cubo de un lado a otro, sin recipiente
 

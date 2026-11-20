@@ -123,6 +123,9 @@ GRIPPER_FAST_TIMEOUT_S = 3.0
 GRIPPER_OPEN_SPEED_DEFAULT = 300
 GRIPPER_SPEED_MIN_SETTING = 100
 GRIPPER_SPEED_HARD_MAX = 1000
+# `gripper squeeze <grados>`: al detectar el contacto, la garra queda en la posición de la
+# primera lectura de contacto menos esto (0 = como antes). Ver el firmware.
+GRIPPER_SQUEEZE_MAX_DEGREES = 10.0
 # Vigilancia fuera del cierre, igual que processGripperWatch() del firmware.
 GRIPPER_WATCH_INTERVAL_S = 0.100
 GRIPPER_MOVE_INRUSH_IGNORE_S = 0.250
@@ -353,6 +356,7 @@ class DigitalTwin:
         self.arm_max_speed = MOVE_SPEED
         self.arm_acc = MOVE_ACC
         self.gripper_open_speed = GRIPPER_OPEN_SPEED_DEFAULT
+        self.gripper_squeeze = 0.0
         self.gripper_angle_open_speed = MOVE_SPEED
         self.power_guard = False
         self.guard_limits = (95, 80, 3000, 4500)  # lento y corte: décimas de V y mA
@@ -391,6 +395,7 @@ class DigitalTwin:
         self.pending_report: tuple[float, int] | None = None
         self.gripper_closing = False
         self.gripper_fast_until: float | None = None  # tramo rápido del cierre en curso
+        self.gripper_contact_degrees: float | None = None  # M6 en la primera lectura de contacto
         self.gripper_command = GRIPPER_CLOSED_DEGREES
         self.gripper_started = 0.0
         self.gripper_last_step = -math.inf
@@ -1083,15 +1088,24 @@ class DigitalTwin:
 
     def _freeze_gripper(self, reason: str, current_raw: int) -> None:
         position = self._read_pos(6)
-        # El firmware ordena la posición leída; ver la nota del módulo sobre la elasticidad.
-        self.profiles[6].target = self.profiles[6].setpoint
-        self.profiles[6].velocity = 0.0
-        self.gripper_command = pos_to_deg(position) - 10.0
+        squeeze = ""
+        if reason == "contact" and self.gripper_squeeze > 0 and self.gripper_contact_degrees is not None:
+            # Como el firmware: posición del primer contacto menos el apriete, a 120/15.
+            target = max(GRIPPER_CLOSED_DEGREES, self.gripper_contact_degrees - self.gripper_squeeze)
+            self.profiles[6].command(target, 120, 15)
+            self.gripper_command = target
+            squeeze = f" squeeze_deg={self.gripper_squeeze:.1f}"
+        else:
+            # El firmware ordena la posición leída; ver la nota del módulo sobre la elasticidad.
+            self.profiles[6].target = self.profiles[6].setpoint
+            self.profiles[6].velocity = 0.0
+            self.gripper_command = pos_to_deg(position) - 10.0
+        self.gripper_contact_degrees = None
         self.gripper_closing = False
         self.gripper_samples = 0
         self.println(f"GRIPPER_HOLD reason={reason} current_raw={current_raw} "
                      f"current_ma_aprox={current_raw * 6.5:.1f} position_raw={position} "
-                     f"logical_deg={self.gripper_command:.1f}")
+                     f"logical_deg={self.gripper_command:.1f}{squeeze}")
         self._start_watch("holding")
 
     def _start_watch(self, mode: str) -> None:
@@ -1178,6 +1192,7 @@ class DigitalTwin:
         self.gripper_last_step = -math.inf
         self.gripper_samples = 0
         self.gripper_fast_until = None
+        self.gripper_contact_degrees = None
         detail = ""
         if fast_until is not None and start > fast_until + GRIPPER_FAST_HANDOFF_DEGREES:
             self.gripper_fast_until = fast_until
@@ -1205,6 +1220,8 @@ class DigitalTwin:
             self._freeze_gripper("timeout", current_raw)
             return
         if elapsed >= GRIPPER_INRUSH_IGNORE_S and current_raw >= self.contact_threshold:
+            if self.gripper_samples == 0:
+                self.gripper_contact_degrees = self._logical_from_encoder(6)
             self.gripper_samples += 1
         else:
             self.gripper_samples = 0
@@ -1241,7 +1258,8 @@ class DigitalTwin:
         lowered = line.lower()
         if self.sync_firmware and lowered == "caps":
             self.println(f"FIRMWARE_CAPS sync=1 sync_max_motors={SYNC_MAX_MOTORS} sync_max_speed={self.arm_max_speed} "
-                         f"guard=1 speed_hard_max={ARM_SPEED_HARD_MAX} gripper_fast=1")
+                         f"guard=1 speed_hard_max={ARM_SPEED_HARD_MAX} gripper_fast=1 "
+                         f"gripper_squeeze=1")
             return
         if lowered == "waypoint" or lowered.startswith("waypoint "):
             self._waypoint_command(lowered)
@@ -1271,6 +1289,13 @@ class DigitalTwin:
                 self.println("GRIPPER_ERROR reason=fuera_de_rango detail=gripper_close_hasta_0_a_140")
             else:
                 self._start_closing(float(text))
+        elif self.sync_firmware and lowered.startswith("gripper squeeze "):
+            text = lowered[16:].strip()
+            if not _STRICT_FLOAT.fullmatch(text) or not 0.0 <= float(text) <= GRIPPER_SQUEEZE_MAX_DEGREES:
+                self.println("GRIPPER_SQUEEZE_REJECTED reason=fuera_de_rango")
+            else:
+                self.gripper_squeeze = float(text)
+                self.println(f"GRIPPER_SQUEEZE deg={self.gripper_squeeze:.1f}")
         elif self.sync_firmware and lowered.startswith("gripper speed "):
             text = lowered[14:].strip()
             if not _STRICT_INT.fullmatch(text) or not GRIPPER_SPEED_MIN_SETTING <= int(text) <= GRIPPER_SPEED_HARD_MAX:

@@ -68,6 +68,48 @@ class TwinFastCloseTests(unittest.TestCase):
         self.assertFalse(any("GRIPPER_SPEED" in line for line in self.run_line("gripper speed 900")))
 
 
+class TwinSqueezeTests(unittest.TestCase):
+    def setUp(self):
+        self.twin = DigitalTwin(seed=4)
+
+    def close_on_contact(self):
+        """Cierre en curso: primera lectura de contacto a 43,6° y confirmación a 42,8°."""
+        twin = self.twin
+        twin.gripper_closing = True
+        twin.gripper_started = twin.now - 1.0
+        twin.gripper_command = 0.0
+        twin.contact_threshold = 60
+        twin._logical_from_encoder = lambda motor: self.position if motor == 6 else 0.0
+        for position, current in [(43.6, 100), (42.8, 120), (42.8, 120)]:
+            self.position = position
+            twin._gripper_current_raw = lambda value=current: value
+            twin.gripper_last_step = -1e9
+            twin._process_gripper_closing()
+        return twin.log_since(0)
+
+    def test_hold_from_first_contact_minus_squeeze(self):
+        self.assertEqual(self.twin.log_since(0)[-1:], [])
+        self.twin.handle_line("gripper squeeze 2")
+        self.assertIn("GRIPPER_SQUEEZE deg=2.0", self.twin.log_since(0))
+        log = self.close_on_contact()
+        hold = [line for line in log if line.startswith("GRIPPER_HOLD reason=contact")]
+        self.assertEqual(len(hold), 1)
+        self.assertTrue(hold[0].endswith("squeeze_deg=2.0"), hold[0])
+        self.assertAlmostEqual(self.twin.profiles[6].target, 41.6)
+
+    def test_without_squeeze_it_keeps_the_old_behaviour(self):
+        log = self.close_on_contact()
+        hold = [line for line in log if line.startswith("GRIPPER_HOLD reason=contact")][0]
+        self.assertNotIn("squeeze_deg", hold)
+
+    def test_bad_values_are_refused(self):
+        for line in ("gripper squeeze 11", "gripper squeeze -1", "gripper squeeze x"):
+            count = self.twin.log_count
+            self.twin.handle_line(line)
+            self.assertEqual(self.twin.log_since(count), ["GRIPPER_SQUEEZE_REJECTED reason=fuera_de_rango"])
+        self.assertEqual(self.twin.gripper_squeeze, 0.0)
+
+
 class Recorder(RobotSerial):
     def __init__(self, fast):
         super().__init__("SIMULADO", 115200)
@@ -98,6 +140,9 @@ class HostGripperTests(unittest.TestCase):
         robot = Recorder(fast=True)
         commands = configure_motion(robot, MotionConfig(gripper_open_speed=800), timeout=0.05)
         self.assertEqual(commands[-1], "gripper speed 800")
+        robot.gripper_squeeze_supported = True
+        commands = configure_motion(robot, MotionConfig(gripper_squeeze_degrees=2.0), timeout=0.05)
+        self.assertEqual(commands[-1], "gripper squeeze 2.0")
         robot._consume_line("FIRMWARE_CAPS sync=1 sync_max_motors=5 sync_max_speed=450 guard=1 "
                             "speed_hard_max=1000 gripper_fast=1", 1.0)
         self.assertTrue(robot.gripper_fast_supported)
@@ -106,11 +151,15 @@ class HostGripperTests(unittest.TestCase):
 
     def test_configuration_range(self):
         self.assertEqual(load_motion({}).gripper_open_speed, 900)
+        self.assertEqual(load_motion({}).gripper_squeeze_degrees, 5.0)
         self.assertTrue(load_motion({}).fast_gripper_close)
         self.assertFalse(load_motion({"cierre_rapido": False}).fast_gripper_close)
         for value in (50, 2000):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 load_motion({"velocidad_garra_abrir": value})
+        for value in (-1, 11):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_motion({"apriete_grados": value})
 
 
 if __name__ == "__main__":
