@@ -7,6 +7,7 @@ sigue pidiendo confirmación y pasando por el planificador y el firmware.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import mujoco
@@ -80,14 +81,28 @@ class GeometricPolicy:
         self._key: bytes | None = None
         self._placement: Placement | None = None
         self._plan = None
+        # (radial, lateral) en mm: dónde agarrar respecto del cubo que ven las cámaras
+        # (config.json «agarre»; ver config.load_grasp_offset). Solo mueve el cubo.
+        self.grasp_offset_mm: tuple[float, float] = (0.0, 0.0)
+
+    def grasp_point(self, cube_xy) -> tuple[float, float]:
+        """El cubo según las cámaras, corrido por `grasp_offset_mm` respecto de la base (0, 0)."""
+        radial, lateral = (float(value) / 1000.0 for value in self.grasp_offset_mm)
+        x, y = float(cube_xy[0]), float(cube_xy[1])
+        length = math.hypot(x, y)
+        if length < 1e-6 or (radial == 0.0 and lateral == 0.0):
+            return x, y
+        ux, uy = x / length, y / length
+        return x + radial * ux - lateral * uy, y + radial * uy + lateral * ux
 
     def placement(self, scene_features) -> Placement:
         positions = self.calibration.locate(scene_features)
-        return Placement(positions["cubo"], self.cube_yaw, positions["recipiente"], self.container_yaw)
+        return Placement(self.grasp_point(positions["cubo"]), self.cube_yaw, positions["recipiente"],
+                         self.container_yaw)
 
     def plan(self, scene_features):
         """(ubicación estimada, plan del experto); se calcula una vez por escena."""
-        key = np.asarray(scene_features, dtype=np.float64).tobytes()
+        key = np.asarray(scene_features, dtype=np.float64).tobytes() + repr(tuple(self.grasp_offset_mm)).encode()
         if key != self._key:
             placement = self.placement(scene_features)
             try:

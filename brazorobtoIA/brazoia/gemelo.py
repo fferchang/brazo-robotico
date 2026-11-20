@@ -26,6 +26,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -72,6 +73,30 @@ SIM_DETECTION = dict(minimum_red_area_ratio=0.001, minimum_lime_area_ratio=0.004
 STEPS_PER_TURN = 4095.0
 MOVE_SPEED = 450            # pasos/s del servo
 MOVE_ACC = 45               # unidades de 100 pasos/s²
+# Orden `sync` del firmware: hasta cinco motores M1..M5 juntos (ver handleSyncLine).
+SYNC_MIN_SPEED = 20         # nunca 0: en el STS3215 sería la velocidad máxima
+SPEED_FLOOR = 1             # piso por motor y tras la escala del supervisor (como el firmware)
+GUARD_HOLD_LATCH_S = 1.0    # tras POWER_GUARD_HOLD se rechazan órdenes de M1..M5
+SYNC_MAX_MOTORS = 5
+SYNC_MAX_DURATION_MS = 10000
+# `speed max` y `power guard` (ver el firmware).
+ARM_SPEED_MIN_SETTING = 100
+ARM_SPEED_HARD_MAX = 1000
+ARM_ACC_MIN_SETTING = 10
+ARM_ACC_MAX_SETTING = 150
+GUARD_HOLD_SAMPLES = 2
+GUARD_RECOVER_SAMPLES = 10
+GUARD_SCALE_MIN_PCT = 25
+GUARD_SCALE_STEP_UP_PCT = 25
+ARM_GOAL_REISSUE_S = 5.0
+# Corriente de M1..M5 por N·m del actuador. La de la garra sale del umbral de contacto
+# (~2 A por N·m); con esa escala el brazo daba ~7 A, pero en el brazo real nunca pasó de
+# ~300 mA (6/11). Este factor hace que una vuelta del gemelo dé eso: es una calibración
+# con una sola medición, para que el supervisor no reaccione a picos falsos.
+ARM_CURRENT_MA_PER_NM = 85.0
+# Números como los aceptan strtol/strtof en el firmware (sin "nan", "inf" ni "1_0").
+_STRICT_INT = re.compile(r"[+-]?\d+")
+_STRICT_FLOAT = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 MOVE_COOLDOWN_S = 0.050
 WAYPOINT_SPACING_S = 0.065
 WAYPOINT_POLL_S = 0.050
@@ -97,7 +122,7 @@ GRIPPER_WATCH_INTERVAL_S = 0.100
 GRIPPER_MOVE_INRUSH_IGNORE_S = 0.250
 GRIPPER_MOVE_WATCH_S = 9.0
 GRIPPER_HARD_CURRENT_SAMPLES = 2
-POWER_TELEM_INTERVAL_S = 0.100
+POWER_TELEM_INTERVAL_S = 0.100   # POWER_SAMPLE_INTERVAL_MS: telemetría y supervisor
 GRIPPER_HOLD_LIMIT_RAW = 170
 GRIPPER_HOLD_LIMIT_SAMPLES = 20
 GRIPPER_HOLD_RELIEF_DEGREES = 1.5
@@ -316,6 +341,16 @@ class DigitalTwin:
         # Como en el firmware, `power telem` sigue prendido aunque cambie la escena.
         self.power_telemetry = False
         self.last_power_telemetry = -math.inf
+        # False: se comporta como el firmware cargado el 6/11, sin `caps` ni `sync`.
+        self.sync_firmware = True
+        # Como en el firmware: valen hasta reiniciar, aunque cambie la escena.
+        self.arm_max_speed = MOVE_SPEED
+        self.arm_acc = MOVE_ACC
+        self.power_guard = False
+        self.guard_limits = (95, 80, 3000, 4500)  # lento y corte: décimas de V y mA
+        # Para pruebas: corriente cruda extra por motor y voltaje forzado (décimas de V).
+        self.injected_current_raw: dict[int, int] = {}
+        self.injected_voltage_dv: int | None = None
         self._reset_state(self.placement)
 
     # ----- escena -----
@@ -359,6 +394,10 @@ class DigitalTwin:
         self.gripper_high_samples = 0
         self.gripper_reliefs = 0
         self.gripper_telemetry = False
+        self.speed_scale_pct = 100
+        self.guard_hard_samples = 0
+        self.guard_good_samples = 0
+        self.arm_goals: dict[int, tuple[float, float, float]] = {}  # motor: (destino, velocidad base, t)
         self.arm.contacts.clear()
 
     @property
@@ -563,6 +602,16 @@ class DigitalTwin:
             return
         profile.command(logical, speed, acc)
 
+    def _scaled_speed(self, base: float) -> int:
+        return int(max(SPEED_FLOOR, base * self.speed_scale_pct / 100.0))
+
+    def _arm_write(self, motor: int, logical: float, base_speed: float, acc: float | None = None) -> int:
+        """Orden a un motor de M1..M5 con la escala del supervisor; recuerda el destino."""
+        speed = self._scaled_speed(base_speed)
+        self._write_pos(motor, logical, speed, self.arm_acc if acc is None else acc)
+        self.arm_goals[motor] = (float(logical), float(base_speed), self.now)
+        return speed
+
     def _set_gain(self, motor: int, kp: float) -> None:
         aid = self.arm.actuator_ids[motor]
         self.arm.model.actuator_gainprm[aid, 0] = kp
@@ -701,7 +750,10 @@ class DigitalTwin:
         extra = f" (real {real:.1f} deg)" if motor == 6 else ""
         self.println(f"Moviendo ID {motor} a {degrees:.1f} deg{extra} -> pos {deg_to_pos(real)}")
         self.last_move = self.now
-        self._write_pos(motor, degrees, MOVE_SPEED, MOVE_ACC)
+        if motor <= 5:
+            self._arm_write(motor, degrees, self.arm_max_speed)
+        else:
+            self._write_pos(motor, degrees, MOVE_SPEED, MOVE_ACC)
         self.pending_report = (self.now + POST_MOVE_REPORT_S, motor)
 
     def _move_pair(self, first: int, first_deg: float, second: int, second_deg: float, *,
@@ -733,16 +785,75 @@ class DigitalTwin:
         deltas = [abs(first_deg - self._logical_from_encoder(first)),
                   abs(second_deg - self._logical_from_encoder(second))]
         largest = max(deltas)
-        speeds = [MOVE_SPEED, MOVE_SPEED]
+        arm = first <= 5 and second <= 5
+        cruise = self.arm_max_speed if arm else MOVE_SPEED
+        base = [cruise, cruise]
         if largest > 0.1:
-            speeds = [int(max(80.0, MOVE_SPEED * delta / largest)) for delta in deltas]
-        self._write_pos(first, first_deg, speeds[0], MOVE_ACC)
-        self._write_pos(second, second_deg, speeds[1], MOVE_ACC)
+            base = [max(80.0, cruise * delta / largest) for delta in deltas]
+        speeds = [self._scaled_speed(value) for value in base]
+        acc = self.arm_acc if arm else MOVE_ACC
+        for motor, degrees, value in ((first, first_deg, base[0]), (second, second_deg, base[1])):
+            if motor <= 5:
+                self._arm_write(motor, degrees, value, acc)
+            else:
+                self._write_pos(motor, degrees, self._scaled_speed(value), acc)
         self.last_move = self.now
         self.pending_report = None
         if report:
             self.println(f"PAIR_MOVE_OK ID1={first} target1={first_deg:.2f} speed1={speeds[0]} "
                          f"ID2={second} target2={second_deg:.2f} speed2={speeds[1]}")
+
+    def _sync_command(self, line: str) -> None:
+        """Réplica de `handleSyncLine`: hasta cinco motores de M1..M5 en una orden."""
+        parts = line.split()[1:]
+        if not parts or not _STRICT_INT.fullmatch(parts[0]) or not 0 <= int(parts[0]) <= SYNC_MAX_DURATION_MS:
+            self.println("SYNC_REJECTED reason=formato")
+            return
+        duration_ms = int(parts[0])
+        targets: dict[int, float] = {}
+        values = parts[1:]
+        for index in range(0, len(values), 2):
+            if len(targets) == SYNC_MAX_MOTORS:
+                self.println("SYNC_REJECTED reason=formato")
+                return
+            motor_text = values[index]
+            if not _STRICT_INT.fullmatch(motor_text) or not 1 <= int(motor_text) <= SYNC_MAX_MOTORS \
+                    or int(motor_text) in targets:
+                self.println("SYNC_REJECTED reason=motores")
+                return
+            if index + 1 >= len(values) or not _STRICT_FLOAT.fullmatch(values[index + 1]):
+                self.println("SYNC_REJECTED reason=formato")
+                return
+            motor, degrees = int(motor_text), float(values[index + 1])
+            low, high = USER_LIMITS[motor]
+            if not low <= degrees <= high:
+                self.println("SYNC_REJECTED reason=fuera_de_rango")
+                return
+            targets[motor] = degrees
+        if not targets:
+            self.println("SYNC_REJECTED reason=formato")
+            return
+        if self.now - self.last_move < MOVE_COOLDOWN_S:
+            self.println("SYNC_REJECTED reason=cooldown")
+            return
+        current = {motor: self._logical_from_encoder(motor) for motor in targets}
+        reason = self._validate_pair(targets)  # M6 no cambia: la misma recta de 20 puntos
+        if reason != "OK":
+            self.println(f"SYNC_REJECTED reason=trayectoria_insegura detail={reason}")
+            return
+        largest = max(abs(targets[motor] - current[motor]) for motor in targets)
+        cruise = float(self.arm_max_speed)
+        if duration_ms > 0 and largest > 0.1:
+            wanted = (largest / 360.0 * STEPS_PER_TURN) / (duration_ms / 1000.0)
+            cruise = min(max(wanted, SYNC_MIN_SPEED), self.arm_max_speed)
+        speeds = {}
+        for motor, degrees in targets.items():
+            share = abs(degrees - current[motor]) / largest if largest > 0.1 else 1.0
+            speeds[motor] = self._arm_write(motor, degrees, max(SPEED_FLOOR, cruise * share))
+        self.last_move = self.now
+        self.pending_report = None
+        self.println(f"SYNC_MOVE_OK n={len(targets)} dur_ms={duration_ms} "
+                     f"ids={','.join(map(str, targets))} speeds={','.join(str(speeds[m]) for m in targets)}")
 
     def _waypoint_result(self, status: str, identifier: int, reason: str = "") -> None:
         detail = f" reason={reason}" if reason else ""
@@ -860,7 +971,7 @@ class DigitalTwin:
             self._move_pair(first, a, second, b, report=False)
         else:
             motor, target = next(iter(group.items()))
-            self._write_pos(motor, target, MOVE_SPEED, MOVE_ACC)
+            self._arm_write(motor, target, self.arm_max_speed)
             self.last_move = now
             self.pending_report = None
         if self.last_move == last_move or any(self.profiles[motor].target != target for motor, target in group.items()):
@@ -872,19 +983,91 @@ class DigitalTwin:
         point.stable = 0
 
     # ----- firmware: garra -----
-    def _process_power_telemetry(self) -> None:
-        """Como `power telem on` del firmware. Las corrientes salen del torque de cada
-        actuador con la escala de la garra y el voltaje de una fuente ideal de 12 V con
-        0,2 Ω de caída: sirven para probar el camino de la medición, no como medida."""
-        if not self.power_telemetry or self.now - self.last_power_telemetry < POWER_TELEM_INTERVAL_S:
-            return
-        self.last_power_telemetry = self.now
-        currents = [current_raw_from_torque(float(self.arm.data.actuator_force[self.arm.actuator_ids[motor]]))
-                    if self.torque[motor] else 0 for motor in range(1, 7)]
+    def _read_power(self) -> tuple[list[int], int]:
+        """Corrientes crudas de M1..M6 y el voltaje más bajo (décimas de V). Garra: escala
+        del umbral de contacto; brazo: ARM_CURRENT_MA_PER_NM. Fuente ideal de 12 V con
+        0,2 Ω. Sirven para probar el camino, no como medida."""
+        currents = []
+        for motor in range(1, 7):
+            if not self.torque[motor]:
+                currents.append(0)
+                continue
+            torque = float(self.arm.data.actuator_force[self.arm.actuator_ids[motor]])
+            raw = current_raw_from_torque(torque) if motor == 6 else \
+                int(round(abs(torque) * ARM_CURRENT_MA_PER_NM / 6.5))
+            currents.append(raw + int(self.injected_current_raw.get(motor, 0)))
         total_ma = sum(currents) * 6.5
         voltage_dv = int(round(120 - total_ma / 1000.0 * 2.0))
-        self.println(f"POWER_TELEM ms={int(self.now * 1000)} I={','.join(str(value) for value in currents)} "
-                     f"total_ma={total_ma:.0f} v_min_dv={voltage_dv} v_id=1")
+        if self.injected_voltage_dv is not None:
+            voltage_dv = int(self.injected_voltage_dv)
+        return currents, voltage_dv
+
+    def _process_power_telemetry(self) -> None:
+        """Como `processPower` del firmware: una lectura cada 100 ms para `power telem` y
+        para el supervisor de la fuente."""
+        if not (self.power_telemetry or self.power_guard) \
+                or self.now - self.last_power_telemetry < POWER_TELEM_INTERVAL_S:
+            return
+        self.last_power_telemetry = self.now
+        currents, voltage_dv = self._read_power()
+        total_ma = sum(currents) * 6.5
+        if self.power_telemetry:
+            self.println(f"POWER_TELEM ms={int(self.now * 1000)} I={','.join(str(value) for value in currents)} "
+                         f"total_ma={total_ma:.0f} v_min_dv={voltage_dv} v_id=1")
+        if self.power_guard:
+            self._evaluate_guard(voltage_dv, total_ma)
+
+    def _guard_detail(self, reason: str, voltage_dv: int, total_ma: float) -> str:
+        return f"reason={reason} v_min_dv={voltage_dv} total_ma={total_ma:.0f}"
+
+    def _reissue_arm_goals(self) -> None:
+        for motor, (goal, base, at) in list(self.arm_goals.items()):
+            if self.now - at > ARM_GOAL_REISSUE_S:
+                continue
+            if abs(self._read_pos(motor) - deg_to_pos(goal)) <= 8:
+                continue
+            self._write_pos(motor, goal, self._scaled_speed(base), self.arm_acc)
+
+    def _set_speed_scale(self, pct: int, reason: str, voltage_dv: int, total_ma: float) -> None:
+        if pct == self.speed_scale_pct:
+            return
+        self.speed_scale_pct = pct
+        self.println(f"POWER_GUARD scale={pct} {self._guard_detail(reason, voltage_dv, total_ma)}")
+        self._reissue_arm_goals()
+
+    def _hold_arm(self, reason: str, voltage_dv: int, total_ma: float) -> None:
+        for motor in range(1, 6):
+            if self.torque[motor]:
+                self._write_pos(motor, self._logical_from_encoder(motor), self.arm_max_speed, self.arm_acc)
+        self.arm_goals.clear()
+        if self.waypoint is not None:
+            self._finish_waypoint("CANCELLED", "power_guard")
+        self.guard_hold_at = self.now
+        self.println(f"POWER_GUARD_HOLD {self._guard_detail(reason, voltage_dv, total_ma)}")
+
+    def _evaluate_guard(self, voltage_dv: int, total_ma: float) -> None:
+        slow_dv, hold_dv, slow_ma, hold_ma = self.guard_limits
+        low_hold = 0 < voltage_dv < hold_dv
+        low_slow = 0 < voltage_dv < slow_dv
+        hold = low_hold or total_ma > hold_ma
+        slow = hold or low_slow or total_ma > slow_ma
+        reason = "voltaje" if low_hold or (low_slow and not hold) else "corriente"
+        if hold:
+            self.guard_hard_samples += 1
+            if self.guard_hard_samples >= GUARD_HOLD_SAMPLES:
+                self.guard_hard_samples = 0
+                self._hold_arm(reason, voltage_dv, total_ma)
+        else:
+            self.guard_hard_samples = 0
+        if slow:
+            self.guard_good_samples = 0
+            self._set_speed_scale(max(GUARD_SCALE_MIN_PCT, self.speed_scale_pct // 2), reason, voltage_dv, total_ma)
+        elif self.speed_scale_pct < 100:
+            self.guard_good_samples += 1
+            if self.guard_good_samples >= GUARD_RECOVER_SAMPLES:
+                self.guard_good_samples = 0
+                self._set_speed_scale(min(100, self.speed_scale_pct + GUARD_SCALE_STEP_UP_PCT), "normal",
+                                      voltage_dv, total_ma)
 
     def _gripper_current_raw(self) -> int:
         return current_raw_from_torque(float(self.arm.data.actuator_force[self.arm.actuator_ids[6]]))
@@ -1032,6 +1215,13 @@ class DigitalTwin:
         if not line:
             return
         lowered = line.lower()
+        if self.now - getattr(self, "guard_hold_at", -math.inf) < GUARD_HOLD_LATCH_S and _is_arm_move(lowered):
+            self.println("POWER_GUARD_HOLD_ACTIVE reason=freno_reciente")
+            return
+        if self.sync_firmware and lowered == "caps":
+            self.println(f"FIRMWARE_CAPS sync=1 sync_max_motors={SYNC_MAX_MOTORS} sync_max_speed={self.arm_max_speed} "
+                         f"guard=1 speed_hard_max={ARM_SPEED_HARD_MAX}")
+            return
         if lowered == "waypoint" or lowered.startswith("waypoint "):
             self._waypoint_command(lowered)
             return
@@ -1064,6 +1254,37 @@ class DigitalTwin:
             self.gripper_watch = "none"
             result = self._enable_torque(6, False)
             self.println(f"GRIPPER_TORQUE_OFF reason=manual_release result={result}")
+        elif self.sync_firmware and lowered in ("power guard on", "power guard off"):
+            self.power_guard = lowered == "power guard on"
+            self.guard_hard_samples = self.guard_good_samples = 0
+            self.speed_scale_pct = 100
+            self.println(f"POWER_GUARD={'on' if self.power_guard else 'off'}")
+        elif self.sync_firmware and lowered.startswith("power guard "):
+            values = lowered.split()[2:]
+            try:
+                slow_dv, hold_dv, slow_ma, hold_ma = (int(value) for value in values)
+                valid = len(values) == 4 and 50 <= hold_dv < slow_dv <= 130 and 100 <= slow_ma < hold_ma <= 10000
+            except ValueError:
+                valid = False
+            if not valid:
+                self.println("POWER_GUARD_REJECTED reason=fuera_de_rango")
+            else:
+                self.guard_limits = (slow_dv, hold_dv, slow_ma, hold_ma)
+                self.println(f"POWER_GUARD_LIMITS slow_dv={slow_dv} hold_dv={hold_dv} slow_ma={slow_ma} hold_ma={hold_ma}")
+        elif self.sync_firmware and lowered.startswith("speed max "):
+            values = lowered.split()[2:]
+            try:
+                speed = int(values[0])
+                acc = int(values[1]) if len(values) == 2 else MOVE_ACC
+                valid = len(values) in (1, 2) and ARM_SPEED_MIN_SETTING <= speed <= ARM_SPEED_HARD_MAX \
+                    and ARM_ACC_MIN_SETTING <= acc <= ARM_ACC_MAX_SETTING
+            except (ValueError, IndexError):
+                valid = False
+            if not valid:
+                self.println("ARM_SPEED_REJECTED reason=fuera_de_rango")
+            else:
+                self.arm_max_speed, self.arm_acc = speed, acc
+                self.println(f"ARM_SPEED max={speed} acc={acc}")
         elif lowered in ("power telem on", "power telem off"):
             self.power_telemetry = lowered == "power telem on"
             self.last_power_telemetry = -math.inf
@@ -1080,6 +1301,7 @@ class DigitalTwin:
                 self.println(f"GRIPPER_CURRENT_THRESHOLD={requested}")
         elif lowered in ("arm torque on", "arm torque off"):
             enable = lowered == "arm torque on"
+            self.arm_goals.clear()
             self.println("Activando torque del brazo M1..M5..." if enable
                          else "Desactivando torque del brazo M1..M5... M6 no cambia.")
             for motor in range(1, 6):
@@ -1088,6 +1310,7 @@ class DigitalTwin:
             self.println("ARM_TORQUE_ON_OK" if enable else "ARM_TORQUE_OFF_OK")
         elif lowered in ("torque on", "torque off"):
             enable = lowered == "torque on"
+            self.arm_goals.clear()
             if not enable:
                 if self.gripper_closing:
                     self.println("GRIPPER_STOP reason=torque_off detail=se_cancelo_el_cierre")
@@ -1102,6 +1325,10 @@ class DigitalTwin:
         elif line.startswith("read "):
             self._read_one(_to_int(line[5:]))
             self._divider()
+        elif self.sync_firmware and line == "sync":
+            self.println("SYNC_REJECTED reason=formato")
+        elif self.sync_firmware and line.startswith("sync "):
+            self._sync_command(line)
         elif line.startswith(("bpair ", "pair ")):
             values = line.split()[1:]
             if len(values) != 4:
@@ -1359,3 +1586,12 @@ def _ensure_twin_calibration(config, scenes, seed, max_yaw_degrees, force, progr
     calibration = fit_calibration(samples, settings, model=fingerprint)
     calibration.save(path)
     return calibration
+
+
+def _is_arm_move(line: str) -> bool:
+    """Como isArmMoveLine del firmware: orden que mueve M1..M5."""
+    if line.startswith(("sync ", "pair ", "bpair ")):
+        return True
+    if line.startswith("waypoint ") and not line.startswith(("waypoint keepalive", "waypoint cancel")):
+        return True
+    return len(line) >= 2 and line[0] in "12345" and line[1] == " "

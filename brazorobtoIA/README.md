@@ -232,6 +232,55 @@ En el gemelo, cada vuelta de la demo bajó de ~88 s a ~38 s. Lo que queda lento 
 los movimientos grandes, como salir de Inicio y volver, que todavía van de a dos
 motores: es la etapa 2 (los 5 motores a la vez desde el firmware).
 
+### Etapa 2: cinco motores por orden (`sync`)
+
+El firmware nuevo agrega `sync <ms> <id> <grados> ...`: hasta cinco motores de M1–M5
+en un solo `SyncWritePosEx`, con velocidades proporcionales para que lleguen juntos.
+Revisa piso, autocolisiones y la regla de M4 en 20 puntos de la recta, como `pair`, y
+rechaza la orden entera (`SYNC_REJECTED`) sin ajustes automáticos. El techo de
+velocidad sigue en 450 (~40°/s). M6 no va por `sync`.
+
+- Al conectar, la app pregunta `caps`. Si el firmware responde `FIRMWARE_CAPS sync=1`,
+  cada punto de paso «junto» sale en una sola orden y el siguiente se manda cuando el
+  motor más atrasado está a un paso del destino, si la caja de esos puntos pasa las
+  revisiones 2D y 3D de siempre. Con el firmware de la exposición no hay respuesta y
+  todo sigue con `pair`, como antes.
+- `app.py --sin-sync` y `gemelo_digital.py --sin-sync` fuerzan `pair` aunque el
+  firmware tenga `sync`, para comparar.
+- Gemelo (19/11): la vuelta de la demo bajó de 42,7–44,1 s a 33,1–35,9 s y las frenadas
+  de los servos antes de la orden siguiente, de 97–98% a 43%. La tarea con recipiente,
+  de 44–47 s a 36–39 s (3/3 en ambos casos). Falta medirlo en el brazo real.
+- `firmware/prueba_pc/` compila el `.ino` en la PC con stubs de Arduino y del bus y
+  prueba `sync`; `tests/test_orden_sync.py` lo corre si hay `g++`.
+
+### Guardado preparado de antemano
+
+Preparar Guardado (la vuelta larga a Inicio, con la garra cerrándose en camino) tardaba
+3–7 s después de soltar, con el brazo quieto. Ahora se prepara en segundo plano apenas
+se conoce la escena, desde el destino de Soltado y para cualquier M6 entre 84° y 96°
+(la apertura de Soltado ± la tolerancia con que se acepta). Al terminar Soltado se usa
+solo si M1–M5 quedaron a 1,2° o menos de ese destino y M6 dentro de la banda; si no,
+se replanifica como siempre. El hilo usa su propia copia del modelo 3D.
+`--sin-anticipar` vuelve a prepararlo al final. En el gemelo la espera pasó a 0 s.
+
+### Supervisor de la fuente y velocidad máxima
+
+Con el firmware nuevo, la app manda al conectar la sección `movimiento` de
+`config.json`:
+
+- `velocidad_max` (pasos/s, 100–1000; 450 ≈ 40°/s) y `aceleracion` (10–150) de M1–M5.
+- `guardia_fuente`: cada 100 ms el firmware lee la corriente y el voltaje de los seis
+  servos. Con el voltaje más bajo bajo `lento_v` o la corriente total sobre `lento_ma`,
+  M1–M5 van a la mitad de velocidad, todos por igual y con los mismos destinos (la ruta
+  no cambia), hasta 25%; vuelven de a 25% tras 1 s normal. Bajo `corte_v` o sobre
+  `corte_ma` durante 200 ms el brazo se frena donde está (sin cortar el torque) y la
+  tarea se detiene con `POWER_GUARD_HOLD`. La garra no se frena: tiene su protección.
+- Valores iniciales: 9,5 V / 3000 mA para ir más lento y 8,0 V / 4500 mA para frenar.
+  Son puntos de partida: hay que ajustarlos con «Medir corriente» en el brazo real.
+- En el gemelo, subir `velocidad_max` casi no acelera la vuelta (450: 29,0 s; 1000 con
+  aceleración 90: 26,4 s) y aumenta las frenadas, porque cada paso de 6° termina antes
+  de que llegue la orden siguiente. Por eso queda en 450.
+
 ### Demo: el cubo de un lado a otro, sin recipiente
 
 **🔁 DEMO: llevar el cubo de un lado a otro** (pestaña **Tarea automática**)
@@ -273,9 +322,26 @@ empujando 18/15 mm y cierre de la garra con el umbral 92 del firmware. Tiene un
 solo cambio respecto de entonces: la garra abre del todo una vez, en Aproximación
 2, y ya no cierra y vuelve a abrir sobre el cubo. En el gemelo tarda ~72–80 s por
 vuelta (14/11: demo 4/4, tarea con recipiente 3/3), y en el brazo real ~71–87 s.
-La casilla **Movimiento rápido (experimental)** vuelve a las optimizaciones del
-6/11 (tramos juntos, garra a 90° en camino, agarre 10/6 mm): ~39 s por vuelta,
-pero en el brazo real se veía trabado y el 14/11 falló el agarre seguido.
+El selector **Movimiento** tiene tres opciones (19/11):
+
+- **Clásico** (por defecto): lo de arriba, siempre de a dos motores.
+- **Rápido**: las optimizaciones del 6/11 (tramos juntos, garra a 90° en camino,
+  agarre 10/6 mm), con pasos de 6° encadenados: ~39 s por vuelta con `pair`, pero
+  en el brazo real se veía trabado y el 14/11 falló el agarre seguido. Con el
+  firmware `sync` cada paso sale en un solo mensaje.
+- **Directo**: como Rápido, pero cada punto va en **una sola orden `sync`** al
+  destino (todos los motores salen y llegan juntos) cuando la recta entera pasa
+  las revisiones; si no, usa los pasos de 6°. Necesita el firmware con `sync`.
+
+**Motores a la vez** (2 a 5) limita cuántos de M1–M5 pueden estar moviéndose al
+mismo tiempo; la garra no cuenta. Con menos de los que mueve un tramo, salen de a
+tandas. Ver `docs/RELEVO_MOVIMIENTO_Y_CORRIENTE.md`, «Motores a la vez y
+movimiento directo».
+
+Las cajas **Agarre** (y `config.json` «agarre») corren dónde cierra la pinza respecto
+del cubo que ven las cámaras, sin recalibrar: *hacia afuera* = más lejos de la base,
+*a la izquierda* = mirando desde la base hacia el cubo. Arranca en 10 mm hacia afuera
+(el 19/11 la pinza cerraba sobre el borde del cubo más cercano a la base).
 
 Las cámaras no se tienen que mover después de calibrarlas: la calibración pasa de
 píxeles a la mesa con la pose de cada cámara. El 14/11, en otra sala, la frontal
@@ -329,7 +395,7 @@ virtuales. Ver `docs/CALIBRACION_CAMARAS.md`.
 - ESP32 preferido en `COM4`, 115200 baud. Si cambia el número y hay un solo
   adaptador USB serie, la interfaz lo selecciona automáticamente.
 - Firmware compatible con `posall`, `arm torque on/off`, `torque on/off`, `pair`,
-  `gripper open/close/stop`.
+  `gripper open/close/stop`. Opcional: `caps` y `sync` (etapa 2).
 - Dos cámaras DirectShow.
 - Seis servos STS3215.
 

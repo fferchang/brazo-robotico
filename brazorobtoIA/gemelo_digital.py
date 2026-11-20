@@ -35,7 +35,7 @@ from brazoia.gemelo import (
     twin_config,
 )
 from brazoia.mujoco_sim import PickPlaceExpert, VirtualArm
-from brazoia.robot import RobotSerial
+from brazoia.robot import RobotSerial, configure_motion
 from brazoia.vision import detect_scene, verify_cube_in_container
 
 
@@ -55,6 +55,17 @@ def parse_args(argv=None):
     parser.add_argument("--giro-max", type=float, default=5.0,
                         help="Giro máximo de cubo y recipiente en grados (alineados a mano).")
     parser.add_argument("--recalibrar", action="store_true", help="Recalcula la calibración de las cámaras virtuales.")
+    parser.add_argument("--ajuste-agarre", type=float, nargs=2, default=(0.0, 0.0), metavar=("RADIAL", "LATERAL"),
+                        help="Corrimiento del agarre en mm (hacia afuera, a la izquierda). Por defecto 0: "
+                             "las cámaras virtuales no tienen el desvío del brazo real.")
+    parser.add_argument("--directo", action="store_true",
+                        help="Una sola orden sync por punto cuando la recta entera es segura.")
+    parser.add_argument("--motores", type=int, default=5, choices=range(2, 6),
+                        help="Motores de M1..M5 moviéndose a la vez como máximo (2 a 5).")
+    parser.add_argument("--sin-anticipar", action="store_true",
+                        help="Prepara Guardado recién al terminar Soltado, como antes.")
+    parser.add_argument("--sin-sync", action="store_true",
+                        help="Órdenes de a dos motores (pair), como el firmware de la exposición.")
     args = parser.parse_args(argv)
     if args.episodios < 1:
         parser.error("--episodios tiene que ser 1 o más.")
@@ -66,15 +77,24 @@ def parse_args(argv=None):
 class TwinSession:
     """Gemelo, cámaras virtuales, puerto serie virtual y política geométrica."""
 
-    def __init__(self, config, twin: DigitalTwin, log=print):
+    def __init__(self, config, twin: DigitalTwin, log=print, *, sync_orders: bool = True,
+                 one_order: bool = False, max_motors: int = 5, anticipate: bool = True,
+                 grasp_offset_mm=(0.0, 0.0)):
         self.config = config
+        self.sync_orders = sync_orders
+        self.one_order = one_order
+        self.max_motors = max_motors
+        self.anticipate = anticipate
+        self._ahead = None
         self.twin = twin
         self.log = log
         self.cameras = [VirtualCameraStream(twin, "frontal", 0), VirtualCameraStream(twin, "lateral", 1)]
         self.robot = RobotSerial(VIRTUAL_PORT, config.baud, opener=twin.open_port)
         self.robot.connect()
+        configure_motion(self.robot, config.motion)
         planner_arm = VirtualArm(config.root / "assets", limits=config.limits)
         self.policy = load_twin_policy(config, arm=planner_arm, expert=PickPlaceExpert(planner_arm))
+        self.policy.grasp_offset_mm = tuple(grasp_offset_mm)
 
     def close(self) -> None:
         for camera in self.cameras:
@@ -107,6 +127,43 @@ class TwinSession:
                 return
             time.sleep(0.03)
         raise RuntimeError(message)
+
+    def _run_stages(self, execution, executor, entry, placement) -> None:
+        """Las etapas de un episodio; prepara Guardado mientras se ejecuta Soltado."""
+        self._ahead = None
+        while not execution.finished:
+            current = self.wait_stable()
+            proposal = None
+            if self._ahead is not None and self._ahead.stage_index == execution.next_stage_index:
+                plan, self._ahead = self._ahead, None
+                proposal, detail = execution.adopt_ahead(plan, current)
+                entry.setdefault("anticipada", []).append(detail if proposal is not None else f"descartada: {detail}")
+            if proposal is None:
+                proposal = execution.prepare(current, self.observations())
+            if proposal.stage_index == 1:
+                estimated, _ = self.policy.plan(execution.scene_features)
+                entry["error_cubo_mm"] = round(float(np.linalg.norm(
+                    np.subtract(estimated.cube_xy, placement.cube_xy)) * 1000), 1)
+                entry["error_recipiente_mm"] = round(float(np.linalg.norm(
+                    np.subtract(estimated.container_xy, placement.container_xy)) * 1000), 1)
+                self.log(f"  ubicación estimada: cubo a {entry['error_cubo_mm']:.0f} mm, "
+                         f"recipiente a {entry['error_recipiente_mm']:.0f} mm de la verdadera")
+            if self.anticipate and proposal.stage_index == 1:
+                self._ahead = execution.start_ahead(self.observations())
+            stage_started = time.monotonic()
+            try:
+                executor.execute(proposal)
+            except Exception as exc:
+                entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
+                                        "segundos": round(time.monotonic() - stage_started, 1),
+                                        "error": str(exc)})
+                raise
+            entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
+                                    "segundos": round(time.monotonic() - stage_started, 1),
+                                    "garra": self.robot.snapshot().gripper_state})
+            self.log(f"  {proposal.label:<26} {len(proposal.groups):2d} tramos · "
+                     f"{time.monotonic() - stage_started:4.1f} s")
+            execution.mark_completed()
 
     def wait_stable(self, timeout: float = 4.0) -> dict[int, float]:
         capture = self.config.capture
@@ -141,35 +198,18 @@ class TwinSession:
             problem = validate_stage_gripper("inicio", current[6], self.robot.snapshot().gripper_state)
             if problem:
                 raise RuntimeError(problem)
-            execution = SupervisedExecution(self.policy, self.config.limits)
+            sync = self.sync_orders and self.robot.sync_supported
+            entry["sync"] = sync
+            execution = SupervisedExecution(self.policy, self.config.limits, sync_orders=sync,
+                                            one_order=self.one_order, max_motors=self.max_motors)
+            entry["una_orden_por_punto"] = execution.one_order
+            entry["motores_a_la_vez"] = self.max_motors
             warnings = entry.setdefault("avisos", [])
             executor = MotionExecutor(self.robot, status=lambda text: warnings.append(text)
-                                      if text.startswith("Llegada con desvío") else None)
-            while not execution.finished:
-                current = self.wait_stable()
-                proposal = execution.prepare(current, self.observations())
-                if proposal.stage_index == 1:
-                    estimated, _ = self.policy.plan(execution.scene_features)
-                    entry["error_cubo_mm"] = round(float(np.linalg.norm(
-                        np.subtract(estimated.cube_xy, placement.cube_xy)) * 1000), 1)
-                    entry["error_recipiente_mm"] = round(float(np.linalg.norm(
-                        np.subtract(estimated.container_xy, placement.container_xy)) * 1000), 1)
-                    self.log(f"  ubicación estimada: cubo a {entry['error_cubo_mm']:.0f} mm, "
-                             f"recipiente a {entry['error_recipiente_mm']:.0f} mm de la verdadera")
-                stage_started = time.monotonic()
-                try:
-                    executor.execute(proposal)
-                except Exception as exc:
-                    entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
-                                            "segundos": round(time.monotonic() - stage_started, 1),
-                                            "error": str(exc)})
-                    raise
-                entry["etapas"].append({"etapa": proposal.stage, "tramos": len(proposal.groups),
-                                        "segundos": round(time.monotonic() - stage_started, 1),
-                                        "garra": self.robot.snapshot().gripper_state})
-                self.log(f"  {proposal.label:<26} {len(proposal.groups):2d} tramos · "
-                         f"{time.monotonic() - stage_started:4.1f} s")
-                execution.mark_completed()
+                                      if text.startswith("Llegada con desvío") else None,
+                                      sync_orders=None if self.sync_orders else False,
+                                      max_motors=self.max_motors)
+            self._run_stages(execution, executor, entry, placement)
             time.sleep(1.0)
             passed, checks = verify_cube_in_container(*self.frames_and_observations())
             entry["verificacion_visual"] = passed
@@ -210,7 +250,9 @@ def main(argv=None) -> int:
         viewer = launch_scene_viewer(twin.arm.model, twin.arm.data, panels=args.paneles)
         twin.viewer = viewer
     print("Conectando al firmware virtual...", flush=True)
-    session = TwinSession(config, twin, log=lambda text: print(text, flush=True))
+    session = TwinSession(config, twin, log=lambda text: print(text, flush=True), sync_orders=not args.sin_sync,
+                          one_order=args.directo, max_motors=args.motores,
+                          anticipate=not args.sin_anticipar, grasp_offset_mm=args.ajuste_agarre)
     results = []
     started = time.monotonic()
     try:

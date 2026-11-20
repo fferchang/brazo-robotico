@@ -179,7 +179,8 @@ class DemoPolicy(GeometricPolicy):
 
     def placement(self, scene_features) -> Placement:
         cube = self.locate_cube(scene_features)
-        return Placement(cube, self.cube_yaw, farther_spot(cube, self.spots), 0.0)
+        # El destino se elige con el cubo visto; el agarre, con el corrimiento.
+        return Placement(self.grasp_point(cube), self.cube_yaw, farther_spot(cube, self.spots), 0.0)
 
     def describe(self, scene_features) -> str:
         placement, plan = self.plan(scene_features)

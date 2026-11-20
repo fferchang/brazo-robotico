@@ -43,7 +43,7 @@ from brazoia.planner import (
 from brazoia.policy import PILOT_DEMONSTRATION_LIMIT, StagePolicy, train_policy
 from brazoia.mujoco_view import MujocoArmView, launch_scene_viewer
 from brazoia.rerun_view import RerunArmView
-from brazoia.robot import RobotEvent, RobotSerial
+from brazoia.robot import RobotEvent, RobotSerial, configure_motion
 from brazoia.runlog import ExecutionLog
 from brazoia.vision import detect_scene, draw_observation, observation_features, verify_cube_in_container
 
@@ -139,11 +139,22 @@ class _CubeLost(RuntimeError):
     """La física del gemelo detectó que el cubo se separó de la pinza."""
 
 
+def _executor_sync(app) -> bool | None:
+    """Para MotionExecutor: None usa `sync` si el firmware lo anunció; False, nunca."""
+    return None if getattr(app, "sync_orders", True) else False
+
+
 class App:
-    def __init__(self, root: tk.Tk, *, gemelo: bool = False, firmware_waypoints: bool = False):
+    def __init__(self, root: tk.Tk, *, gemelo: bool = False, firmware_waypoints: bool = False,
+                 sync_orders: bool = True, anticipate: bool = True):
         if firmware_waypoints and not gemelo:
             raise ValueError("Los puntos de firmware solo se prueban con --gemelo.")
         self.firmware_waypoints = firmware_waypoints
+        # Usar la orden `sync` (hasta cinco motores por mensaje) si el firmware la anuncia.
+        # `--sin-sync` vuelve a pair de a dos, como en la exposición.
+        self.sync_orders = sync_orders
+        # Preparar Guardado en segundo plano desde la etapa 1 (SupervisedExecution.start_ahead).
+        self.anticipate = anticipate
         self.root = root
         self.config = load_config()
         # Gemelo digital: el brazo y las cámaras de MuJoCo detrás del mismo puerto serie
@@ -202,7 +213,15 @@ class App:
         self.geometric_model = None  # (VirtualArm, PickPlaceExpert, clásico): armarlo tarda ~1 s
         # Movimiento rápido (las optimizaciones del 6/11: tramos juntos, garra a 90° en camino,
         # agarre 10/6 mm). Apagado = modo clásico, el de las primeras corridas que funcionaron.
-        self.fast_motion = tk.BooleanVar(value=False)
+        # "clasico" | "rapido" | "directo" (una orden `sync` por punto, firmware del 19/11).
+        self.motion_mode = tk.StringVar(value="clasico")
+        # Motores del brazo (M1..M5) moviéndose a la vez como máximo; la garra no cuenta.
+        self.max_motors = tk.StringVar(value="5")
+        # Corrimiento del punto de agarre (mm), sin recalibrar: config.json «agarre».
+        # En el gemelo, 0: las cámaras virtuales no tienen el desvío del brazo real.
+        radial, lateral = (0.0, 0.0) if self.twin is not None else self.config.grasp_offset_mm
+        self.grasp_radial = tk.StringVar(value=f"{radial:g}")
+        self.grasp_lateral = tk.StringVar(value=f"{lateral:g}")
         self.demo_arm = None         # VirtualArm de la demo (brazoia/demo.py)
         self.demo_cycles = tk.StringVar(value="0")
         self.demo_direct = tk.BooleanVar(value=False)
@@ -414,10 +433,30 @@ class App:
             foreground="#555",
         ).pack(side="left")
 
-        ttk.Checkbutton(
-            tab, variable=self.fast_motion,
-            text="Movimiento rápido (experimental): tramos juntos, garra a 90° y agarre 10/6 mm. "
-                 "Apagado = modo clásico: un movimiento por vez, más lento y suave.",
+        motion = ttk.Frame(tab)
+        motion.pack(fill="x", pady=(6, 0))
+        ttk.Label(motion, text="Movimiento:").pack(side="left")
+        for value, text in (("clasico", "Clásico (de a dos, frena entre tramos)"),
+                            ("rapido", "Rápido (pasos de 6° encadenados)"),
+                            ("directo", "Directo (una orden por punto)")):
+            ttk.Radiobutton(motion, text=text, value=value, variable=self.motion_mode).pack(side="left", padx=(6, 0))
+        ttk.Label(motion, text="   Motores a la vez:").pack(side="left")
+        ttk.Spinbox(motion, from_=2, to=5, increment=1, width=3, state="readonly",
+                    textvariable=self.max_motors).pack(side="left", padx=(3, 0))
+        ttk.Label(motion, text="   Agarre: hacia afuera (mm)").pack(side="left")
+        ttk.Spinbox(motion, from_=-30, to=30, increment=2, width=4,
+                    textvariable=self.grasp_radial).pack(side="left", padx=(3, 0))
+        ttk.Label(motion, text=" a la izquierda (mm)").pack(side="left")
+        ttk.Spinbox(motion, from_=-30, to=30, increment=2, width=4,
+                    textvariable=self.grasp_lateral).pack(side="left", padx=(3, 0))
+        ttk.Label(
+            tab, foreground="#555", wraplength=1250,
+            text="Rápido y Directo: tramos juntos, garra a 90° y agarre 10/6 mm. Directo manda cada punto en una "
+                 "sola orden «sync» (todos los motores salen y llegan juntos) si la recta entera es segura; si no, "
+                 "usa los pasos de 6°. Necesita el firmware con sync. «Motores a la vez» limita M1–M5 (la garra "
+                 "no cuenta); con menos de los que mueve un tramo, salen de a tandas. Clásico siempre va de a dos. "
+                 "«Agarre» corre dónde cierra la pinza respecto del cubo que ven las cámaras: hacia afuera = "
+                 "más lejos de la base; a la izquierda = mirando desde la base hacia el cubo. Se toma al iniciar.",
         ).pack(anchor="w")
         ttk.Checkbutton(
             tab, variable=self.demo_retry,
@@ -744,6 +783,41 @@ class App:
         name = "Frontal" if index == 0 else "Lateral"
         self.rotation_vars[index].set(f"{name}: {value}°")
 
+    def _classic_motion(self) -> bool:
+        return self.motion_mode.get() not in ("rapido", "directo")
+
+    def _max_motors(self) -> int:
+        try:
+            return max(2, min(5, int(self.max_motors.get())))
+        except (TypeError, ValueError):
+            return 2
+
+    def _grasp_offset(self) -> tuple[float, float]:
+        """(radial, lateral) en mm de las cajas «Agarre», acotados a ±30."""
+        values = []
+        for variable in (self.grasp_radial, self.grasp_lateral):
+            try:
+                value = float(str(variable.get()).replace(",", "."))
+            except (TypeError, ValueError):
+                value = 0.0
+            values.append(max(-30.0, min(30.0, value)))
+        return values[0], values[1]
+
+    def _motion_options(self) -> dict:
+        """Para SupervisedExecution: modo de movimiento, `sync` y motores a la vez."""
+        classic = self._classic_motion()
+        return {"classic": classic, "sync_orders": self._sync_active(), "max_motors": self._max_motors(),
+                "one_order": self.motion_mode.get() == "directo" and not classic}
+
+    def _motion_label(self) -> str:
+        mode = self.motion_mode.get()
+        return f"{mode}, {self._max_motors()} motores a la vez" + ("" if self._sync_active() else ", sin sync")
+
+    def _sync_active(self) -> bool:
+        """Para planificar: `sync` habilitado y anunciado por el firmware conectado."""
+        return bool(self.sync_orders and self.robot is not None
+                    and getattr(self.robot, "sync_supported", False) is True)
+
     def connect_robot(self) -> None:
         if self.robot is not None and self.robot.connected:
             return
@@ -754,9 +828,23 @@ class App:
         self.robot = robot
         self.connection_status.set("Conectando...")
 
-        def connected(_result):
+        def connect_and_configure():
+            robot.connect()
+            # Firmware con `speed max` y `power guard`: la configuración de config.json.
+            return configure_motion(robot, self.config.motion)
+
+        def connected(commands):
             if self.robot is robot:
                 self.connection_status.set(f"Conectado · {robot.port}")
+                motion = self.config.motion
+                if commands:
+                    guard = (f"supervisor de fuente: lento < {motion.guard_slow_volts:g} V o > {motion.guard_slow_ma} mA, "
+                             f"freno < {motion.guard_hold_volts:g} V o > {motion.guard_hold_ma} mA"
+                             if motion.guard_enabled else "supervisor de fuente apagado")
+                    self.log(f"Firmware: velocidad máxima {motion.max_speed} pasos/s, aceleración "
+                             f"{motion.acceleration}; {guard}.")
+                elif robot.sync_supported is False:
+                    self.log("Firmware sin `sync` ni supervisor de fuente: se usa pair, como en la exposición.")
                 try:
                     # También para «Cerrar garra por presión» de «Mover a mano» (ver GRIPPER_CONTACT_RAW).
                     robot.send(f"gripper current {GRIPPER_CONTACT_RAW}")
@@ -768,7 +856,7 @@ class App:
                 self.connection_status.set(f"Error: {exc}")
 
         self.run_async(
-            robot.connect,
+            connect_and_configure,
             success=connected,
             failure=connection_failed,
         )
@@ -883,7 +971,8 @@ class App:
         if self.robot is not robot or not robot.connected or self.execution_busy or self.execution is not None:
             self.status.set("Cambió el estado del robot; volvé a solicitar el movimiento.")
             return
-        executor = MotionExecutor(robot, status=lambda text: self.worker_messages.put(("log", text)))
+        executor = MotionExecutor(robot, status=lambda text: self.worker_messages.put(("log", text)),
+                                  sync_orders=_executor_sync(self))
         self.manual_executor = executor
         self.execution_busy = True
         self.status.set(f"Moviendo M{motor_id} a {target:g}°…")
@@ -957,7 +1046,8 @@ class App:
             recovery=True,
         )
         executor = MotionExecutor(
-            robot, status=lambda text: self.worker_messages.put(("log", text))
+            robot, status=lambda text: self.worker_messages.put(("log", text)),
+            sync_orders=_executor_sync(self),
         )
         self.manual_executor = executor
         self.execution_busy = True
@@ -1332,6 +1422,8 @@ class App:
         policy = self.automatic_policy()
         if policy is None:
             return
+        if hasattr(policy, "grasp_offset_mm"):
+            policy.grasp_offset_mm = self._grasp_offset()
         snapshot = self.robot.snapshot()
         if 6 not in snapshot.positions:
             self.status.set("Leé las posiciones antes de iniciar; falta M6.")
@@ -1342,7 +1434,7 @@ class App:
         if gripper_problem:
             self.status.set("Para iniciar la tarea automática: " + gripper_problem)
             return
-        self.execution = SupervisedExecution(policy, self.config.limits, classic=not self.fast_motion.get())
+        self.execution = SupervisedExecution(policy, self.config.limits, **self._motion_options())
         run_log = ExecutionLog(
             self.config.root / "datos" / ("gemelo" if self.twin is not None else "") / "ejecuciones",
             {
@@ -1356,6 +1448,9 @@ class App:
                 },
                 "cameras": self.camera_configuration(),
                 "limits": {str(key): list(value) for key, value in self.config.limits.items()},
+                "sync": self.execution.sync_orders,
+                "ajuste_agarre_mm": list(getattr(policy, "grasp_offset_mm", (0.0, 0.0))),
+                "movimiento": self._motion_label(),
             },
         )
 
@@ -1366,7 +1461,8 @@ class App:
                 run_log.note("aviso", text, None if proposal is None else proposal.stage)
 
         # Detener/EMERGENCIA cortan también una parada pedida entre dos etapas.
-        self.executor = MotionExecutor(self.robot, status=executor_status, abort=self.auto_stop)
+        self.executor = MotionExecutor(self.robot, status=executor_status, abort=self.auto_stop,
+                                       sync_orders=_executor_sync(self), max_motors=self._max_motors())
         self.execution_log = run_log
         self.logged_scene = None
         self.automatic_verification = None
@@ -1380,7 +1476,7 @@ class App:
             from brazoia.politica_geometrica import load_geometric_policy
 
             try:
-                classic = not self.fast_motion.get()
+                classic = self._classic_motion()
                 if self.geometric_model is None or self.geometric_model[2] != classic:
                     from brazoia.mujoco_sim import CLASSIC_EXPERT, PickPlaceExpert, VirtualArm
 
@@ -1856,6 +1952,16 @@ class App:
         `inicio_problem(snapshots, observations, taken_at)`: lo que impide planificar
         con la foto de Inicio. `stage_photos`: foto al terminar cada etapa (la demo
         guarda solo la de Inicio y las de los bloqueos). `prefix`: para el estado."""
+        self._ahead = None
+        try:
+            self._drive_stages_loop(execution, executor, run_log, who, inicio_problem,
+                                    stage_photos=stage_photos, prefix=prefix, monitor_cube=monitor_cube)
+        finally:
+            self._ahead = None  # su hilo termina solo y usa su propia copia del modelo 3D
+
+    def _drive_stages_loop(self, execution: SupervisedExecution, executor: MotionExecutor,
+                           run_log: ExecutionLog | None, who: str, inicio_problem, *,
+                           stage_photos: bool, prefix: str, monitor_cube: bool) -> None:
         robot = self.robot
         recoveries = 0
         settled = False  # la etapa anterior se ejecutó acá y el ejecutor confirmó la llegada
@@ -1879,7 +1985,16 @@ class App:
                     problem = inicio_problem(snapshots, observations, taken_at)
                     if problem:
                         raise _Rejected("No arranca: " + problem)
-                proposal = execution.prepare(current, observations)
+                proposal = None
+                if self._ahead is not None and self._ahead.stage_index == execution.next_stage_index:
+                    plan, self._ahead = self._ahead, None
+                    proposal, detail = execution.adopt_ahead(plan, current)
+                    self.worker_messages.put(("log", f"{STAGE_LABELS[stage]}: "
+                                              + (detail if proposal is not None else f"se replanifica ({detail})")))
+                    if run_log is not None:
+                        run_log.note("anticipada" if proposal is not None else "anticipada_descartada", detail, stage)
+                if proposal is None:
+                    proposal = execution.prepare(current, observations)
                 stage = proposal.stage
                 if proposal.recovery:
                     recoveries += 1
@@ -1908,6 +2023,8 @@ class App:
                     run_log.proposal(proposal)
                 robot.power_label = f"{prefix}{proposal.stage}"  # columna «etapa» de la medición
                 self._stopped()
+                if proposal.stage_index == 1 and getattr(self, "anticipate", True):
+                    self._ahead = execution.start_ahead(observations)
                 timings = executor.execute(proposal)
             except Exception as exc:
                 # Si se vuelve a intentar, se replanifica desde donde quedó el brazo.
@@ -1966,7 +2083,8 @@ class App:
             return
         from brazoia.demo import load_demo_policy
 
-        classic = not self.fast_motion.get()
+        classic = self._classic_motion()
+        self.demo_motion_options = self._motion_options()  # fijas hasta que termine la demo
         try:
             if self.twin is not None and not self.twin_calibration_ready.is_set():
                 raise ValueError("todavía se están calibrando las cámaras virtuales; probá en unos segundos")
@@ -1975,6 +2093,7 @@ class App:
 
                 self.demo_arm = VirtualArm(limits=self.config.limits)
             policy = load_demo_policy(self.config, arm=self.demo_arm, twin=self.twin is not None, classic=classic)
+            policy.grasp_offset_mm = self._grasp_offset()  # fijo hasta que termine la demo
         except (OSError, ValueError) as exc:
             self.status.set(f"Demo: {exc}")
             return
@@ -1993,11 +2112,14 @@ class App:
         self.set_camera_controls_enabled(False)
         self.executor = MotionExecutor(
             robot, status=lambda text: self.worker_messages.put(("log", text)), abort=self.auto_stop,
-            firmware_waypoints=self.firmware_waypoints)
+            firmware_waypoints=self.firmware_waypoints, sync_orders=_executor_sync(self),
+            max_motors=self._max_motors())
         who = "Gemelo" if self.twin is not None else "Brazo"
         limit = f"{cycles} vueltas" if cycles else "hasta Detener"
         self.auto_status.set(f"Demo ({limit}): preparando...")
-        self.log(f"Demo con la calibración de cámaras del {policy.metadata['calibracion']}, {limit}.")
+        radial, lateral = policy.grasp_offset_mm
+        self.log(f"Demo con la calibración de cámaras del {policy.metadata['calibracion']}, {limit}; "
+                 f"agarre {radial:+g} mm hacia afuera y {lateral:+g} mm a la izquierda.")
         done: list[int] = [0]
         direct = self.twin is not None and self.demo_direct.get() and not classic
         retry = self.demo_retry.get()
@@ -2187,13 +2309,22 @@ class App:
         from brazoia.demo import ARRIVAL_RADIUS_MM, arrival_error_mm
 
         self._stopped()
+        # Las opciones de movimiento quedan fijas desde que se apretó DEMO, igual que el
+        # ejecutor: si se cambian a mitad de la demo, plan y ejecutor no coincidirían.
+        options = dict(getattr(self, "demo_motion_options", None) or self._motion_options())
+        options["classic"] = classic  # el de la política armada al apretar DEMO
+        options["max_motors"] = getattr(self.executor, "max_motors", options["max_motors"])
         execution = SupervisedExecution(
-            policy, self.config.limits, direct_demo=direct, classic=classic,
-            carried_cube_check=carried_cube_check if direct else None,
+            policy, self.config.limits, direct_demo=direct,
+            carried_cube_check=carried_cube_check if direct else None, **options,
         )
         run_log = ExecutionLog(root, {
             "port": self.robot.port, "gemelo": self.twin is not None, "modo": "demo", "vuelta": cycle,
-            "movimiento": "clasico" if classic else "rapido",
+            "movimiento": "clasico" if classic else
+                          f"{'directo' if execution.one_order else 'rapido'}, {execution.max_motors} motores a la vez",
+            "sync": execution.sync_orders,
+            "ajuste_agarre_mm": list(getattr(policy, "grasp_offset_mm", (0.0, 0.0))),
+            "una_orden_por_punto": execution.one_order,
             "poses_directas": execution.direct_demo,
             "politica": dict(policy.metadata), "cameras": self.camera_configuration(),
             "limits": {str(key): list(value) for key, value in self.config.limits.items()},
@@ -2421,7 +2552,9 @@ class App:
 if __name__ == "__main__":
     root = tk.Tk()
     application = App(root, gemelo="--gemelo" in sys.argv,
-                      firmware_waypoints="--puntos-firmware" in sys.argv)
+                      firmware_waypoints="--puntos-firmware" in sys.argv,
+                      sync_orders="--sin-sync" not in sys.argv,
+                      anticipate="--sin-anticipar" not in sys.argv)
     if "--trayecto-simulado" in sys.argv:
         root.after(200, application.open_trajectory_simulator)
     if "--calibracion" in sys.argv:

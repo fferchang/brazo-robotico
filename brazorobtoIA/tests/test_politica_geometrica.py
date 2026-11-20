@@ -189,7 +189,7 @@ class AppModeTests(unittest.TestCase):
 
         return SimpleNamespace(automatic_mode=Mock(get=Mock(return_value=mode)), config=dataclasses.replace(CONFIG, root=root),
                                geometric_model=(self.arm, self.expert, False), policy=policy, status=Mock(), log=Mock(),
-                               twin=None, fast_motion=Mock(get=Mock(return_value=True)))
+                               twin=None, _classic_motion=Mock(return_value=False))
 
     def test_geometric_mode_needs_a_saved_calibration(self) -> None:
         from app import App

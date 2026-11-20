@@ -72,5 +72,20 @@
     "frontal_minimum_lime_area_ratio": 0.04,
     "frontal_minimum_lime_shape_ratio": 0.4,
     "frontal_minimum_lime_confidence": 0.7
+  },
+  "agarre": {
+    "ajuste_radial_mm": 10,
+    "ajuste_lateral_mm": 0
+  },
+  "movimiento": {
+    "velocidad_max": 450,
+    "aceleracion": 45,
+    "guardia_fuente": {
+      "activa": true,
+      "lento_v": 9.5,
+      "corte_v": 7.0,
+      "lento_ma": 3000,
+      "corte_ma": 4500
+    }
   }
 }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -117,6 +117,59 @@ def detection_parameters(vision: VisionConfig, camera_index: int) -> dict:
 
 
 @dataclass(frozen=True)
+class MotionConfig:
+    """Sección `movimiento` de config.json. La app la manda al firmware al conectar, si
+    el firmware la anuncia en `caps`; con el firmware de la exposición no se usa."""
+    # Pasos/s del motor que más recorre (450 ≈ 40°/s). El firmware no acepta más de 1000.
+    max_speed: int = 450
+    acceleration: int = 45
+    # Supervisor de la fuente: con la tensión más baja de los servos bajo `slow_volts` o la
+    # corriente total sobre `slow_ma`, M1–M5 van más despacio, todos por igual; bajo
+    # `hold_volts` o sobre `hold_ma` durante 200 ms, el brazo se frena donde está.
+    guard_enabled: bool = True
+    guard_slow_volts: float = 9.5
+    guard_hold_volts: float = 8.0
+    guard_slow_ma: int = 3000
+    guard_hold_ma: int = 4500
+
+
+def load_motion(raw: dict) -> MotionConfig:
+    guard = raw.get("guardia_fuente", {})
+    defaults = MotionConfig()
+    motion = MotionConfig(
+        max_speed=int(raw.get("velocidad_max", defaults.max_speed)),
+        acceleration=int(raw.get("aceleracion", defaults.acceleration)),
+        guard_enabled=bool(guard.get("activa", defaults.guard_enabled)),
+        guard_slow_volts=float(guard.get("lento_v", defaults.guard_slow_volts)),
+        guard_hold_volts=float(guard.get("corte_v", defaults.guard_hold_volts)),
+        guard_slow_ma=int(guard.get("lento_ma", defaults.guard_slow_ma)),
+        guard_hold_ma=int(guard.get("corte_ma", defaults.guard_hold_ma)),
+    )
+    # Los mismos rangos que acepta el firmware (`speed max` y `power guard`).
+    if not 100 <= motion.max_speed <= 1000 or not 10 <= motion.acceleration <= 150:
+        raise ValueError("movimiento: velocidad_max entre 100 y 1000 y aceleracion entre 10 y 150.")
+    if not 5.0 <= motion.guard_hold_volts < motion.guard_slow_volts <= 13.0 \
+            or not 100 <= motion.guard_slow_ma < motion.guard_hold_ma <= 10000:
+        raise ValueError("movimiento.guardia_fuente: 5 <= corte_v < lento_v <= 13 y 100 <= lento_ma < corte_ma <= 10000.")
+    return motion
+
+
+# Corrimiento del punto de agarre respecto del cubo que ven las cámaras, sin recalibrarlas.
+# El 19/11 en el brazo real la pinza cerraba sobre el borde del cubo más cercano a la base
+# (fotos de Agarre): radial positivo lo corre hacia afuera, en la dirección base→cubo;
+# lateral positivo, a la izquierda mirando desde la base hacia el cubo (giro antihorario).
+GRASP_OFFSET_LIMIT_MM = 30.0
+
+
+def load_grasp_offset(raw: dict) -> tuple[float, float]:
+    radial = float(raw.get("ajuste_radial_mm", 0.0))
+    lateral = float(raw.get("ajuste_lateral_mm", 0.0))
+    if abs(radial) > GRASP_OFFSET_LIMIT_MM or abs(lateral) > GRASP_OFFSET_LIMIT_MM:
+        raise ValueError(f"agarre: ajuste_radial_mm y ajuste_lateral_mm entre ±{GRASP_OFFSET_LIMIT_MM:g}.")
+    return radial, lateral
+
+
+@dataclass(frozen=True)
 class AppConfig:
     root: Path
     port: str
@@ -125,6 +178,8 @@ class AppConfig:
     limits: dict[int, tuple[float, float]]
     capture: CaptureConfig
     vision: VisionConfig
+    motion: MotionConfig = field(default_factory=MotionConfig)
+    grasp_offset_mm: tuple[float, float] = (0.0, 0.0)  # (radial, lateral), ver load_grasp_offset
 
     @property
     def demonstrations_dir(self) -> Path:
@@ -165,4 +220,6 @@ def load_config(path: Path | None = None) -> AppConfig:
         limits=limits,
         capture=CaptureConfig(**capture_raw),
         vision=VisionConfig(**raw["vision"]),
+        motion=load_motion(raw.get("movimiento", {})),
+        grasp_offset_mm=load_grasp_offset(raw.get("agarre", {})),
     )
