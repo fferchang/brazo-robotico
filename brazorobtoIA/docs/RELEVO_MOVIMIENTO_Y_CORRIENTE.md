@@ -290,6 +290,58 @@ Resultados en el gemelo (DEMO, una vuelta por fila, todas `success`):
   del supervisor y `speed max`. El host encontró un `struct` declarado después de los
   prototipos que genera Arduino: se movió arriba. Sigue sin compilarse con Arduino CLI.
 
+### Garra más rápida (20/11)
+
+En la vuelta con todo lo anterior, la garra se llevaba ~7,2 s fijos: abrir en
+Aproximación 2 (1,9 s) y Soltado (1,6 s) a 40°/s, cerrar por presión en Agarre (2,8 s)
+más 0,8 s de espera, y 0,9 s al final de Guardado. El cierre por presión avanza la
+consigna a 37,5°/s pero el servo va a 220 pasos/s (~19°/s): de 90° a 40° tarda ~2,6 s.
+
+Cambios (firmware, gemelo y PC; `caps` anuncia `gripper_fast=1`):
+- `gripper speed <n>` (100–1000): velocidad de M6 al abrir (`gripper open` y por
+  ángulo hacia un ángulo mayor). Arranca en 300 y 450 como antes; la app manda
+  `movimiento.velocidad_garra_abrir` (900).
+- `gripper close <hasta>`: tramo rápido (600 pasos/s, acc 30) hasta <hasta>; a 5° de
+  ese ángulo, consigna en cerrada y servo a 220, como al final del cierre de siempre.
+  Contacto y sobrecorriente activos todo el tiempo. Sin argumento, igual que antes.
+  La PC usa 55° en Agarre y 10° en Guardado (`GRIPPER_FAST_CLOSE_UNTIL`,
+  `GRIPPER_FAST_CLOSE_EMPTY_UNTIL`); `movimiento.cierre_rapido: false` lo apaga.
+
+Qué se aprendió en el gemelo (tarea con recipiente, 5 escenas por fila):
+- El contacto con el cubo empieza en ~43,6°, también con el cubo girado 15°: no hay
+  roce previo de una esquina. El agarre queda en 40–43°.
+- La primera versión seguía el paso a paso desde el ángulo de corte y apretaba menos
+  al tocar: la corriente al congelar bajaba a 106–112 contra 120–126 y los cubos
+  girados ~14° no subían con la garra (quedaban a la altura de la mesa). Por eso al
+  pasar al paso a paso la consigna va directo a cerrada.
+- Aun así, el apriete depende de en qué lectura de corriente (cada 40 ms) cae el
+  contacto, que sube de ~56 a ~123 en 0,12 s. Eso pasa también con el cierre de
+  siempre y deja al límite a los cubos girados ~15°.
+
+| Semilla, giro máx. | Apertura / cierre | Éxitos | Tiempo medio |
+|---|---|---:|---:|
+| 4, 5° | 450 / de siempre | 5/5 | 32,5 s |
+| 4, 5° | 900 / rápido hasta 55° | 5/5 | 30,9 s |
+| 9, 5° | 900 / de siempre | 5/5 | 30,9 s |
+| 9, 5° | 900 / rápido hasta 55° | 5/5 | 28,3 s |
+| 7, 15° | 450 / de siempre | 4/5 (otra tanda 5/5) | — |
+| 7, 15° | 900 / de siempre | 4/5 | — |
+| 7, 15° | 450 / rápido hasta 75°, sin la corrección | 3/5 | — |
+| 7, 15° | 900 / rápido hasta 55°, con la corrección | 3/5 | — |
+| 7, 15° | 900 / rápido hasta 75°, con la corrección | 2/5 | — |
+
+En la escena 7 del giro 15°, el cubo girado ~14° falla en casi todas las variantes
+rápidas y casi nunca con el cierre de siempre. Con una vuelta por variante no se puede
+separar del ruido de ejecución del gemelo, pero la tendencia es en contra.
+
+DEMO, todo por defecto: semilla 4 26,80 s (antes 29,02), semilla 1 25,65 s (antes
+27,81). Dentro del ejecutor: 20,98 y 20,21 s (antes 24,51 y 23,62). Aproximación 2
+2,52 → 1,50 s, Agarre 3,77 → 2,71 s, Soltado 2,94 → 2,39 s, Guardado 6,03 → 5,18 s.
+
+Pendiente posible: hacer que el apriete no dependa de en qué lectura cae el contacto
+(por ejemplo, congelar unos grados más adentro de donde se detectó). Cambia la fuerza
+sobre el cubo y la corriente al sostener: medirlo antes en el brazo real.
+
 ### Cronómetro y métricas de ejecución
 
 La pestaña **Tarea automática** muestra el tiempo del último intento.

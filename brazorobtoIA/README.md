@@ -281,6 +281,22 @@ Con el firmware nuevo, la app manda al conectar la sección `movimiento` de
   aceleración 90: 26,4 s) y aumenta las frenadas, porque cada paso de 6° termina antes
   de que llegue la orden siguiente. Por eso queda en 450.
 
+### Garra más rápida
+
+Con el firmware nuevo (`caps` con `gripper_fast=1`):
+
+- **Abrir**: `velocidad_garra_abrir` (900 pasos/s ≈ 79°/s; antes 450 por ángulo y 300 con
+  «gripper open»). Solo al abrir, que es alejarse del objeto; cerrar por ángulo no cambia.
+- **Cerrar por presión**: hasta 55° va a ~53°/s y después sigue como el final del cierre
+  de siempre (consigna cerrada, servo a ~19°/s): llega al cubo a la misma velocidad que
+  antes, con la detección de contacto y el corte por sobrecorriente activos todo el
+  tiempo. En Guardado, sin cubo entre los dedos, va rápido hasta 10°.
+  `"cierre_rapido": false` en `movimiento` vuelve al cierre de siempre.
+- Gemelo: la vuelta de la demo bajó de 29,0 / 27,8 s a 26,8 / 25,7 s. La tarea con
+  recipiente con cubos girados hasta 5°, 10/10 igual que antes. Con cubos girados ~15°
+  los agarres quedan al límite con los dos cierres y con el rápido fallaron más: si en
+  el brazo real se resbalan cubos, apagalo.
+
 ### Demo: el cubo de un lado a otro, sin recipiente
 
 **🔁 DEMO: llevar el cubo de un lado a otro** (pestaña **Tarea automática**)

@@ -18,6 +18,9 @@ static void resetPose() {
   servoBus.syncCalls.clear();
   lastMoveCommandMs = 0;
   waypoint = {};
+  gripperClosing = false;
+  gripperFastPhase = false;
+  gripperWatch = WATCH_NONE;
   powerGuard = false;
   powerTelemetry = false;
   speedScalePct = 100;
@@ -226,6 +229,65 @@ int main() {
   }
   run("power guard off");
   CHECK(Serial.out.find("POWER_GUARD=off") == 0 && speedScalePct == 100, "power guard off");
+
+  // ----- garra: cierre con tramo rapido y velocidad al abrir -----
+  auto gripperTick = [&]() { fake_millis += 40; Serial.out.clear(); processGripperClosing(); };
+  resetPose();
+  servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(100);  // M6 logico 90
+  run("caps");
+  CHECK(Serial.out.find("gripper_fast=1") != std::string::npos, "caps anuncia gripper_fast");
+  run("gripper close 55");
+  CHECK(Serial.out.find("GRIPPER_CLOSE_START from=90.0 contact_raw=92 fast_until=55.0") == 0, "inicio con tramo rapido");
+  CHECK(servoBus.servo[6].goal == toPos(65) && servoBus.servo[6].speed == 600, "va rapido a 55 logico");
+  gripperTick();
+  CHECK(servoBus.servo[6].goal == toPos(65), "mientras esta lejos no hay paso a paso");
+  servoBus.servo[6].pos = toPos(69);  // 59 logico: a 4 grados de 55
+  gripperTick();
+  CHECK(servoBus.servo[6].goal == toPos(10) && servoBus.servo[6].speed == 220,
+        "sigue como al final del cierre de siempre: consigna cerrada a 220");
+  CHECK(!gripperFastPhase, "termino el tramo rapido");
+  // El contacto se detecta tambien durante el tramo rapido (pasada la exclusion inicial).
+  resetPose();
+  gripperClosing = false;
+  servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(100);
+  run("gripper close 55");
+  fake_millis += 300;
+  servoBus.servo[6].current = 150;
+  for (int i = 0; i < 3; i++) gripperTick();
+  CHECK(Serial.out.find("GRIPPER_HOLD reason=contact") != std::string::npos, "contacto en el tramo rapido");
+  CHECK(!gripperClosing, "freno al tocar");
+  // Sin argumento, o ya cerca: como siempre.
+  resetPose();
+  gripperClosing = false;
+  servoBus.servo[6].current = 0;
+  servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(100);
+  run("gripper close");
+  CHECK(Serial.out.find("GRIPPER_CLOSE_START from=90.0 contact_raw=92\r\n") == 0 && !gripperFastPhase, "cierre de siempre");
+  gripperClosing = false;
+  servoBus.servo[6].pos = toPos(68);  // 58 logico
+  run("gripper close 55");
+  CHECK(!gripperFastPhase, "ya esta cerca: sin tramo rapido");
+  gripperClosing = false;
+  for (const char *line : {"gripper close 200", "gripper close -1", "gripper close x", "gripper close 55 1"}) {
+    run(line);
+    CHECK(Serial.out.find("GRIPPER_ERROR reason=fuera_de_rango") == 0, line);
+  }
+  // Abrir mas rapido; cerrar por angulo, como siempre.
+  resetPose();
+  servoBus.servo[6].pos = servoBus.servo[6].goal = toPos(50);  // 40 logico
+  run("gripper speed 900");
+  CHECK(Serial.out.find("GRIPPER_SPEED open=900") == 0, "gripper speed");
+  run("6 90");
+  CHECK(servoBus.servo[6].speed == 900, "abrir por angulo con la velocidad nueva");
+  lastMoveCommandMs = 0;
+  servoBus.servo[6].pos = toPos(100);
+  run("6 30");
+  CHECK(servoBus.servo[6].speed == 450, "cerrar por angulo con la velocidad de siempre");
+  for (const char *line : {"gripper speed 50", "gripper speed 2000", "gripper speed x"}) {
+    run(line);
+    CHECK(Serial.out.find("GRIPPER_SPEED_REJECTED reason=fuera_de_rango") == 0, line);
+  }
+  run("gripper speed 300");
 
   if (failures == 0) std::cout << "OK: pruebas de sync en la PC" << std::endl;
   return failures == 0 ? 0 : 1;

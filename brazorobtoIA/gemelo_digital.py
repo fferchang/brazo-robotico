@@ -191,7 +191,8 @@ class TwinSession:
             warnings = entry.setdefault("avisos", [])
             executor = MotionExecutor(self.robot, status=lambda text: warnings.append(text)
                                       if text.startswith("Llegada con desvío") else None,
-                                      sync_orders=None if self.sync_orders else False)
+                                      sync_orders=None if self.sync_orders else False,
+                                      fast_gripper_close=self.config.motion.fast_gripper_close)
             self._run_stages(execution, executor, entry, placement)
             time.sleep(1.0)
             passed, checks = verify_cube_in_container(*self.frames_and_observations())

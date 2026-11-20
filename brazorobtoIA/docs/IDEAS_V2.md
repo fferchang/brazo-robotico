@@ -156,6 +156,9 @@ lento son los movimientos grandes (salir de Inicio y volver), que van «en escal
   rinde poco hasta tener una cola de puntos en el firmware: cada paso de 6° termina
   antes de que llegue la orden siguiente. Lo que más tiempo fijo queda es la garra
   (~7 s por vuelta).
+- Avance (20/11): la garra abre a ~79°/s y cierra rápido hasta 55° (vuelta ~26 s en el
+  gemelo). Queda la espera de 0,8 s después de agarrar y un apriete que depende de en qué
+  lectura de corriente cae el contacto.
 
 ### Comunicación más rápida con el ESP32
 Hoy los comandos y la telemetría van como texto a 115200 baudios, con las posiciones

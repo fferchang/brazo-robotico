@@ -115,6 +115,14 @@ GRIPPER_CLOSED_TOLERANCE_DEGREES = 2.0
 GRIPPER_CONTACT_CURRENT_RAW = 92
 GRIPPER_HARD_CURRENT_RAW = 200
 GRIPPER_CONTACT_SAMPLES = 3
+# `gripper close <hasta>` y `gripper speed` (ver el firmware).
+GRIPPER_FAST_CLOSE_SPEED = 600
+GRIPPER_FAST_CLOSE_ACC = 30
+GRIPPER_FAST_HANDOFF_DEGREES = 5.0
+GRIPPER_FAST_TIMEOUT_S = 3.0
+GRIPPER_OPEN_SPEED_DEFAULT = 300
+GRIPPER_SPEED_MIN_SETTING = 100
+GRIPPER_SPEED_HARD_MAX = 1000
 # Vigilancia fuera del cierre, igual que processGripperWatch() del firmware.
 GRIPPER_WATCH_INTERVAL_S = 0.100
 GRIPPER_MOVE_INRUSH_IGNORE_S = 0.250
@@ -344,6 +352,8 @@ class DigitalTwin:
         # Como en el firmware: valen hasta reiniciar, aunque cambie la escena.
         self.arm_max_speed = MOVE_SPEED
         self.arm_acc = MOVE_ACC
+        self.gripper_open_speed = GRIPPER_OPEN_SPEED_DEFAULT
+        self.gripper_angle_open_speed = MOVE_SPEED
         self.power_guard = False
         self.guard_limits = (95, 80, 3000, 4500)  # lento y corte: décimas de V y mA
         # Para pruebas: corriente cruda extra por motor y voltaje forzado (décimas de V).
@@ -380,6 +390,7 @@ class DigitalTwin:
         self.last_telemetry = -math.inf
         self.pending_report: tuple[float, int] | None = None
         self.gripper_closing = False
+        self.gripper_fast_until: float | None = None  # tramo rápido del cierre en curso
         self.gripper_command = GRIPPER_CLOSED_DEGREES
         self.gripper_started = 0.0
         self.gripper_last_step = -math.inf
@@ -751,7 +762,8 @@ class DigitalTwin:
         if motor <= 5:
             self._arm_write(motor, degrees, self.arm_max_speed)
         else:
-            self._write_pos(motor, degrees, MOVE_SPEED, MOVE_ACC)
+            opening = degrees > self._logical_from_encoder(6)
+            self._write_pos(motor, degrees, self.gripper_angle_open_speed if opening else MOVE_SPEED, MOVE_ACC)
         self.pending_report = (self.now + POST_MOVE_REPORT_S, motor)
 
     def _move_pair(self, first: int, first_deg: float, second: int, second_deg: float, *,
@@ -1148,23 +1160,30 @@ class DigitalTwin:
         self.gripper_closing = False
         self.gripper_samples = 0
         self._enable_torque(6, True)
-        self._write_pos(6, GRIPPER_OPEN_DEGREES - GRIPPER_OPEN_SHORTFALL_DEGREES, 300, 25)
+        self._write_pos(6, GRIPPER_OPEN_DEGREES - GRIPPER_OPEN_SHORTFALL_DEGREES, self.gripper_open_speed, 25)
         self.gripper_command = GRIPPER_OPEN_DEGREES
         self.println("GRIPPER_OPEN_OK target=140.0")
         self._start_watch("moving")
 
-    def _start_closing(self) -> None:
+    def _start_closing(self, fast_until: float | None = None) -> None:
         if self.gripper_closing:
             self.println("GRIPPER_CLOSE_IGNORED reason=ya_esta_cerrando")
             return
         self._enable_torque(6, True)
-        self.gripper_command = min(max(self._logical_from_encoder(6), GRIPPER_CLOSED_DEGREES), GRIPPER_OPEN_DEGREES)
+        start = min(max(self._logical_from_encoder(6), GRIPPER_CLOSED_DEGREES), GRIPPER_OPEN_DEGREES)
+        self.gripper_command = start
         self.gripper_watch = "none"  # el cierre se vigila en _process_gripper_closing()
         self.gripper_closing = True
         self.gripper_started = self.now
         self.gripper_last_step = -math.inf
         self.gripper_samples = 0
-        self.println(f"GRIPPER_CLOSE_START from={self.gripper_command:.1f} contact_raw={self.contact_threshold}")
+        self.gripper_fast_until = None
+        detail = ""
+        if fast_until is not None and start > fast_until + GRIPPER_FAST_HANDOFF_DEGREES:
+            self.gripper_fast_until = fast_until
+            self._write_pos(6, fast_until, GRIPPER_FAST_CLOSE_SPEED, GRIPPER_FAST_CLOSE_ACC)
+            detail = f" fast_until={fast_until:.1f}"
+        self.println(f"GRIPPER_CLOSE_START from={start:.1f} contact_raw={self.contact_threshold}{detail}")
 
     def _process_gripper_closing(self) -> None:
         if not self.gripper_closing:
@@ -1195,6 +1214,14 @@ class DigitalTwin:
                          f"threshold_ma_aprox={self.contact_threshold * 6.5:.1f}")
             self._freeze_gripper("contact", current_raw)
             return
+        if self.gripper_fast_until is not None:
+            if self._logical_from_encoder(6) > self.gripper_fast_until + GRIPPER_FAST_HANDOFF_DEGREES \
+                    and elapsed < GRIPPER_FAST_TIMEOUT_S:
+                return
+            self.gripper_fast_until = None
+            # Como al final del cierre de siempre: la consigna ya en cerrada y el servo a su
+            # ritmo, para que al tocar el cubo apriete igual que antes.
+            self.gripper_command = GRIPPER_CLOSED_DEGREES
         if self.gripper_command <= GRIPPER_CLOSED_DEGREES:
             actual = min(max(self._logical_from_encoder(6), GRIPPER_CLOSED_DEGREES), GRIPPER_OPEN_DEGREES)
             if actual <= GRIPPER_CLOSED_DEGREES + GRIPPER_CLOSED_TOLERANCE_DEGREES:
@@ -1214,7 +1241,7 @@ class DigitalTwin:
         lowered = line.lower()
         if self.sync_firmware and lowered == "caps":
             self.println(f"FIRMWARE_CAPS sync=1 sync_max_motors={SYNC_MAX_MOTORS} sync_max_speed={self.arm_max_speed} "
-                         f"guard=1 speed_hard_max={ARM_SPEED_HARD_MAX}")
+                         f"guard=1 speed_hard_max={ARM_SPEED_HARD_MAX} gripper_fast=1")
             return
         if lowered == "waypoint" or lowered.startswith("waypoint "):
             self._waypoint_command(lowered)
@@ -1238,6 +1265,19 @@ class DigitalTwin:
             self._open_gripper()
         elif lowered in ("gripper close", "cerrar garra"):
             self._start_closing()
+        elif self.sync_firmware and lowered.startswith("gripper close "):
+            text = lowered[14:].strip()
+            if not _STRICT_FLOAT.fullmatch(text) or not GRIPPER_CLOSED_DEGREES <= float(text) <= GRIPPER_OPEN_DEGREES:
+                self.println("GRIPPER_ERROR reason=fuera_de_rango detail=gripper_close_hasta_0_a_140")
+            else:
+                self._start_closing(float(text))
+        elif self.sync_firmware and lowered.startswith("gripper speed "):
+            text = lowered[14:].strip()
+            if not _STRICT_INT.fullmatch(text) or not GRIPPER_SPEED_MIN_SETTING <= int(text) <= GRIPPER_SPEED_HARD_MAX:
+                self.println("GRIPPER_SPEED_REJECTED reason=fuera_de_rango")
+            else:
+                self.gripper_open_speed = self.gripper_angle_open_speed = int(text)
+                self.println(f"GRIPPER_SPEED open={int(text)}")
         elif lowered in ("gripper stop", "parar garra"):
             self._freeze_gripper("manual", self._gripper_current_raw())
         elif lowered in ("gripper release", "garra libre"):

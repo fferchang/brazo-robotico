@@ -30,6 +30,7 @@ FAULT_MARKERS = (
     "power_guard_hold",
     "power_guard_rejected",
     "arm_speed_rejected",
+    "gripper_speed_rejected",
     "bloqueado",
     "fuera de rango",
     "sin respuesta",
@@ -156,6 +157,8 @@ def configure_motion(robot: "RobotSerial", motion, timeout: float = 1.5) -> list
     if not robot.guard_supported:
         return []
     commands = motion_commands(motion)
+    if robot.gripper_fast_supported:
+        commands.append(f"gripper speed {int(motion.gripper_open_speed)}")
     for command in commands:
         robot.send(command)
     return commands
@@ -215,6 +218,8 @@ class RobotSerial:
         self.sync_supported = False
         # `caps` con `guard=1`: el firmware tiene `power guard` y `speed max`.
         self.guard_supported = False
+        # `caps` con `gripper_fast=1`: `gripper close <hasta>` y `gripper speed`.
+        self.gripper_fast_supported = False
         self.speed_scale = 1.0
         self.arm_max_speed: int | None = None
         # Medición de la fuente: última muestra, CSV abierto y la etapa que la app anota.
@@ -422,6 +427,7 @@ class RobotSerial:
                 fields = line.split()
                 self.sync_supported = "sync=1" in fields
                 self.guard_supported = "guard=1" in fields
+                self.gripper_fast_supported = "gripper_fast=1" in fields
             elif line.startswith("POWER_GUARD scale="):
                 try:
                     self.speed_scale = int(line.split()[1].split("=", 1)[1]) / 100.0

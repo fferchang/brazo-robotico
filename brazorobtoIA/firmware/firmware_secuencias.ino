@@ -90,6 +90,25 @@ static const float GRIPPER_CLOSED_TOLERANCE_DEGREES = 2.0f;
 static int gripperContactCurrentRaw = 92;
 static const int GRIPPER_HARD_CURRENT_RAW = 200;
 static const uint8_t GRIPPER_CONTACT_SAMPLES = 3;
+// Cierre por presion con tramo rapido (`gripper close <hasta>`): de la apertura actual
+// hasta <hasta> grados va a GRIPPER_FAST_CLOSE_SPEED, sin el cubo entre los dedos
+// todavia; a GRIPPER_FAST_HANDOFF_DEGREES de ese angulo sigue como al final del cierre de
+// siempre (consigna en cerrada, servo a 220): llega al cubo a la misma velocidad y aprieta
+// igual. La deteccion de contacto y el corte por sobrecorriente siguen activos siempre.
+// Sin argumento, `gripper close` es el de siempre (~19 grados/s del servo).
+static const uint16_t GRIPPER_FAST_CLOSE_SPEED = 600;   // ~53 grados/s
+static const uint8_t GRIPPER_FAST_CLOSE_ACC = 30;
+static const float GRIPPER_FAST_HANDOFF_DEGREES = 5.0f;
+static const unsigned long GRIPPER_FAST_TIMEOUT_MS = 3000;
+// Abrir (`gripper open` y M6 por angulo hacia un angulo mayor): `gripper speed <n>`. Al
+// arrancar, las velocidades de siempre. Cerrar por angulo no cambia.
+static const uint16_t GRIPPER_OPEN_SPEED_DEFAULT = 300;
+static const uint16_t GRIPPER_SPEED_MIN_SETTING = 100;
+static const uint16_t GRIPPER_SPEED_HARD_MAX = 1000;
+uint16_t gripperOpenSpeed = GRIPPER_OPEN_SPEED_DEFAULT;
+uint16_t gripperAngleOpenSpeed = MOVE_SPEED;
+bool gripperFastPhase = false;
+float gripperFastUntil = 0.0f;
 // Vigilancia de corriente fuera del cierre: al abrir, al mover M6 por angulo y al
 // sostener (docs/DIAGNOSTICO_GARRA.md). El cierre tiene la suya en
 // processGripperClosing(). Con la fuente de 12 V / 5 A compartida, una garra
@@ -530,6 +549,8 @@ void printHelp() {
   Serial.println(F("  caps"));
   Serial.println(F("  speed max 450 [45]   (pasos/s y aceleracion de M1..M5; techo 1000)"));
   Serial.println(F("  power guard on|off"));
+  Serial.println(F("  gripper close 55     (rapido hasta 55 grados, despues por presion)"));
+  Serial.println(F("  gripper speed 900    (velocidad al abrir la garra)"));
   Serial.println(F("  power guard 95 80 3000 4500  (lento/corte en decimas de V y en mA)"));
   Serial.println(F("  read <id>"));
   Serial.println(F("  scan"));
@@ -1019,7 +1040,10 @@ void moveServoToDegrees(
     servoBus.WritePosEx(id, (int)targetPos, scaledArmSpeed(armMaxSpeed), armAcc);
     rememberArmGoal(id, targetPos, armMaxSpeed);
   } else {
-    servoBus.WritePosEx(id, (int)targetPos, MOVE_SPEED, MOVE_ACC);
+    // M6 abriendo (alejandose de lo que sostiene): `gripper speed`; cerrando, como siempre.
+    float currentM6 = degrees;
+    bool opening = getCurrentLogicalDegrees(6, currentM6) && degrees > currentM6;
+    servoBus.WritePosEx(id, (int)targetPos, opening ? gripperAngleOpenSpeed : MOVE_SPEED, MOVE_ACC);
   }
   pendingMoveReport = true;
   pendingMoveReportId = id;
@@ -1202,13 +1226,13 @@ void openGripper() {
   gripperHighCurrentSamples = 0;
   servoBus.EnableTorque(6, 1);
   float realDegrees = toRealServoDegrees(6, GRIPPER_OPEN_DEGREES);
-  servoBus.WritePosEx(6, (int)degToPos(realDegrees), 300, 25);
+  servoBus.WritePosEx(6, (int)degToPos(realDegrees), gripperOpenSpeed, 25);
   gripperCommandDegrees = GRIPPER_OPEN_DEGREES;
   Serial.println(F("GRIPPER_OPEN_OK target=140.0"));
   startGripperWatch(WATCH_MOVING);
 }
 
-void startClosingGripper() {
+void startClosingGripper(float fastUntil = NAN) {
   if (gripperClosing) {
     // Una segunda pulsacion no reinicia cronometro, contador ni exclusion inicial.
     Serial.println(F("GRIPPER_CLOSE_IGNORED reason=ya_esta_cerrando"));
@@ -1230,10 +1254,21 @@ void startClosingGripper() {
   gripperCloseStartedMs = millis();
   gripperLastStepMs = 0;
   gripperHighCurrentSamples = 0;
+  gripperFastPhase = !isnan(fastUntil) && gripperCommandDegrees > fastUntil + GRIPPER_FAST_HANDOFF_DEGREES;
+  if (gripperFastPhase) {
+    gripperFastUntil = fastUntil;
+    servoBus.WritePosEx(6, (int)degToPos(toRealServoDegrees(6, fastUntil)),
+                        GRIPPER_FAST_CLOSE_SPEED, GRIPPER_FAST_CLOSE_ACC);
+  }
   Serial.print(F("GRIPPER_CLOSE_START from="));
-  Serial.print(gripperCommandDegrees, 1);
+  Serial.print(constrain(posToDeg(position) - 10.0f, GRIPPER_CLOSED_DEGREES, GRIPPER_OPEN_DEGREES), 1);
   Serial.print(F(" contact_raw="));
-  Serial.println(gripperContactCurrentRaw);
+  Serial.print(gripperContactCurrentRaw);
+  if (gripperFastPhase) {
+    Serial.print(F(" fast_until="));
+    Serial.print(gripperFastUntil, 1);
+  }
+  Serial.println();
 }
 
 void stopGripper() {
@@ -1413,6 +1448,28 @@ void processGripperClosing() {
     Serial.println(gripperContactCurrentRaw * 6.5f, 1);
     freezeGripperAtCurrentPosition("contact", currentRaw);
     return;
+  }
+
+  if (gripperFastPhase) {
+    // Tramo rapido: la garra va sola hasta gripperFastUntil; cerca, sigue el paso a paso.
+    int actualPosition = servoBus.ReadPos(6);
+    if (actualPosition < 0) {
+      Serial.println(F("GRIPPER_STOP reason=communication_error detail=ReadPos_sin_respuesta_en_tramo_rapido"));
+      gripperClosing = false;
+      gripperFastPhase = false;
+      gripperHighCurrentSamples = 0;
+      releaseGripperAfterFailure("communication_error");
+      return;
+    }
+    float actualLogicalDegrees = posToDeg(actualPosition) - 10.0f;
+    if (actualLogicalDegrees > gripperFastUntil + GRIPPER_FAST_HANDOFF_DEGREES &&
+        now - gripperCloseStartedMs < GRIPPER_FAST_TIMEOUT_MS) {
+      return;
+    }
+    gripperFastPhase = false;
+    // Como al final del cierre de siempre: la consigna ya en cerrada y el servo a su
+    // ritmo (220), para que al tocar el cubo apriete igual que antes.
+    gripperCommandDegrees = GRIPPER_CLOSED_DEGREES;
   }
 
   if (gripperCommandDegrees <= GRIPPER_CLOSED_DEGREES) {
@@ -1871,7 +1928,8 @@ void printCapabilities() {
   Serial.print(F(" sync_max_speed="));
   Serial.print(armMaxSpeed);
   Serial.print(F(" guard=1 speed_hard_max="));
-  Serial.println(ARM_SPEED_HARD_MAX);
+  Serial.print(ARM_SPEED_HARD_MAX);
+  Serial.println(F(" gripper_fast=1"));
 }
 
 void handleLine(String line) {
@@ -1930,6 +1988,33 @@ void handleLine(String line) {
 
   if (line.equalsIgnoreCase("gripper close") || line.equalsIgnoreCase("cerrar garra")) {
     startClosingGripper();
+    return;
+  }
+
+  if (line.startsWith("gripper close ")) {
+    const char *cursor = line.c_str() + 14;
+    float fastUntil;
+    if (!readWaypointDegrees(cursor, fastUntil) || (skipWaypointSpaces(cursor), *cursor) ||
+        fastUntil < GRIPPER_CLOSED_DEGREES || fastUntil > GRIPPER_OPEN_DEGREES) {
+      Serial.println(F("GRIPPER_ERROR reason=fuera_de_rango detail=gripper_close_hasta_0_a_140"));
+      return;
+    }
+    startClosingGripper(fastUntil);
+    return;
+  }
+
+  if (line.startsWith("gripper speed ")) {
+    int speed = 0;
+    char extra = 0;
+    if (sscanf(line.c_str(), "gripper speed %d %c", &speed, &extra) != 1 ||
+        speed < GRIPPER_SPEED_MIN_SETTING || speed > GRIPPER_SPEED_HARD_MAX) {
+      Serial.println(F("GRIPPER_SPEED_REJECTED reason=fuera_de_rango"));
+      return;
+    }
+    gripperOpenSpeed = speed;
+    gripperAngleOpenSpeed = speed;
+    Serial.print(F("GRIPPER_SPEED open="));
+    Serial.println(speed);
     return;
   }
 

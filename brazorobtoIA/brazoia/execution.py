@@ -119,6 +119,16 @@ GRIP_SETTLE_MA = 300.0
 # (~390 mA) detecta el contacto antes; en la física agarra y sostiene igual (40/40 con
 # ambos, M6 sosteniendo a ~38,5° en vez de ~38°). La garra libre consume 6–20 mA.
 GRIPPER_CONTACT_RAW = 60
+# Con el firmware que lo anuncia (`gripper_fast=1`), el cierre por presión va rápido
+# (~53°/s) hasta acá y después sigue como el final del cierre de siempre (consigna cerrada,
+# servo a ~19°/s): llega al cubo a la misma velocidad. El contacto empieza en ~43,6° también
+# con el cubo girado 15° y en el brazo real el agarre queda en ~40°. Gemelo (20/11), cubos
+# girados hasta 5°: 10/10 con y sin tramo rápido. Con cubos girados ~15° los agarres
+# quedan al límite en los dos casos (el apriete depende de en qué lectura de corriente cae
+# el contacto) y con el tramo rápido fallaron más. `movimiento.cierre_rapido` lo apaga.
+GRIPPER_FAST_CLOSE_UNTIL = 55.0
+# En Guardado no hay cubo entre los dedos (se acaba de soltar): rápido casi hasta cerrar.
+GRIPPER_FAST_CLOSE_EMPTY_UNTIL = 10.0
 GRIP_SETTLE_SECONDS = 0.8
 GRIP_SETTLE_TIMEOUT_SECONDS = 2.0
 POWER_FRESH_SECONDS = 0.5
@@ -172,6 +182,7 @@ class MotionExecutor:
         *,
         firmware_waypoints: bool = False,
         sync_orders: bool | None = None,
+        fast_gripper_close: bool = True,
     ):
         self.robot = robot
         self.status = status or (lambda text: None)
@@ -182,6 +193,8 @@ class MotionExecutor:
         self.firmware_waypoints = firmware_waypoints
         # None: usar `sync` si el firmware lo anunció (`caps`); False: nunca (como el 6/11).
         self.sync_orders = sync_orders
+        # False: «gripper close» de siempre aunque el firmware tenga el tramo rápido.
+        self.fast_gripper_close = fast_gripper_close
         self._last_move_sent = -math.inf
 
     @property
@@ -235,7 +248,7 @@ class MotionExecutor:
                     if angle:
                         self._send_gripper_angle(proposal.gripper_degrees)
                     else:
-                        self._send_gripper_close()
+                        self._send_gripper_close(proposal.stage)
                 gripper_sent = True
             groups = proposal.groups[segment.start:segment.end]
             sync_targets = self._sync_targets(groups) if use_sync else None
@@ -299,7 +312,7 @@ class MotionExecutor:
             with _time_phase(timings, "gripper"):
                 if not gripper_sent:
                     holds_before = getattr(self.robot.snapshot(), "gripper_holds", None)
-                    self._send_gripper_close()
+                    self._send_gripper_close(proposal.stage)
                 self._wait_gripper_hold(holds_before, timeout=16.0)
                 if proposal.stage == "agarre" and getattr(self.robot.snapshot(), "gripper_hold_reason", "") == "closed_limit":
                     # Cerró hasta el tope sin tocar nada: no hay cubo entre los dedos.
@@ -376,10 +389,14 @@ class MotionExecutor:
         detail = "sin lectura" if current is None else f"{current:.0f} mA"
         self.status(f"La garra sigue consumiendo {detail} después de agarrar; se levanta igual.")
 
-    def _send_gripper_close(self) -> None:
+    def _send_gripper_close(self, stage: str | None = None) -> None:
         self.status("Cerrando la garra por presión...")
         self.robot.send(f"gripper current {GRIPPER_CONTACT_RAW}")
-        self.robot.send("gripper close")
+        if getattr(self.robot, "gripper_fast_supported", False) is True and self.fast_gripper_close:
+            until = GRIPPER_FAST_CLOSE_EMPTY_UNTIL if stage == "guardado" else GRIPPER_FAST_CLOSE_UNTIL
+            self.robot.send(f"gripper close {until:.1f}")
+        else:
+            self.robot.send("gripper close")
 
     def _wait_gripper_hold(self, holds_before: int | None, timeout: float) -> None:
         """Hasta un GRIPPER_HOLD posterior a la orden; uno de antes no cuenta."""

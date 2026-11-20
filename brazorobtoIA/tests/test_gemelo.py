@@ -29,7 +29,10 @@ class OpenTimeoutTest(unittest.TestCase):
 
     def test_speed_matches_the_firmware_open_command(self):
         text = FIRMWARE.read_text(encoding="utf-8", errors="replace")
-        self.assertIn("servoBus.WritePosEx(6, (int)degToPos(realDegrees), 300, 25);", text)
+        # Arranca en 300 (`gripper speed` la sube); el plazo de la PC usa la más lenta.
+        self.assertIn("servoBus.WritePosEx(6, (int)degToPos(realDegrees), gripperOpenSpeed, 25);", text)
+        self.assertIn("GRIPPER_OPEN_SPEED_DEFAULT = 300;", text)
+        self.assertIn("uint16_t gripperOpenSpeed = GRIPPER_OPEN_SPEED_DEFAULT;", text)
 
 
 class LoadedArrivalTest(unittest.TestCase):

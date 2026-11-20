@@ -76,6 +76,8 @@
   "movimiento": {
     "velocidad_max": 450,
     "aceleracion": 45,
+    "velocidad_garra_abrir": 900,
+    "cierre_rapido": true,
     "guardia_fuente": {
       "activa": true,
       "lento_v": 9.5,

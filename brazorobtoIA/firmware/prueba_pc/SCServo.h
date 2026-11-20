@@ -4,7 +4,7 @@
 #include <vector>
 #define SMS_STS_TORQUE_ENABLE 40
 #define SMS_STS_GOAL_POSITION_L 42
-struct FakeServo { bool present = true; int pos = 2048; int goal = 2048; int torque = 1; int current = 0; int voltage = 120; };
+struct FakeServo { bool present = true; int pos = 2048; int goal = 2048; int torque = 1; int current = 0; int voltage = 120; int speed = 0; };
 struct SyncCall { std::vector<int> ids, positions, speeds, accs; };
 class SMS_STS {
  public:
@@ -25,7 +25,7 @@ class SMS_STS {
   int EnableTorque(int id, int e) { servo[id].torque = e; return 1; }
   int readByte(int id, int) { return servo[id].torque; }
   int readWord(int id, int) { return servo[id].goal; }
-  int WritePosEx(int id, int pos, int, int) { servo[id].goal = pos; writes++; return 1; }
+  int WritePosEx(int id, int pos, int speed, int) { servo[id].goal = pos; servo[id].speed = speed; writes++; return 1; }
   void SyncWritePosEx(u8 ids[], u8 n, s16 pos[], u16 spd[], u8 acc[]) {
     SyncCall c;
     for (int i = 0; i < n; i++) { c.ids.push_back(ids[i]); c.positions.push_back(pos[i]); c.speeds.push_back(spd[i]); c.accs.push_back(acc[i]); servo[ids[i]].goal = pos[i]; }

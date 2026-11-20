@@ -123,6 +123,11 @@ class MotionConfig:
     # Pasos/s del motor que más recorre (450 ≈ 40°/s). El firmware no acepta más de 1000.
     max_speed: int = 450
     acceleration: int = 45
+    # Pasos/s de M6 al abrir (`gripper speed`; 900 ≈ 79°/s). Antes: 450 por ángulo y 300
+    # con «gripper open». Cerrar no cambia: el cierre por presión tiene su propio ritmo.
+    gripper_open_speed: int = 900
+    # Cierre por presión con tramo rápido hasta 55° (execution.GRIPPER_FAST_CLOSE_UNTIL).
+    fast_gripper_close: bool = True
     # Supervisor de la fuente: con la tensión más baja de los servos bajo `slow_volts` o la
     # corriente total sobre `slow_ma`, M1–M5 van más despacio, todos por igual; bajo
     # `hold_volts` o sobre `hold_ma` durante 200 ms, el brazo se frena donde está.
@@ -139,6 +144,8 @@ def load_motion(raw: dict) -> MotionConfig:
     motion = MotionConfig(
         max_speed=int(raw.get("velocidad_max", defaults.max_speed)),
         acceleration=int(raw.get("aceleracion", defaults.acceleration)),
+        gripper_open_speed=int(raw.get("velocidad_garra_abrir", defaults.gripper_open_speed)),
+        fast_gripper_close=bool(raw.get("cierre_rapido", defaults.fast_gripper_close)),
         guard_enabled=bool(guard.get("activa", defaults.guard_enabled)),
         guard_slow_volts=float(guard.get("lento_v", defaults.guard_slow_volts)),
         guard_hold_volts=float(guard.get("corte_v", defaults.guard_hold_volts)),
@@ -146,8 +153,10 @@ def load_motion(raw: dict) -> MotionConfig:
         guard_hold_ma=int(guard.get("corte_ma", defaults.guard_hold_ma)),
     )
     # Los mismos rangos que acepta el firmware (`speed max` y `power guard`).
-    if not 100 <= motion.max_speed <= 1000 or not 10 <= motion.acceleration <= 150:
-        raise ValueError("movimiento: velocidad_max entre 100 y 1000 y aceleracion entre 10 y 150.")
+    if not 100 <= motion.max_speed <= 1000 or not 10 <= motion.acceleration <= 150 \
+            or not 100 <= motion.gripper_open_speed <= 1000:
+        raise ValueError("movimiento: velocidad_max y velocidad_garra_abrir entre 100 y 1000, "
+                         "aceleracion entre 10 y 150.")
     if not 5.0 <= motion.guard_hold_volts < motion.guard_slow_volts <= 13.0 \
             or not 100 <= motion.guard_slow_ma < motion.guard_hold_ma <= 10000:
         raise ValueError("movimiento.guardia_fuente: 5 <= corte_v < lento_v <= 13 y 100 <= lento_ma < corte_ma <= 10000.")

@@ -1328,7 +1328,8 @@ class App:
 
         # Detener/EMERGENCIA cortan también una parada pedida entre dos etapas.
         self.executor = MotionExecutor(self.robot, status=executor_status, abort=self.auto_stop,
-                                       sync_orders=_executor_sync(self))
+                                       sync_orders=_executor_sync(self),
+                                       fast_gripper_close=self.config.motion.fast_gripper_close)
         self.execution_log = run_log
         self.logged_scene = None
         self.automatic_verification = None
@@ -1949,7 +1950,8 @@ class App:
         self.set_camera_controls_enabled(False)
         self.executor = MotionExecutor(
             robot, status=lambda text: self.worker_messages.put(("log", text)), abort=self.auto_stop,
-            firmware_waypoints=self.firmware_waypoints, sync_orders=_executor_sync(self))
+            firmware_waypoints=self.firmware_waypoints, sync_orders=_executor_sync(self),
+            fast_gripper_close=self.config.motion.fast_gripper_close)
         who = "Gemelo" if self.twin is not None else "Brazo"
         limit = f"{cycles} vueltas" if cycles else "hasta Detener"
         self.auto_status.set(f"Demo ({limit}): preparando...")
